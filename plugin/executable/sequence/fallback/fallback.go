@@ -49,6 +49,7 @@ type fallback struct {
 	secondary            sequence.Executable
 	fastFallbackDuration time.Duration
 	alwaysStandby        bool
+	primaryFailureOnly   bool
 }
 
 type Args struct {
@@ -62,6 +63,10 @@ type Args struct {
 
 	// AlwaysStandby: secondary should always stand by in fallback.
 	AlwaysStandby bool `yaml:"always_standby"`
+
+	// PrimaryFailureOnly: secondary only starts after primary explicitly failed.
+	// If enabled, threshold timeout will not trigger secondary.
+	PrimaryFailureOnly bool `yaml:"primary_failure_only"`
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -92,6 +97,7 @@ func newFallbackPlugin(bp *coremain.BP, args *Args) (*fallback, error) {
 		secondary:            se,
 		fastFallbackDuration: threshold,
 		alwaysStandby:        args.AlwaysStandby,
+		primaryFailureOnly:   args.PrimaryFailureOnly,
 	}
 	return s, nil
 }
@@ -143,7 +149,16 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 	go func() {
 		timer := pool.GetTimer(f.fastFallbackDuration)
 		defer pool.ReleaseTimer(timer)
-		if !f.alwaysStandby { // not always standby, wait here.
+		if f.primaryFailureOnly {
+			// Strict fallback mode: secondary must not be started by threshold.
+			// It only starts after primary explicitly failed.
+			select {
+			case <-primDone: // primary is done, no need to exec this.
+				respChan <- nil // Send a nil to unblock the main loop.
+				return
+			case <-primFailed: // primary failed
+			}
+		} else if !f.alwaysStandby { // not always standby, wait here.
 			select {
 			case <-primDone: // primary is done, no need to exec this.
 				respChan <- nil // Send a nil to unblock the main loop.
