@@ -112,126 +112,161 @@ func (f *fallback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 	return f.doFallback(ctx, qCtx)
 }
 
-func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) error {
-	respChan := make(chan *query_context.Context, 2) // resp could be nil.
-	primFailed := make(chan struct{})
-	primDone := make(chan struct{})
+type fallbackResultSource uint8
 
-	// primary goroutine.
-	qCtxP := qCtx.Copy()
+const (
+	fallbackResultPrimary fallbackResultSource = iota
+	fallbackResultSecondary
+)
+
+type fallbackResult struct {
+	source  fallbackResultSource
+	qCtx    *query_context.Context
+	success bool
+}
+
+func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) error {
+	runCtx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll()
+
+	resultChan := make(chan fallbackResult, 2)
+
 	go func() {
-		qCtx := qCtxP
-		ctx, cancel := makeDdlCtx(ctx, defaultParallelTimeout)
+		qCtxP := qCtx.Copy()
+		execCtx, cancel := makeDdlCtx(runCtx, defaultParallelTimeout)
 		defer cancel()
-		err := f.primary.Exec(ctx, qCtx)
+
+		err := f.primary.Exec(execCtx, qCtxP)
 		primarySucceeded := false
 		if err != nil {
 			if errors.Is(err, sequence.ErrExit) {
 				primarySucceeded = true
 			} else {
-				f.logger.Warn("primary error", qCtx.InfoField(), zap.Error(err))
+				f.logger.Warn("primary error", qCtxP.InfoField(), zap.Error(err))
 			}
-		} else if qCtx.R() != nil {
+		} else if qCtxP.R() != nil {
 			primarySucceeded = true
 		}
 
-		if primarySucceeded {
-			close(primDone)
-			respChan <- qCtx
-		} else {
-			close(primFailed)
-			respChan <- nil
-		}
+		sendFallbackResult(runCtx, resultChan, fallbackResult{
+			source:  fallbackResultPrimary,
+			qCtx:    qCtxP,
+			success: primarySucceeded,
+		})
 	}()
 
-	// Secondary goroutine.
-	qCtxS := qCtx.Copy()
-	go func() {
-		timer := pool.GetTimer(f.fastFallbackDuration)
+	secondaryStarted := false
+	startSecondary := func() {
+		if secondaryStarted {
+			return
+		}
+		secondaryStarted = true
+
+		go func() {
+			qCtxS := qCtx.Copy()
+			execCtx, cancel := makeDdlCtx(runCtx, defaultParallelTimeout)
+			defer cancel()
+
+			err := f.secondary.Exec(execCtx, qCtxS)
+			secondarySucceeded := false
+			if err != nil {
+				f.logger.Warn("secondary error", qCtxS.InfoField(), zap.Error(err))
+			} else if qCtxS.R() != nil {
+				secondarySucceeded = true
+			}
+
+			sendFallbackResult(runCtx, resultChan, fallbackResult{
+				source:  fallbackResultSecondary,
+				qCtx:    qCtxS,
+				success: secondarySucceeded,
+			})
+		}()
+	}
+
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	if !f.primaryFailureOnly {
+		timer = pool.GetTimer(f.fastFallbackDuration)
 		defer pool.ReleaseTimer(timer)
+		timerC = timer.C
+	}
 
-		if !f.alwaysStandby { // secondary is lazy-started.
-			if f.primaryFailureOnly {
-				// Strict fallback mode: threshold must not start secondary.
-				// It only starts after primary explicitly failed.
-				select {
-				case <-primDone: // primary is done, no need to exec this.
-					respChan <- nil // Send a nil to unblock the main loop.
-					return
-				case <-primFailed: // primary failed
-				}
-			} else {
-				// Threshold fallback mode: threshold starts secondary.
-				select {
-				case <-primDone: // primary is done, no need to exec this.
-					respChan <- nil // Send a nil to unblock the main loop.
-					return
-				case <-timer.C: // timed out
-				}
+	if f.alwaysStandby {
+		startSecondary()
+	}
+
+	primaryDone := false
+	primaryFailed := false
+	secondaryDone := false
+	thresholdReached := false
+	var secondarySuccessCtx *query_context.Context
+
+	useSecondaryIfAllowed := func() bool {
+		if secondarySuccessCtx == nil {
+			return false
+		}
+		if f.primaryFailureOnly {
+			if !primaryFailed {
+				return false
+			}
+		} else if f.alwaysStandby && !thresholdReached {
+			return false
+		}
+
+		secondarySuccessCtx.CopyTo(qCtx)
+		return true
+	}
+
+	for {
+		if useSecondaryIfAllowed() {
+			return nil
+		}
+
+		if primaryDone && primaryFailed {
+			if f.primaryFailureOnly && !secondaryStarted {
+				startSecondary()
+			}
+			if secondaryStarted && secondaryDone && secondarySuccessCtx == nil {
+				return ErrFailed
 			}
 		}
 
-		qCtx := qCtxS
-		ctx, cancel := makeDdlCtx(ctx, defaultParallelTimeout)
-		defer cancel()
-		err := f.secondary.Exec(ctx, qCtx)
-		if err != nil {
-			f.logger.Warn("secondary error", qCtx.InfoField(), zap.Error(err))
-			respChan <- nil
-			return
-		}
-
-		r := qCtx.R()
-		if r == nil {
-			respChan <- nil
-			return
-		}
-
-		// always_standby means secondary has already queried in parallel,
-		// but its response is held until the selected fallback condition is met.
-		if f.alwaysStandby {
-			if f.primaryFailureOnly {
-				// Parallel strict fallback: use secondary only after primary explicitly failed.
-				select {
-				case <-ctx.Done():
-					respChan <- nil
-				case <-primDone:
-					respChan <- nil
-				case <-primFailed:
-					respChan <- qCtx
-				}
-			} else {
-				// Parallel threshold fallback: secondary is usable after threshold.
-				select {
-				case <-ctx.Done():
-					respChan <- nil
-				case <-primDone:
-					respChan <- nil
-				case <-timer.C: // threshold reached.
-					respChan <- qCtx
-				}
-			}
-		} else {
-			respChan <- qCtx
-		}
-	}()
-
-	for i := 0; i < 2; i++ {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
-		case successCtx := <-respChan:
-			if successCtx == nil { // One of goroutines finished but failed or was skipped.
-				continue
+		case <-timerC:
+			thresholdReached = true
+			timerC = nil
+			if !f.alwaysStandby && !secondaryStarted {
+				startSecondary()
 			}
-			// Copy all data from the successful context to the original context.
-			successCtx.CopyTo(qCtx)
-			return nil
+		case result := <-resultChan:
+			switch result.source {
+			case fallbackResultPrimary:
+				primaryDone = true
+				if result.success {
+					result.qCtx.CopyTo(qCtx)
+					return nil
+				}
+				primaryFailed = true
+			case fallbackResultSecondary:
+				secondaryDone = true
+				if result.success {
+					// In primary_failure_only mode, secondary is allowed to run in
+					// parallel, but its result must only be cached here. It can be
+					// copied to the original qCtx only after primary explicitly fails.
+					secondarySuccessCtx = result.qCtx
+				}
+			}
 		}
 	}
+}
 
-	// All goroutines finished but failed.
-	return ErrFailed
+func sendFallbackResult(ctx context.Context, ch chan<- fallbackResult, result fallbackResult) {
+	select {
+	case ch <- result:
+	case <-ctx.Done():
+	}
 }
 
 func makeDdlCtx(ctx context.Context, timeout time.Duration) (context.Context, func()) {
@@ -239,5 +274,5 @@ func makeDdlCtx(ctx context.Context, timeout time.Duration) (context.Context, fu
 	if !ok {
 		ddl = time.Now().Add(timeout)
 	}
-	return context.WithDeadline(context.Background(), ddl)
+	return context.WithDeadline(ctx, ddl)
 }
