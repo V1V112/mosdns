@@ -342,3 +342,68 @@ func TestAlwaysStandbyPrimaryFailureOnlyKeepsSecondaryResultUntilPrimaryFails(t 
 		t.Fatalf("expected primary response to win, got %v", qCtx.R())
 	}
 }
+
+func TestAlwaysStandbyPrimaryFailureOnlyUsesSecondaryAfterAcceptThreshold(t *testing.T) {
+	primaryStarted := make(chan struct{})
+	allowPrimaryFail := make(chan struct{})
+	secondaryStarted := make(chan struct{}, 1)
+	secondaryResp := new(dns.Msg)
+	secondaryResp.Rcode = dns.RcodeSuccess
+	secondaryResp.Id = 3003
+	acceptDelay := time.Millisecond * 80
+
+	f := &fallback{
+		primary: executableFunc(func(_ context.Context, _ *query_context.Context) error {
+			close(primaryStarted)
+			<-allowPrimaryFail
+			// No response means primary explicitly failed.
+			return nil
+		}),
+		secondary: executableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			secondaryStarted <- struct{}{}
+			qCtx.SetResponse(secondaryResp)
+			return nil
+		}),
+		fastFallbackDuration: defaultFallbackThreshold,
+		alwaysStandby:        true,
+		primaryFailureOnly:   true,
+		secondaryAcceptDelay: acceptDelay,
+	}
+
+	qCtx := query_context.NewContext(new(dns.Msg))
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- f.Exec(context.Background(), qCtx)
+	}()
+
+	<-primaryStarted
+	select {
+	case <-secondaryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("secondary did not start immediately in always_standby + primary_failure_only mode")
+	}
+
+	close(allowPrimaryFail)
+	select {
+	case err := <-done:
+		t.Fatalf("Exec() returned before secondary_accept_threshold elapsed, err = %v", err)
+	case <-time.After(acceptDelay / 2):
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Exec() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Exec() did not return after secondary_accept_threshold elapsed")
+	}
+
+	if elapsed := time.Since(start); elapsed < acceptDelay {
+		t.Fatalf("Exec() returned before secondary_accept_threshold: elapsed = %v, threshold = %v", elapsed, acceptDelay)
+	}
+	if qCtx.R() == nil || qCtx.R().Id != secondaryResp.Id {
+		t.Fatalf("expected secondary response after accept threshold, got %v", qCtx.R())
+	}
+}

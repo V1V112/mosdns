@@ -50,6 +50,7 @@ type fallback struct {
 	fastFallbackDuration time.Duration
 	alwaysStandby        bool
 	primaryFailureOnly   bool
+	secondaryAcceptDelay time.Duration
 }
 
 type Args struct {
@@ -64,9 +65,17 @@ type Args struct {
 	// AlwaysStandby: secondary should always stand by in fallback.
 	AlwaysStandby bool `yaml:"always_standby"`
 
-	// PrimaryFailureOnly: secondary only starts after primary explicitly failed.
-	// If enabled, threshold timeout will not trigger secondary.
+	// PrimaryFailureOnly: secondary result is only accepted after primary explicitly failed.
+	// If always_standby is false, secondary also starts only after primary failed.
+	// If always_standby is true, secondary can start in parallel but cannot win before primary fails.
 	PrimaryFailureOnly bool `yaml:"primary_failure_only"`
+
+	// SecondaryAcceptThreshold in milliseconds.
+	// It only takes effect when always_standby and primary_failure_only are both enabled.
+	// In that mode, secondary can run in parallel, but its result can only be accepted
+	// after both primary has failed and this timer has elapsed. Default is 0, meaning
+	// secondary can be accepted immediately after primary fails.
+	SecondaryAcceptThreshold int `yaml:"secondary_accept_threshold"`
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -91,6 +100,11 @@ func newFallbackPlugin(bp *coremain.BP, args *Args) (*fallback, error) {
 		threshold = defaultFallbackThreshold
 	}
 
+	secondaryAcceptDelay := time.Duration(args.SecondaryAcceptThreshold) * time.Millisecond
+	if secondaryAcceptDelay < 0 {
+		secondaryAcceptDelay = 0
+	}
+
 	s := &fallback{
 		logger:               bp.L(),
 		primary:              pe,
@@ -98,6 +112,7 @@ func newFallbackPlugin(bp *coremain.BP, args *Args) (*fallback, error) {
 		fastFallbackDuration: threshold,
 		alwaysStandby:        args.AlwaysStandby,
 		primaryFailureOnly:   args.PrimaryFailureOnly,
+		secondaryAcceptDelay: secondaryAcceptDelay,
 	}
 	return s, nil
 }
@@ -191,6 +206,16 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 		timerC = timer.C
 	}
 
+	secondaryAcceptReached := true
+	var secondaryAcceptTimer *time.Timer
+	var secondaryAcceptTimerC <-chan time.Time
+	if f.primaryFailureOnly && f.alwaysStandby && f.secondaryAcceptDelay > 0 {
+		secondaryAcceptReached = false
+		secondaryAcceptTimer = pool.GetTimer(f.secondaryAcceptDelay)
+		defer pool.ReleaseTimer(secondaryAcceptTimer)
+		secondaryAcceptTimerC = secondaryAcceptTimer.C
+	}
+
 	if f.alwaysStandby {
 		startSecondary()
 	}
@@ -206,7 +231,7 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			return false
 		}
 		if f.primaryFailureOnly {
-			if !primaryFailed {
+			if !primaryFailed || !secondaryAcceptReached {
 				return false
 			}
 		} else if f.alwaysStandby && !thresholdReached {
@@ -240,6 +265,9 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			if !f.alwaysStandby && !secondaryStarted {
 				startSecondary()
 			}
+		case <-secondaryAcceptTimerC:
+			secondaryAcceptReached = true
+			secondaryAcceptTimerC = nil
 		case result := <-resultChan:
 			switch result.source {
 			case fallbackResultPrimary:
