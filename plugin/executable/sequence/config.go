@@ -19,11 +19,26 @@
 
 package sequence
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
+// RuleArgs is intentionally permissive because real-world configs often use
+// both of these equivalent YAML forms:
+//
+//	matches: has_resp
+//
+// and:
+//
+//	matches:
+//	  - has_resp
+//
+// Keeping Matches/Exec as any lets us normalize both forms here instead of
+// forcing users to rewrite existing configuration files.
 type RuleArgs struct {
-	Matches []string    `yaml:"matches"`
-	Exec    interface{} `yaml:"exec"` // Supports string or []string
+	Matches any `yaml:"matches"`
+	Exec    any `yaml:"exec"`
 }
 
 type ExecConfig struct {
@@ -34,23 +49,50 @@ type ExecConfig struct {
 
 func parseArgs(ra RuleArgs) RuleConfig {
 	var rc RuleConfig
-	for _, s := range ra.Matches {
+	for _, s := range normalizeStringList(ra.Matches) {
 		rc.Matches = append(rc.Matches, parseMatch(s))
 	}
 
-	switch v := ra.Exec.(type) {
-	case string:
-		if v != "" {
-			rc.Execs = append(rc.Execs, parseExecStr(v))
-		}
-	case []interface{}:
-		for _, item := range v {
-			if s, ok := item.(string); ok && s != "" {
-				rc.Execs = append(rc.Execs, parseExecStr(s))
-			}
-		}
+	for _, s := range normalizeStringList(ra.Exec) {
+		rc.Execs = append(rc.Execs, parseExecStr(s))
 	}
 	return rc
+}
+
+func normalizeStringList(v any) []string {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case string:
+		s := strings.TrimSpace(x)
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	case []string:
+		out := make([]string, 0, len(x))
+		for _, item := range x {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(x))
+		for _, item := range x {
+			s := strings.TrimSpace(fmt.Sprint(item))
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		s := strings.TrimSpace(fmt.Sprint(x))
+		if s == "" || s == "<nil>" {
+			return nil
+		}
+		return []string{s}
+	}
 }
 
 func parseMatch(s string) MatchConfig {

@@ -20,9 +20,11 @@
 package utils
 
 import (
+	"reflect"
+	"strconv"
+
 	"github.com/go-viper/mapstructure/v2"
 	"golang.org/x/exp/constraints"
-	"strconv"
 )
 
 func SetDefaultNum[K constraints.Integer | constraints.Float](p *K, d K) {
@@ -57,6 +59,7 @@ func WeakDecode(in any, output any) error {
 		Result:           output,
 		WeaklyTypedInput: true,
 		TagName:          "yaml",
+		DecodeHook:       emptyStringToZeroHook,
 	}
 
 	decoder, err := mapstructure.NewDecoder(config)
@@ -65,6 +68,25 @@ func WeakDecode(in any, output any) error {
 	}
 
 	return decoder.Decode(in)
+}
+
+func emptyStringToZeroHook(from reflect.Type, to reflect.Type, data any) (any, error) {
+	if from.Kind() != reflect.String {
+		return data, nil
+	}
+	if data.(string) != "" {
+		return data, nil
+	}
+
+	switch to.Kind() {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return reflect.Zero(to).Interface(), nil
+	default:
+		return data, nil
+	}
 }
 
 func ParseNameOrNum[T constraints.Integer](s string, m map[string]T) (T, bool) {
