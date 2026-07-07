@@ -149,22 +149,25 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 	go func() {
 		timer := pool.GetTimer(f.fastFallbackDuration)
 		defer pool.ReleaseTimer(timer)
-		if f.primaryFailureOnly {
-			// Strict fallback mode: secondary must not be started by threshold.
-			// It only starts after primary explicitly failed.
-			select {
-			case <-primDone: // primary is done, no need to exec this.
-				respChan <- nil // Send a nil to unblock the main loop.
-				return
-			case <-primFailed: // primary failed
-			}
-		} else if !f.alwaysStandby { // not always standby, wait here.
-			select {
-			case <-primDone: // primary is done, no need to exec this.
-				respChan <- nil // Send a nil to unblock the main loop.
-				return
-			case <-primFailed: // primary failed
-			case <-timer.C: // timed out
+
+		if !f.alwaysStandby { // secondary is lazy-started.
+			if f.primaryFailureOnly {
+				// Strict fallback mode: threshold must not start secondary.
+				// It only starts after primary explicitly failed.
+				select {
+				case <-primDone: // primary is done, no need to exec this.
+					respChan <- nil // Send a nil to unblock the main loop.
+					return
+				case <-primFailed: // primary failed
+				}
+			} else {
+				// Threshold fallback mode: threshold starts secondary.
+				select {
+				case <-primDone: // primary is done, no need to exec this.
+					respChan <- nil // Send a nil to unblock the main loop.
+					return
+				case <-timer.C: // timed out
+				}
 			}
 		}
 
@@ -184,17 +187,29 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			return
 		}
 
-		// always standby is enabled. Wait until secondary resp is needed.
+		// always_standby means secondary has already queried in parallel,
+		// but its response is held until the selected fallback condition is met.
 		if f.alwaysStandby {
-			select {
-			case <-ctx.Done():
-				// Context cancelled, do nothing.
-			case <-primDone:
-				// Primary succeeded, do nothing.
-			case <-primFailed: // only send secondary result when primary is failed.
-				respChan <- qCtx
-			case <-timer.C: // or timed out.
-				respChan <- qCtx
+			if f.primaryFailureOnly {
+				// Parallel strict fallback: use secondary only after primary explicitly failed.
+				select {
+				case <-ctx.Done():
+					respChan <- nil
+				case <-primDone:
+					respChan <- nil
+				case <-primFailed:
+					respChan <- qCtx
+				}
+			} else {
+				// Parallel threshold fallback: secondary is usable after threshold.
+				select {
+				case <-ctx.Done():
+					respChan <- nil
+				case <-primDone:
+					respChan <- nil
+				case <-timer.C: // threshold reached.
+					respChan <- qCtx
+				}
 			}
 		} else {
 			respChan <- qCtx
