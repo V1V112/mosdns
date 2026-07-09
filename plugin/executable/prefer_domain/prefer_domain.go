@@ -61,6 +61,7 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     resolver: fallback_direct
 //     timeout: 2s          # number without unit means milliseconds
 //     warm_interval: 5m    # number without unit means seconds
+//     bind_ttl_to_warm_interval: true
 //     warm_on_start: true
 //     serve_stale: true
 //     rules:
@@ -94,7 +95,14 @@ type Args struct {
 
 	// cache_ttl accepts Go duration strings. A plain number means seconds.
 	// 0 means derive TTL from the preferred-domain answer.
+	// Ignored when bind_ttl_to_warm_interval is enabled.
 	CacheTTL string `yaml:"cache_ttl"`
+
+	// bind_ttl_to_warm_interval forces both the internal preferred-domain cache TTL
+	// and the client-visible masked answer TTL to warm_interval + 1s.
+	// This keeps the cached preferred-domain answer valid slightly longer than the
+	// next scheduled warm-up. Requires warm_interval > 0.
+	BindTTLToWarmInterval bool `yaml:"bind_ttl_to_warm_interval"`
 
 	WarmOnStart bool `yaml:"warm_on_start"`
 	ServeStale  bool `yaml:"serve_stale"`
@@ -129,11 +137,12 @@ type PreferDomain struct {
 	resolver sequence.Executable
 	rules    []compiledRule
 
-	timeout      time.Duration
-	warmInterval time.Duration
-	cacheTTL     time.Duration
-	warmOnStart  bool
-	serveStale   bool
+	timeout               time.Duration
+	warmInterval          time.Duration
+	cacheTTL              time.Duration
+	bindTTLToWarmInterval bool
+	warmOnStart           bool
+	serveStale            bool
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -169,6 +178,9 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid cache_ttl: %w", PluginType, err)
 	}
+	if cfg.BindTTLToWarmInterval && warmInterval <= 0 {
+		return nil, fmt.Errorf("%s: bind_ttl_to_warm_interval requires warm_interval > 0", PluginType)
+	}
 
 	ruleArgs := normalizeRuleArgs(cfg)
 	if len(ruleArgs) == 0 {
@@ -201,17 +213,18 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &PreferDomain{
-		logger:       bp.L(),
-		resolver:     resolver,
-		rules:        rules,
-		timeout:      timeout,
-		warmInterval: warmInterval,
-		cacheTTL:     cacheTTL,
-		warmOnStart:  cfg.WarmOnStart,
-		serveStale:   cfg.ServeStale,
-		cache:        make(map[string]cacheEntry),
-		ctx:          ctx,
-		cancel:       cancel,
+		logger:                bp.L(),
+		resolver:              resolver,
+		rules:                 rules,
+		timeout:               timeout,
+		warmInterval:          warmInterval,
+		cacheTTL:              cacheTTL,
+		bindTTLToWarmInterval: cfg.BindTTLToWarmInterval,
+		warmOnStart:           cfg.WarmOnStart,
+		serveStale:            cfg.ServeStale,
+		cache:                 make(map[string]cacheEntry),
+		ctx:                   ctx,
+		cancel:                cancel,
 	}
 
 	if p.warmInterval > 0 {
@@ -222,7 +235,8 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		zap.Int("rules", len(rules)),
 		zap.String("resolver", cfg.Resolver),
 		zap.Duration("timeout", p.timeout),
-		zap.Duration("warm_interval", p.warmInterval))
+		zap.Duration("warm_interval", p.warmInterval),
+		zap.Bool("bind_ttl_to_warm_interval", p.bindTTLToWarmInterval))
 
 	return p, nil
 }
@@ -262,7 +276,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		return nil
 	}
 
-	maskedResp, ok := buildMaskedResponse(q, preferredResp)
+	maskedResp, ok := buildMaskedResponse(q, preferredResp, p.forcedResponseTTL())
 	if !ok {
 		p.logger.Debug("preferred domain has no usable answer, keep original response",
 			zap.String("prefer_domain", rule.preferDisplay),
@@ -353,13 +367,7 @@ func (p *PreferDomain) storePreferred(rule *compiledRule, qType uint16, msg *dns
 		return
 	}
 
-	ttl := p.cacheTTL
-	if ttl <= 0 {
-		ttl = ttlFromAnswer(msg, qType)
-	}
-	if ttl <= 0 {
-		ttl = 60 * time.Second
-	}
+	ttl := p.cacheDuration(msg, qType)
 
 	p.mu.Lock()
 	p.cache[cacheKey(rule.preferDomain, qType)] = cacheEntry{
@@ -407,6 +415,32 @@ func (p *PreferDomain) warmAll() {
 			p.storePreferred(rule, qType, msg)
 		}
 	}
+}
+
+func (p *PreferDomain) cacheDuration(msg *dns.Msg, qType uint16) time.Duration {
+	if ttl := p.boundWarmTTL(); ttl > 0 {
+		return ttl
+	}
+
+	ttl := p.cacheTTL
+	if ttl <= 0 {
+		ttl = ttlFromAnswer(msg, qType)
+	}
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	return ttl
+}
+
+func (p *PreferDomain) boundWarmTTL() time.Duration {
+	if !p.bindTTLToWarmInterval || p.warmInterval <= 0 {
+		return 0
+	}
+	return p.warmInterval + time.Second
+}
+
+func (p *PreferDomain) forcedResponseTTL() uint32 {
+	return durationToTTLSeconds(p.boundWarmTTL())
 }
 
 func normalizeRuleArgs(cfg *Args) []RuleArgs {
@@ -499,6 +533,24 @@ func hasWantedIP(r *dns.Msg, qType uint16) bool {
 	return false
 }
 
+func durationToTTLSeconds(d time.Duration) uint32 {
+	if d <= 0 {
+		return 0
+	}
+	maxTTLDuration := time.Duration(^uint32(0)) * time.Second
+	if d >= maxTTLDuration {
+		return ^uint32(0)
+	}
+	sec := d / time.Second
+	if d%time.Second != 0 {
+		sec++
+	}
+	if sec <= 0 {
+		return 1
+	}
+	return uint32(sec)
+}
+
 func ttlFromAnswer(r *dns.Msg, qType uint16) time.Duration {
 	var minTTL uint32
 	for _, rr := range r.Answer {
@@ -518,7 +570,7 @@ func ttlFromAnswer(r *dns.Msg, qType uint16) time.Duration {
 	return time.Duration(minTTL) * time.Second
 }
 
-func buildMaskedResponse(originalQ *dns.Msg, preferredResp *dns.Msg) (*dns.Msg, bool) {
+func buildMaskedResponse(originalQ *dns.Msg, preferredResp *dns.Msg, forcedTTL uint32) (*dns.Msg, bool) {
 	if originalQ == nil || preferredResp == nil || len(originalQ.Question) != 1 {
 		return nil, false
 	}
@@ -542,16 +594,24 @@ func buildMaskedResponse(originalQ *dns.Msg, preferredResp *dns.Msg) (*dns.Msg, 
 			if q.Qtype != dns.TypeA {
 				continue
 			}
+			ttl := rr.Hdr.Ttl
+			if forcedTTL > 0 {
+				ttl = forcedTTL
+			}
 			answers = append(answers, &dns.A{
-				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: rr.Hdr.Ttl},
+				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
 				A:   append(net.IP(nil), rr.A...),
 			})
 		case *dns.AAAA:
 			if q.Qtype != dns.TypeAAAA {
 				continue
 			}
+			ttl := rr.Hdr.Ttl
+			if forcedTTL > 0 {
+				ttl = forcedTTL
+			}
 			answers = append(answers, &dns.AAAA{
-				Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: rr.Hdr.Ttl},
+				Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
 				AAAA: append(net.IP(nil), rr.AAAA...),
 			})
 		}
