@@ -623,6 +623,18 @@ func TestParseFixedDurationDefaultsAndUnits(t *testing.T) {
 			want:         300 * time.Second,
 		},
 		{
+			name:         "cache ttl default",
+			defaultValue: 0,
+			unit:         time.Millisecond,
+			want:         0,
+		},
+		{
+			name:  "cache ttl milliseconds",
+			value: "1500",
+			unit:  time.Millisecond,
+			want:  1500 * time.Millisecond,
+		},
+		{
 			name:  "milliseconds",
 			value: "750",
 			unit:  time.Millisecond,

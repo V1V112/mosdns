@@ -119,8 +119,8 @@ type Args struct {
 	// Set to 0/"0" to disable background warm-up.
 	WarmInterval string `yaml:"warm_interval"`
 
-	// cache_ttl accepts Go duration strings. A plain number means seconds.
-	// 0 means derive TTL from the preferred-domain answer.
+	// cache_ttl is always milliseconds. Default 0 means derive TTL from the
+	// preferred-domain answer.
 	// Ignored for the internal cache when bind_ttl_to_warm_interval is enabled.
 	CacheTTL string `yaml:"cache_ttl"`
 
@@ -248,7 +248,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid warm_interval: %w", PluginType, err)
 	}
-	cacheTTL, err := parseDurationWithDefault(cfg.CacheTTL, 0, time.Second)
+	cacheTTL, err := parseFixedDuration(cfg.CacheTTL, 0, time.Millisecond)
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid cache_ttl: %w", PluginType, err)
 	}
@@ -707,30 +707,6 @@ func parseFixedDuration(s string, defaultValue int64, unit time.Duration) (time.
 		return 0, fmt.Errorf("duration is too large")
 	}
 	return time.Duration(n) * unit, nil
-}
-
-func parseDurationWithDefault(s string, def time.Duration, plainNumberUnit time.Duration) (time.Duration, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return def, nil
-	}
-	if s == "0" {
-		return 0, nil
-	}
-	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		if n < 0 {
-			return 0, fmt.Errorf("duration must not be negative")
-		}
-		return time.Duration(n) * plainNumberUnit, nil
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, err
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("duration must not be negative")
-	}
-	return d, nil
 }
 
 func cacheKey(name string, qType uint16) string {
