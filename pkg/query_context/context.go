@@ -32,6 +32,10 @@ import (
 const (
 	// KeyDomainSet is the key for storing the matched domain_set name in the context.
 	KeyDomainSet uint32 = iota + 100 // Use a number unlikely to conflict with internal keys.
+
+	// KeyPreferOriginalResponse stores an original-domain response deferred by
+	// prefer_domain until the use_orig sequence action explicitly promotes it.
+	KeyPreferOriginalResponse
 )
 
 const (
@@ -168,6 +172,9 @@ func (ctx *Context) ClientOpt() *dns.OPT {
 // SetResponse sets m as response. It takes the ownership of m.
 // If m is nil. It removes existing response.
 func (ctx *Context) SetResponse(m *dns.Msg) {
+	// Any explicit response update supersedes a deferred original response.
+	// prefer_domain stores its candidate without calling SetResponse.
+	ctx.DeleteValue(KeyPreferOriginalResponse)
 	ctx.resp = m
 	if m == nil {
 		ctx.upstreamOpt = nil

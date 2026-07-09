@@ -59,6 +59,7 @@ const (
 	reuseOriginalOnNonMatch
 	reuseOriginalOnFailure
 	reuseOriginalAlways
+	reuseOriginalDeferred
 )
 
 func init() {
@@ -75,10 +76,10 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //   - tag: cf_prefer
 //     type: prefer_domain
 //     args:
-//     original_resolver: fallback_direct # optional: resolve the original name when no response exists
+//     original_resolver: smartdns_direct # optional: resolve the original name when no response exists
 //     original_timeout: 300 # milliseconds
 //     exit_on_original_failure: false
-//     reuse_original_response: on_failure
+//     reuse_original_response: defer # use "use_orig" later to promote it
 //     resolver: fallback_direct
 //     timeout: 500         # milliseconds
 //     warm_interval: 300   # seconds
@@ -90,6 +91,12 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     rules:
 //   - ip_matcher: cf_manual_ip
 //     prefer_domain: cf.example.com
+//
+// A later sequence rule can promote the deferred response and optionally fall
+// back to its normal resolver when no deferred response is available:
+//
+//   - matches: qname $direct_domains
+//     exec: use_orig $smartdns_direct
 //
 // For a single rule, top-level ip_matcher/prefer_domain are also accepted.
 // Legacy ip_set/ip_set_tag/ipset fields are still accepted as aliases.
@@ -111,8 +118,10 @@ type Args struct {
 	ExitOnOriginalFailure bool `yaml:"exit_on_original_failure"`
 
 	// reuse_original_response controls whether a successful original_resolver
-	// probe is written back to qCtx when no replacement is made. Supported
-	// values: never (default), on_non_match, on_failure, always.
+	// probe is reused when no replacement is made. "defer" stores it outside
+	// qCtx.R so downstream domain matchers still run; use the sequence action
+	// "use_orig" to promote it later. Supported values: never (default),
+	// on_non_match, on_failure, always, defer.
 	ReuseOriginalResponse string `yaml:"reuse_original_response"`
 
 	// Single-rule shorthand.
@@ -451,7 +460,9 @@ func (p *PreferDomain) reuseOriginal(qCtx *query_context.Context, q, r *dns.Msg,
 	if !resolvedOriginal || qCtx == nil || q == nil || r == nil {
 		return
 	}
-	if p.reuseOriginalResponse != reuseOriginalAlways && p.reuseOriginalResponse != reason {
+	if p.reuseOriginalResponse != reuseOriginalAlways &&
+		p.reuseOriginalResponse != reuseOriginalDeferred &&
+		p.reuseOriginalResponse != reason {
 		return
 	}
 
@@ -461,6 +472,10 @@ func (p *PreferDomain) reuseOriginal(qCtx *query_context.Context, q, r *dns.Msg,
 	reused.Opcode = q.Opcode
 	reused.RecursionDesired = q.RecursionDesired
 	reused.CheckingDisabled = q.CheckingDisabled
+	if p.reuseOriginalResponse == reuseOriginalDeferred {
+		qCtx.StoreValue(query_context.KeyPreferOriginalResponse, reused)
+		return
+	}
 	qCtx.SetResponse(reused)
 }
 
@@ -791,8 +806,10 @@ func parseReuseOriginalResponseMode(s string) (reuseOriginalResponseMode, error)
 		return reuseOriginalOnFailure, nil
 	case "always":
 		return reuseOriginalAlways, nil
+	case "defer", "deferred":
+		return reuseOriginalDeferred, nil
 	default:
-		return reuseOriginalNever, fmt.Errorf("must be one of never, on_non_match, on_failure, always")
+		return reuseOriginalNever, fmt.Errorf("must be one of never, on_non_match, on_failure, always, defer")
 	}
 }
 
@@ -804,6 +821,8 @@ func (m reuseOriginalResponseMode) String() string {
 		return "on_failure"
 	case reuseOriginalAlways:
 		return "always"
+	case reuseOriginalDeferred:
+		return "defer"
 	default:
 		return "never"
 	}

@@ -170,6 +170,14 @@ func Test_sequence_Exec(t *testing.T) {
 			wantErr:    false,
 			wantTarget: true,
 		},
+		{
+			name: "use deferred original fallback",
+			ra: []RuleArgs{
+				{Exec: "use_orig $target"},
+			},
+			wantErr:    false,
+			wantTarget: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -195,5 +203,78 @@ func Test_sequence_Exec(t *testing.T) {
 				t.Errorf("Exec() getTarget = %v, wantTarget %v", getTarget, tt.wantTarget)
 			}
 		})
+	}
+}
+
+func TestActionUseOrigPromotesDeferredResponse(t *testing.T) {
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+
+	deferred := new(dns.Msg)
+	deferred.SetReply(q)
+	deferred.Answer = append(deferred.Answer, &dns.A{
+		Hdr: dns.RR_Header{
+			Name:   q.Question[0].Name,
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    300,
+		},
+		A: []byte{192, 0, 2, 1},
+	})
+	qCtx.StoreValue(query_context.KeyPreferOriginalResponse, deferred)
+
+	action := &ActionUseOrig{}
+	if err := action.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("ActionUseOrig.Exec() error = %v", err)
+	}
+	if qCtx.R() == nil || len(qCtx.R().Answer) != 1 {
+		t.Fatalf("promoted response = %v, want one answer", qCtx.R())
+	}
+	if qCtx.R() == deferred {
+		t.Fatal("ActionUseOrig promoted the stored message without copying it")
+	}
+	if _, ok := qCtx.GetValue(query_context.KeyPreferOriginalResponse); ok {
+		t.Fatal("deferred response was not removed after promotion")
+	}
+}
+
+func TestActionUseOrigRunsFallbackWhenDeferredResponseIsMissing(t *testing.T) {
+	calls := 0
+	fallback := ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+		calls++
+		r := new(dns.Msg)
+		r.SetReply(qCtx.Q())
+		qCtx.SetResponse(r)
+		return nil
+	})
+
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+	action := &ActionUseOrig{Fallback: fallback}
+	if err := action.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("ActionUseOrig.Exec() error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("fallback calls = %d, want 1", calls)
+	}
+	if qCtx.R() == nil {
+		t.Fatal("fallback response was not retained")
+	}
+}
+
+func TestSetResponseDiscardsDeferredOriginal(t *testing.T) {
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+	qCtx.StoreValue(query_context.KeyPreferOriginalResponse, new(dns.Msg))
+
+	r := new(dns.Msg)
+	r.SetReply(q)
+	qCtx.SetResponse(r)
+
+	if _, ok := qCtx.GetValue(query_context.KeyPreferOriginalResponse); ok {
+		t.Fatal("explicit response did not discard the deferred original")
 	}
 }

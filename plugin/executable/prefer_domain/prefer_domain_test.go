@@ -584,6 +584,53 @@ func TestExecReusesOriginalResponseOnPreferredFailure(t *testing.T) {
 	}
 }
 
+func TestExecDefersOriginalResponseWithoutAffectingHasResp(t *testing.T) {
+	originalIP := "198.51.100.93"
+	p := &PreferDomain{
+		logger: zap.NewNop(),
+		originalResolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			q := qCtx.Q()
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, newA(q.Question[0].Name, originalIP, 300))
+			qCtx.SetResponse(r)
+			return nil
+		}),
+		rules: []compiledRule{{
+			matcher: matcherFunc(func(netip.Addr) bool { return false }),
+		}},
+		originalTimeout:       time.Second,
+		reuseOriginalResponse: reuseOriginalDeferred,
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	q.Id = 4321
+	qCtx := query_context.NewContext(q)
+	if err := p.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	if qCtx.R() != nil {
+		t.Fatalf("deferred mode set an active response: %v", qCtx.R())
+	}
+
+	v, ok := qCtx.GetValue(query_context.KeyPreferOriginalResponse)
+	if !ok {
+		t.Fatal("deferred original response was not stored")
+	}
+	r, ok := v.(*dns.Msg)
+	if !ok || r == nil || len(r.Answer) != 1 {
+		t.Fatalf("deferred value = %T %v, want one-answer *dns.Msg", v, v)
+	}
+	a, ok := r.Answer[0].(*dns.A)
+	if !ok || a.A.String() != originalIP {
+		t.Fatalf("deferred answer = %v, want %s", r.Answer[0], originalIP)
+	}
+	if r.Id != q.Id || len(r.Question) != 1 || r.Question[0] != q.Question[0] {
+		t.Fatalf("deferred response did not restore the original request header: %v", r)
+	}
+}
+
 func TestConcurrentOriginalResolutionUsesSingleflight(t *testing.T) {
 	pluginCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -846,6 +893,8 @@ func TestParseReuseOriginalResponseMode(t *testing.T) {
 		{value: " ON_NON_MATCH ", want: reuseOriginalOnNonMatch},
 		{value: "on_failure", want: reuseOriginalOnFailure},
 		{value: "always", want: reuseOriginalAlways},
+		{value: "defer", want: reuseOriginalDeferred},
+		{value: " DEFERRED ", want: reuseOriginalDeferred},
 		{value: "sometimes", wantErr: true},
 	}
 
