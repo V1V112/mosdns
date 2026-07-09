@@ -52,6 +52,15 @@ const (
 	defaultWarmIntervalSeconds         = 300
 )
 
+type reuseOriginalResponseMode uint8
+
+const (
+	reuseOriginalNever reuseOriginalResponseMode = iota
+	reuseOriginalOnNonMatch
+	reuseOriginalOnFailure
+	reuseOriginalAlways
+)
+
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
 }
@@ -69,6 +78,7 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     original_resolver: fallback_direct # optional: resolve the original name when no response exists
 //     original_timeout: 300 # milliseconds
 //     exit_on_original_failure: false
+//     reuse_original_response: on_failure
 //     resolver: fallback_direct
 //     timeout: 500         # milliseconds
 //     warm_interval: 300   # seconds
@@ -76,6 +86,7 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     bind_response_ttl_to_warm_interval: false # optional: also force client-visible TTL
 //     warm_on_start: true
 //     serve_stale: true
+//     max_stale: 3600      # seconds; 0 means unlimited
 //     rules:
 //   - ip_matcher: cf_manual_ip
 //     prefer_domain: cf.example.com
@@ -88,7 +99,7 @@ type Args struct {
 
 	// original_resolver optionally resolves the client-requested domain when
 	// the plugin runs before any response has been produced. Its result is
-	// used only for IP matching and is never written to the original qCtx.
+	// used for IP matching and can optionally be reused as the response.
 	OriginalResolver string `yaml:"original_resolver"`
 
 	// original_timeout is always milliseconds. Default is 300.
@@ -98,6 +109,11 @@ type Args struct {
 	// original_resolver times out, fails, or returns no usable A/AAAA response.
 	// Disabled by default so downstream fallback processing remains available.
 	ExitOnOriginalFailure bool `yaml:"exit_on_original_failure"`
+
+	// reuse_original_response controls whether a successful original_resolver
+	// probe is written back to qCtx when no replacement is made. Supported
+	// values: never (default), on_non_match, on_failure, always.
+	ReuseOriginalResponse string `yaml:"reuse_original_response"`
 
 	// Single-rule shorthand.
 	IPMatcher       string `yaml:"ip_matcher"`
@@ -137,6 +153,11 @@ type Args struct {
 
 	WarmOnStart bool `yaml:"warm_on_start"`
 	ServeStale  bool `yaml:"serve_stale"`
+
+	// max_stale is always seconds. Default 0 keeps the existing behavior and
+	// allows an expired preferred-domain response to be used without an age
+	// limit when serve_stale is enabled.
+	MaxStale string `yaml:"max_stale"`
 }
 
 type RuleArgs struct {
@@ -172,6 +193,7 @@ type PreferDomain struct {
 
 	originalTimeout               time.Duration
 	exitOnOriginalFailure         bool
+	reuseOriginalResponse         reuseOriginalResponseMode
 	timeout                       time.Duration
 	warmInterval                  time.Duration
 	cacheTTL                      time.Duration
@@ -179,6 +201,7 @@ type PreferDomain struct {
 	bindResponseTTLToWarmInterval bool
 	warmOnStart                   bool
 	serveStale                    bool
+	maxStale                     time.Duration
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -252,11 +275,25 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid cache_ttl: %w", PluginType, err)
 	}
+	maxStale, err := parseFixedDuration(cfg.MaxStale, 0, time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("%s: invalid max_stale: %w", PluginType, err)
+	}
+	reuseOriginalResponse, err := parseReuseOriginalResponseMode(cfg.ReuseOriginalResponse)
+	if err != nil {
+		return nil, fmt.Errorf("%s: invalid reuse_original_response: %w", PluginType, err)
+	}
 	if cfg.BindTTLToWarmInterval && warmInterval <= 0 {
 		return nil, fmt.Errorf("%s: bind_ttl_to_warm_interval requires warm_interval > 0", PluginType)
 	}
 	if cfg.BindResponseTTLToWarmInterval && !cfg.BindTTLToWarmInterval {
 		return nil, fmt.Errorf("%s: bind_response_ttl_to_warm_interval requires bind_ttl_to_warm_interval", PluginType)
+	}
+	if maxStale > 0 && !cfg.ServeStale {
+		return nil, fmt.Errorf("%s: max_stale requires serve_stale", PluginType)
+	}
+	if reuseOriginalResponse != reuseOriginalNever && originalResolver == nil {
+		return nil, fmt.Errorf("%s: reuse_original_response requires original_resolver", PluginType)
 	}
 
 	ruleArgs := normalizeRuleArgs(cfg)
@@ -296,6 +333,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		rules:                         rules,
 		originalTimeout:               originalTimeout,
 		exitOnOriginalFailure:         cfg.ExitOnOriginalFailure,
+		reuseOriginalResponse:         reuseOriginalResponse,
 		timeout:                       timeout,
 		warmInterval:                  warmInterval,
 		cacheTTL:                      cacheTTL,
@@ -303,6 +341,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		bindResponseTTLToWarmInterval: cfg.BindResponseTTLToWarmInterval,
 		warmOnStart:                   cfg.WarmOnStart,
 		serveStale:                    cfg.ServeStale,
+		maxStale:                      maxStale,
 		cache:                         make(map[string]cacheEntry),
 		ctx:                           ctx,
 		cancel:                        cancel,
@@ -315,9 +354,11 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		zap.String("original_resolver", cfg.OriginalResolver),
 		zap.Duration("original_timeout", p.originalTimeout),
 		zap.Bool("exit_on_original_failure", p.exitOnOriginalFailure),
+		zap.String("reuse_original_response", reuseOriginalResponse.String()),
 		zap.String("resolver", cfg.Resolver),
 		zap.Duration("timeout", p.timeout),
 		zap.Duration("warm_interval", p.warmInterval),
+		zap.Duration("max_stale", p.maxStale),
 		zap.Bool("bind_ttl_to_warm_interval", p.bindTTLToWarmInterval),
 		zap.Bool("bind_response_ttl_to_warm_interval", p.bindResponseTTLToWarmInterval))
 
@@ -341,6 +382,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 	}
 
 	r := qCtx.R()
+	resolvedOriginal := false
 	if r == nil && p.originalResolver != nil {
 		var err error
 		r, err = p.getOriginalResponse(ctx, q.Question[0].Name, qType)
@@ -358,6 +400,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 			}
 			return nil
 		}
+		resolvedOriginal = true
 	}
 	if r == nil || r.Rcode != dns.RcodeSuccess {
 		return nil
@@ -365,6 +408,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 
 	rule, addr, ok := p.matchRule(r)
 	if !ok {
+		p.reuseOriginal(qCtx, q, r, resolvedOriginal, reuseOriginalOnNonMatch)
 		return nil
 	}
 
@@ -374,6 +418,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 			zap.String("prefer_domain", rule.preferDisplay),
 			zap.Stringer("matched_ip", addr),
 			zap.Error(err))
+		p.reuseOriginal(qCtx, q, r, resolvedOriginal, reuseOriginalOnFailure)
 		return nil
 	}
 
@@ -388,6 +433,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		p.logger.Debug("preferred domain has no usable answer, keep original response",
 			zap.String("prefer_domain", rule.preferDisplay),
 			zap.Stringer("matched_ip", addr))
+		p.reuseOriginal(qCtx, q, r, resolvedOriginal, reuseOriginalOnFailure)
 		return nil
 	}
 
@@ -399,6 +445,23 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		zap.Stringer("matched_ip", addr),
 		zap.String("prefer_domain", rule.preferDisplay))
 	return nil
+}
+
+func (p *PreferDomain) reuseOriginal(qCtx *query_context.Context, q, r *dns.Msg, resolvedOriginal bool, reason reuseOriginalResponseMode) {
+	if !resolvedOriginal || qCtx == nil || q == nil || r == nil {
+		return
+	}
+	if p.reuseOriginalResponse != reuseOriginalAlways && p.reuseOriginalResponse != reason {
+		return
+	}
+
+	reused := r.Copy()
+	reused.Id = q.Id
+	reused.Question = append([]dns.Question(nil), q.Question...)
+	reused.Opcode = q.Opcode
+	reused.RecursionDesired = q.RecursionDesired
+	reused.CheckingDisabled = q.CheckingDisabled
+	qCtx.SetResponse(reused)
 }
 
 func (p *PreferDomain) getOriginalResponse(ctx context.Context, name string, qType uint16) (*dns.Msg, error) {
@@ -463,17 +526,13 @@ func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledR
 	resultCh := p.resolveAndStore(rule, qType, false)
 	select {
 	case <-ctx.Done():
-		if p.serveStale && stale.msg != nil {
-			msg := stale.msg.Copy()
-			dnsutils.SetTTL(msg, 0)
+		if msg, ok := p.getStaleResponse(stale, time.Now()); ok {
 			return msg, true, nil
 		}
 		return nil, false, context.Cause(ctx)
 	case result := <-resultCh:
 		if result.Err != nil {
-			if p.serveStale && stale.msg != nil {
-				msg := stale.msg.Copy()
-				dnsutils.SetTTL(msg, 0)
+			if msg, ok := p.getStaleResponse(stale, time.Now()); ok {
 				return msg, true, nil
 			}
 			return nil, false, result.Err
@@ -485,6 +544,19 @@ func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledR
 		}
 		return msg.Copy(), false, nil
 	}
+}
+
+func (p *PreferDomain) getStaleResponse(ce cacheEntry, now time.Time) (*dns.Msg, bool) {
+	if !p.serveStale || ce.msg == nil {
+		return nil, false
+	}
+	if p.maxStale > 0 && (ce.expires.IsZero() || now.Sub(ce.expires) > p.maxStale) {
+		return nil, false
+	}
+
+	msg := ce.msg.Copy()
+	dnsutils.SetTTL(msg, 0)
+	return msg, true
 }
 
 func (p *PreferDomain) resolveAndStore(rule *compiledRule, qType uint16, forceRefresh bool) <-chan singleflight.Result {
@@ -707,6 +779,34 @@ func parseFixedDuration(s string, defaultValue int64, unit time.Duration) (time.
 		return 0, fmt.Errorf("duration is too large")
 	}
 	return time.Duration(n) * unit, nil
+}
+
+func parseReuseOriginalResponseMode(s string) (reuseOriginalResponseMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "never":
+		return reuseOriginalNever, nil
+	case "on_non_match":
+		return reuseOriginalOnNonMatch, nil
+	case "on_failure":
+		return reuseOriginalOnFailure, nil
+	case "always":
+		return reuseOriginalAlways, nil
+	default:
+		return reuseOriginalNever, fmt.Errorf("must be one of never, on_non_match, on_failure, always")
+	}
+}
+
+func (m reuseOriginalResponseMode) String() string {
+	switch m {
+	case reuseOriginalOnNonMatch:
+		return "on_non_match"
+	case reuseOriginalOnFailure:
+		return "on_failure"
+	case reuseOriginalAlways:
+		return "always"
+	default:
+		return "never"
+	}
 }
 
 func cacheKey(name string, qType uint16) string {

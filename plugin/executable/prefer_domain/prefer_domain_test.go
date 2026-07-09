@@ -146,6 +146,68 @@ func TestStaleResponseGetsZeroTTL(t *testing.T) {
 	}
 }
 
+func TestMaxStaleRejectsResponseThatIsTooOld(t *testing.T) {
+	rule := &compiledRule{preferDomain: "preferred.example."}
+	msg := &dns.Msg{Answer: []dns.RR{newA(rule.preferDomain, "192.0.2.31", 300)}}
+	p := &PreferDomain{
+		resolver: sequence.ExecutableFunc(func(context.Context, *query_context.Context) error {
+			return errors.New("upstream unavailable")
+		}),
+		timeout:    time.Second,
+		serveStale: true,
+		maxStale:   time.Minute,
+		cache: map[string]cacheEntry{
+			cacheKey(rule.preferDomain, dns.TypeA): {
+				msg:     msg,
+				stored:  time.Now().Add(-3 * time.Minute),
+				expires: time.Now().Add(-2 * time.Minute),
+			},
+		},
+	}
+
+	got, stale, err := p.getPreferredResponse(context.Background(), rule, dns.TypeA)
+	if err == nil {
+		t.Fatal("getPreferredResponse() error = nil, want resolver error")
+	}
+	if stale {
+		t.Fatal("response older than max_stale was served")
+	}
+	if got != nil {
+		t.Fatalf("response older than max_stale = %v, want nil", got)
+	}
+}
+
+func TestMaxStaleAllowsResponseWithinLimit(t *testing.T) {
+	rule := &compiledRule{preferDomain: "preferred.example."}
+	msg := &dns.Msg{Answer: []dns.RR{newA(rule.preferDomain, "192.0.2.32", 300)}}
+	p := &PreferDomain{
+		resolver: sequence.ExecutableFunc(func(context.Context, *query_context.Context) error {
+			return errors.New("upstream unavailable")
+		}),
+		timeout:    time.Second,
+		serveStale: true,
+		maxStale:   time.Minute,
+		cache: map[string]cacheEntry{
+			cacheKey(rule.preferDomain, dns.TypeA): {
+				msg:     msg,
+				stored:  time.Now().Add(-2 * time.Minute),
+				expires: time.Now().Add(-30 * time.Second),
+			},
+		},
+	}
+
+	got, stale, err := p.getPreferredResponse(context.Background(), rule, dns.TypeA)
+	if err != nil {
+		t.Fatalf("getPreferredResponse() error = %v", err)
+	}
+	if !stale {
+		t.Fatal("response within max_stale was not served")
+	}
+	if got == nil || got.Answer[0].Header().Ttl != 0 {
+		t.Fatalf("stale response = %v, want a zero-TTL answer", got)
+	}
+}
+
 func TestZeroTTLResponseIsNotCached(t *testing.T) {
 	rule := &compiledRule{preferDomain: "preferred.example."}
 	p := &PreferDomain{cache: make(map[string]cacheEntry)}
@@ -434,6 +496,94 @@ func TestExecOriginalResolverNonMatchContinuesWithoutResponse(t *testing.T) {
 	}
 }
 
+func TestExecReusesOriginalResponseOnNonMatch(t *testing.T) {
+	originalIP := "198.51.100.91"
+	p := &PreferDomain{
+		logger: zap.NewNop(),
+		originalResolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			q := qCtx.Q()
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, newA(q.Question[0].Name, originalIP, 300))
+			qCtx.SetResponse(r)
+			return nil
+		}),
+		rules: []compiledRule{{
+			matcher: matcherFunc(func(netip.Addr) bool { return false }),
+		}},
+		originalTimeout:       time.Second,
+		reuseOriginalResponse: reuseOriginalOnNonMatch,
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("Original.Example.", dns.TypeA)
+	q.Id = 1234
+	q.RecursionDesired = false
+	q.CheckingDisabled = true
+	qCtx := query_context.NewContext(q)
+	if err := p.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+
+	r := qCtx.R()
+	if r == nil || len(r.Answer) != 1 {
+		t.Fatalf("reused response = %v, want one answer", r)
+	}
+	a, ok := r.Answer[0].(*dns.A)
+	if !ok || a.A.String() != originalIP {
+		t.Fatalf("reused answer = %v, want %s", r.Answer[0], originalIP)
+	}
+	if r.Id != q.Id || len(r.Question) != 1 || r.Question[0] != q.Question[0] {
+		t.Fatalf("reused response did not restore the original request header: %v", r)
+	}
+	if r.RecursionDesired || !r.CheckingDisabled {
+		t.Fatalf("reused response did not restore RD/CD flags: RD=%v CD=%v", r.RecursionDesired, r.CheckingDisabled)
+	}
+}
+
+func TestExecReusesOriginalResponseOnPreferredFailure(t *testing.T) {
+	originalIP := "198.51.100.92"
+	p := &PreferDomain{
+		logger: zap.NewNop(),
+		originalResolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			q := qCtx.Q()
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, newA(q.Question[0].Name, originalIP, 300))
+			qCtx.SetResponse(r)
+			return nil
+		}),
+		resolver: sequence.ExecutableFunc(func(context.Context, *query_context.Context) error {
+			return errors.New("preferred resolver unavailable")
+		}),
+		rules: []compiledRule{{
+			preferDomain:  "preferred.example.",
+			preferDisplay: "preferred.example",
+			matcher:       matcherFunc(func(netip.Addr) bool { return true }),
+		}},
+		originalTimeout:       time.Second,
+		reuseOriginalResponse: reuseOriginalOnFailure,
+		timeout:               time.Second,
+		cache:                 make(map[string]cacheEntry),
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+	if err := p.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+
+	r := qCtx.R()
+	if r == nil || len(r.Answer) != 1 {
+		t.Fatalf("reused response = %v, want one answer", r)
+	}
+	a, ok := r.Answer[0].(*dns.A)
+	if !ok || a.A.String() != originalIP {
+		t.Fatalf("reused answer = %v, want %s", r.Answer[0], originalIP)
+	}
+}
+
 func TestConcurrentOriginalResolutionUsesSingleflight(t *testing.T) {
 	pluginCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -682,6 +832,37 @@ func TestParseFixedDurationDefaultsAndUnits(t *testing.T) {
 				t.Fatalf("parseFixedDuration() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseReuseOriginalResponseMode(t *testing.T) {
+	tests := []struct {
+		value   string
+		want    reuseOriginalResponseMode
+		wantErr bool
+	}{
+		{value: "", want: reuseOriginalNever},
+		{value: "never", want: reuseOriginalNever},
+		{value: " ON_NON_MATCH ", want: reuseOriginalOnNonMatch},
+		{value: "on_failure", want: reuseOriginalOnFailure},
+		{value: "always", want: reuseOriginalAlways},
+		{value: "sometimes", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		got, err := parseReuseOriginalResponseMode(tt.value)
+		if tt.wantErr {
+			if err == nil {
+				t.Fatalf("parseReuseOriginalResponseMode(%q) = %v, want error", tt.value, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("parseReuseOriginalResponseMode(%q) error = %v", tt.value, err)
+		}
+		if got != tt.want {
+			t.Fatalf("parseReuseOriginalResponseMode(%q) = %v, want %v", tt.value, got, tt.want)
+		}
 	}
 }
 
