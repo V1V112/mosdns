@@ -61,7 +61,8 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     resolver: fallback_direct
 //     timeout: 2s          # number without unit means milliseconds
 //     warm_interval: 5m    # number without unit means seconds
-//     bind_ttl_to_warm_interval: true
+//     bind_ttl_to_warm_interval: true          # internal cache TTL = warm_interval + 1s
+//     bind_response_ttl_to_warm_interval: false # optional: also force client-visible TTL
 //     warm_on_start: true
 //     serve_stale: true
 //     rules:
@@ -95,14 +96,19 @@ type Args struct {
 
 	// cache_ttl accepts Go duration strings. A plain number means seconds.
 	// 0 means derive TTL from the preferred-domain answer.
-	// Ignored when bind_ttl_to_warm_interval is enabled.
+	// Ignored for the internal cache when bind_ttl_to_warm_interval is enabled.
 	CacheTTL string `yaml:"cache_ttl"`
 
-	// bind_ttl_to_warm_interval forces both the internal preferred-domain cache TTL
-	// and the client-visible masked answer TTL to warm_interval + 1s.
-	// This keeps the cached preferred-domain answer valid slightly longer than the
-	// next scheduled warm-up. Requires warm_interval > 0.
+	// bind_ttl_to_warm_interval forces only the internal preferred-domain cache TTL
+	// to warm_interval + 1s. This keeps the cached preferred-domain answer valid
+	// slightly longer than the next scheduled warm-up. Requires warm_interval > 0.
 	BindTTLToWarmInterval bool `yaml:"bind_ttl_to_warm_interval"`
+
+	// bind_response_ttl_to_warm_interval also forces the client-visible masked A/AAAA
+	// answer TTL to warm_interval + 1s. Disabled by default so client-visible TTL
+	// keeps the TTL from the preferred-domain A/AAAA answer. Requires
+	// bind_ttl_to_warm_interval and warm_interval > 0 when enabled.
+	BindResponseTTLToWarmInterval bool `yaml:"bind_response_ttl_to_warm_interval"`
 
 	WarmOnStart bool `yaml:"warm_on_start"`
 	ServeStale  bool `yaml:"serve_stale"`
@@ -137,12 +143,13 @@ type PreferDomain struct {
 	resolver sequence.Executable
 	rules    []compiledRule
 
-	timeout               time.Duration
-	warmInterval          time.Duration
-	cacheTTL              time.Duration
-	bindTTLToWarmInterval bool
-	warmOnStart           bool
-	serveStale            bool
+	timeout                       time.Duration
+	warmInterval                  time.Duration
+	cacheTTL                      time.Duration
+	bindTTLToWarmInterval         bool
+	bindResponseTTLToWarmInterval bool
+	warmOnStart                   bool
+	serveStale                    bool
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -181,6 +188,9 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if cfg.BindTTLToWarmInterval && warmInterval <= 0 {
 		return nil, fmt.Errorf("%s: bind_ttl_to_warm_interval requires warm_interval > 0", PluginType)
 	}
+	if cfg.BindResponseTTLToWarmInterval && !cfg.BindTTLToWarmInterval {
+		return nil, fmt.Errorf("%s: bind_response_ttl_to_warm_interval requires bind_ttl_to_warm_interval", PluginType)
+	}
 
 	ruleArgs := normalizeRuleArgs(cfg)
 	if len(ruleArgs) == 0 {
@@ -213,18 +223,19 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &PreferDomain{
-		logger:                bp.L(),
-		resolver:              resolver,
-		rules:                 rules,
-		timeout:               timeout,
-		warmInterval:          warmInterval,
-		cacheTTL:              cacheTTL,
-		bindTTLToWarmInterval: cfg.BindTTLToWarmInterval,
-		warmOnStart:           cfg.WarmOnStart,
-		serveStale:            cfg.ServeStale,
-		cache:                 make(map[string]cacheEntry),
-		ctx:                   ctx,
-		cancel:                cancel,
+		logger:                        bp.L(),
+		resolver:                      resolver,
+		rules:                         rules,
+		timeout:                       timeout,
+		warmInterval:                  warmInterval,
+		cacheTTL:                      cacheTTL,
+		bindTTLToWarmInterval:         cfg.BindTTLToWarmInterval,
+		bindResponseTTLToWarmInterval: cfg.BindResponseTTLToWarmInterval,
+		warmOnStart:                   cfg.WarmOnStart,
+		serveStale:                    cfg.ServeStale,
+		cache:                         make(map[string]cacheEntry),
+		ctx:                           ctx,
+		cancel:                        cancel,
 	}
 
 	if p.warmInterval > 0 {
@@ -236,7 +247,8 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		zap.String("resolver", cfg.Resolver),
 		zap.Duration("timeout", p.timeout),
 		zap.Duration("warm_interval", p.warmInterval),
-		zap.Bool("bind_ttl_to_warm_interval", p.bindTTLToWarmInterval))
+		zap.Bool("bind_ttl_to_warm_interval", p.bindTTLToWarmInterval),
+		zap.Bool("bind_response_ttl_to_warm_interval", p.bindResponseTTLToWarmInterval))
 
 	return p, nil
 }
@@ -440,6 +452,9 @@ func (p *PreferDomain) boundWarmTTL() time.Duration {
 }
 
 func (p *PreferDomain) forcedResponseTTL() uint32 {
+	if !p.bindResponseTTLToWarmInterval {
+		return 0
+	}
 	return durationToTTLSeconds(p.boundWarmTTL())
 }
 
