@@ -68,6 +68,7 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     args:
 //     original_resolver: fallback_direct # optional: resolve the original name when no response exists
 //     original_timeout: 300 # milliseconds
+//     exit_on_original_failure: false
 //     resolver: fallback_direct
 //     timeout: 500         # milliseconds
 //     warm_interval: 300   # seconds
@@ -88,11 +89,15 @@ type Args struct {
 	// original_resolver optionally resolves the client-requested domain when
 	// the plugin runs before any response has been produced. Its result is
 	// used only for IP matching and is never written to the original qCtx.
-	// Resolution failure returns sequence.ErrExit and stops the current sequence.
 	OriginalResolver string `yaml:"original_resolver"`
 
 	// original_timeout is always milliseconds. Default is 300.
 	OriginalTimeout string `yaml:"original_timeout"`
+
+	// exit_on_original_failure stops the current sequence with ErrExit when
+	// original_resolver times out, fails, or returns no usable A/AAAA response.
+	// Disabled by default so downstream fallback processing remains available.
+	ExitOnOriginalFailure bool `yaml:"exit_on_original_failure"`
 
 	// Single-rule shorthand.
 	IPMatcher       string `yaml:"ip_matcher"`
@@ -166,6 +171,7 @@ type PreferDomain struct {
 	rules            []compiledRule
 
 	originalTimeout               time.Duration
+	exitOnOriginalFailure         bool
 	timeout                       time.Duration
 	warmInterval                  time.Duration
 	cacheTTL                      time.Duration
@@ -209,8 +215,13 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		if originalResolver == nil {
 			return nil, fmt.Errorf("%s: original_resolver plugin %q is not executable", PluginType, cfg.OriginalResolver)
 		}
-	} else if strings.TrimSpace(cfg.OriginalTimeout) != "" {
-		return nil, fmt.Errorf("%s: original_timeout requires original_resolver", PluginType)
+	} else {
+		if strings.TrimSpace(cfg.OriginalTimeout) != "" {
+			return nil, fmt.Errorf("%s: original_timeout requires original_resolver", PluginType)
+		}
+		if cfg.ExitOnOriginalFailure {
+			return nil, fmt.Errorf("%s: exit_on_original_failure requires original_resolver", PluginType)
+		}
 	}
 
 	originalTimeout, err := parseFixedDuration(
@@ -284,6 +295,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		resolver:                      resolver,
 		rules:                         rules,
 		originalTimeout:               originalTimeout,
+		exitOnOriginalFailure:         cfg.ExitOnOriginalFailure,
 		timeout:                       timeout,
 		warmInterval:                  warmInterval,
 		cacheTTL:                      cacheTTL,
@@ -302,6 +314,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		zap.Int("rules", len(rules)),
 		zap.String("original_resolver", cfg.OriginalResolver),
 		zap.Duration("original_timeout", p.originalTimeout),
+		zap.Bool("exit_on_original_failure", p.exitOnOriginalFailure),
 		zap.String("resolver", cfg.Resolver),
 		zap.Duration("timeout", p.timeout),
 		zap.Duration("warm_interval", p.warmInterval),
@@ -332,14 +345,18 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		var err error
 		r, err = p.getOriginalResponse(ctx, q.Question[0].Name, qType)
 		if err != nil {
-			p.logger.Debug("failed to resolve original domain, exit current sequence",
+			p.logger.Debug("failed to resolve original domain",
 				zap.String("qname", strings.TrimSuffix(q.Question[0].Name, ".")),
 				zap.Uint16("qtype", qType),
+				zap.Bool("exit_sequence", p.exitOnOriginalFailure),
 				zap.Error(err))
 			if ctx.Err() != nil {
 				return context.Cause(ctx)
 			}
-			return sequence.ErrExit
+			if p.exitOnOriginalFailure {
+				return sequence.ErrExit
+			}
+			return nil
 		}
 	}
 	if r == nil || r.Rcode != dns.RcodeSuccess {

@@ -284,11 +284,12 @@ func TestExecOriginalResolverTimeoutExitsSequence(t *testing.T) {
 			preferDomain: "preferred.example.",
 			matcher:      matcherFunc(func(netip.Addr) bool { return true }),
 		}},
-		originalTimeout: 20 * time.Millisecond,
-		timeout:         time.Second,
-		cache:           make(map[string]cacheEntry),
-		ctx:             pluginCtx,
-		cancel:          cancel,
+		originalTimeout:       20 * time.Millisecond,
+		exitOnOriginalFailure: true,
+		timeout:               time.Second,
+		cache:                 make(map[string]cacheEntry),
+		ctx:                   pluginCtx,
+		cancel:                cancel,
 	}
 
 	q := new(dns.Msg)
@@ -350,9 +351,10 @@ func TestExecOriginalResolverFailuresExitSequence(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := &PreferDomain{
-				logger:           zap.NewNop(),
-				originalResolver: tt.resolver,
-				originalTimeout:  time.Second,
+				logger:                zap.NewNop(),
+				originalResolver:      tt.resolver,
+				originalTimeout:       time.Second,
+				exitOnOriginalFailure: true,
 			}
 
 			q := new(dns.Msg)
@@ -365,6 +367,26 @@ func TestExecOriginalResolverFailuresExitSequence(t *testing.T) {
 				t.Fatalf("failed original resolution modified qCtx response: %v", qCtx.R())
 			}
 		})
+	}
+}
+
+func TestExecOriginalResolverFailureContinuesWhenExitDisabled(t *testing.T) {
+	p := &PreferDomain{
+		logger: zap.NewNop(),
+		originalResolver: sequence.ExecutableFunc(func(context.Context, *query_context.Context) error {
+			return errors.New("resolver failed")
+		}),
+		originalTimeout: time.Second,
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+	if err := p.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("Exec() error = %v, want nil", err)
+	}
+	if qCtx.R() != nil {
+		t.Fatalf("failed original resolution modified qCtx response: %v", qCtx.R())
 	}
 }
 
