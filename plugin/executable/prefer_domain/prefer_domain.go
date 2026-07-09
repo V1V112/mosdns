@@ -44,7 +44,13 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-const PluginType = "prefer_domain"
+const (
+	PluginType = "prefer_domain"
+
+	defaultOriginalTimeoutMilliseconds = 300
+	defaultTimeoutMilliseconds         = 500
+	defaultWarmIntervalSeconds         = 300
+)
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
@@ -60,9 +66,11 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //   - tag: cf_prefer
 //     type: prefer_domain
 //     args:
+//     original_resolver: fallback_direct # optional: resolve the original name when no response exists
+//     original_timeout: 300 # milliseconds
 //     resolver: fallback_direct
-//     timeout: 2s          # number without unit means milliseconds
-//     warm_interval: 5m    # number without unit means seconds
+//     timeout: 500         # milliseconds
+//     warm_interval: 300   # seconds
 //     bind_ttl_to_warm_interval: true          # internal cache TTL = warm_interval + 1s
 //     bind_response_ttl_to_warm_interval: false # optional: also force client-visible TTL
 //     warm_on_start: true
@@ -74,7 +82,17 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 // For a single rule, top-level ip_matcher/prefer_domain are also accepted.
 // Legacy ip_set/ip_set_tag/ipset fields are still accepted as aliases.
 type Args struct {
+	// Resolver resolves the configured preferred domain after an IP rule matches.
 	Resolver string `yaml:"resolver"`
+
+	// original_resolver optionally resolves the client-requested domain when
+	// the plugin runs before any response has been produced. Its result is
+	// used only for IP matching and is never written to the original qCtx.
+	// Resolution failure returns sequence.ErrExit and stops the current sequence.
+	OriginalResolver string `yaml:"original_resolver"`
+
+	// original_timeout is always milliseconds. Default is 300.
+	OriginalTimeout string `yaml:"original_timeout"`
 
 	// Single-rule shorthand.
 	IPMatcher       string `yaml:"ip_matcher"`
@@ -89,10 +107,10 @@ type Args struct {
 	// Multi-rule form. Rules are checked in order; first hit wins.
 	Rules []RuleArgs `yaml:"rules"`
 
-	// timeout accepts Go duration strings ("2s", "500ms"). A plain number means milliseconds.
+	// timeout is always milliseconds. Default is 500.
 	Timeout string `yaml:"timeout"`
 
-	// warm_interval accepts Go duration strings ("5m", "30s"). A plain number means seconds.
+	// warm_interval is always seconds. Default is 300.
 	// Set to 0/"0" to disable background warm-up.
 	WarmInterval string `yaml:"warm_interval"`
 
@@ -143,9 +161,11 @@ type cacheEntry struct {
 type PreferDomain struct {
 	logger *zap.Logger
 
-	resolver sequence.Executable
-	rules    []compiledRule
+	originalResolver sequence.Executable
+	resolver         sequence.Executable
+	rules            []compiledRule
 
+	originalTimeout               time.Duration
 	timeout                       time.Duration
 	warmInterval                  time.Duration
 	cacheTTL                      time.Duration
@@ -157,7 +177,8 @@ type PreferDomain struct {
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
 
-	resolveGroup singleflight.Group
+	originalResolveGroup singleflight.Group
+	resolveGroup         singleflight.Group
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -178,11 +199,41 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		return nil, fmt.Errorf("%s: resolver plugin %q is not executable", PluginType, cfg.Resolver)
 	}
 
-	timeout, err := parseDurationWithDefault(cfg.Timeout, 2*time.Second, time.Millisecond)
+	var originalResolver sequence.Executable
+	if cfg.OriginalResolver != "" {
+		originalResolverPlugin := bp.M().GetPlugin(cfg.OriginalResolver)
+		if originalResolverPlugin == nil {
+			return nil, fmt.Errorf("%s: original_resolver plugin %q not found", PluginType, cfg.OriginalResolver)
+		}
+		originalResolver = sequence.ToExecutable(originalResolverPlugin)
+		if originalResolver == nil {
+			return nil, fmt.Errorf("%s: original_resolver plugin %q is not executable", PluginType, cfg.OriginalResolver)
+		}
+	} else if strings.TrimSpace(cfg.OriginalTimeout) != "" {
+		return nil, fmt.Errorf("%s: original_timeout requires original_resolver", PluginType)
+	}
+
+	originalTimeout, err := parseFixedDuration(
+		cfg.OriginalTimeout,
+		defaultOriginalTimeoutMilliseconds,
+		time.Millisecond,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%s: invalid original_timeout: %w", PluginType, err)
+	}
+	timeout, err := parseFixedDuration(
+		cfg.Timeout,
+		defaultTimeoutMilliseconds,
+		time.Millisecond,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid timeout: %w", PluginType, err)
 	}
-	warmInterval, err := parseDurationWithDefault(cfg.WarmInterval, 5*time.Minute, time.Second)
+	warmInterval, err := parseFixedDuration(
+		cfg.WarmInterval,
+		defaultWarmIntervalSeconds,
+		time.Second,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid warm_interval: %w", PluginType, err)
 	}
@@ -229,8 +280,10 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &PreferDomain{
 		logger:                        bp.L(),
+		originalResolver:              originalResolver,
 		resolver:                      resolver,
 		rules:                         rules,
+		originalTimeout:               originalTimeout,
 		timeout:                       timeout,
 		warmInterval:                  warmInterval,
 		cacheTTL:                      cacheTTL,
@@ -247,6 +300,8 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 	bp.L().Info("prefer_domain plugin loaded",
 		zap.Int("rules", len(rules)),
+		zap.String("original_resolver", cfg.OriginalResolver),
+		zap.Duration("original_timeout", p.originalTimeout),
 		zap.String("resolver", cfg.Resolver),
 		zap.Duration("timeout", p.timeout),
 		zap.Duration("warm_interval", p.warmInterval),
@@ -273,6 +328,20 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 	}
 
 	r := qCtx.R()
+	if r == nil && p.originalResolver != nil {
+		var err error
+		r, err = p.getOriginalResponse(ctx, q.Question[0].Name, qType)
+		if err != nil {
+			p.logger.Debug("failed to resolve original domain, exit current sequence",
+				zap.String("qname", strings.TrimSuffix(q.Question[0].Name, ".")),
+				zap.Uint16("qtype", qType),
+				zap.Error(err))
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
+			}
+			return sequence.ErrExit
+		}
+	}
 	if r == nil || r.Rcode != dns.RcodeSuccess {
 		return nil
 	}
@@ -313,6 +382,31 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		zap.Stringer("matched_ip", addr),
 		zap.String("prefer_domain", rule.preferDisplay))
 	return nil
+}
+
+func (p *PreferDomain) getOriginalResponse(ctx context.Context, name string, qType uint16) (*dns.Msg, error) {
+	key := cacheKey(name, qType)
+	resultCh := p.originalResolveGroup.DoChan(key, func() (any, error) {
+		parent := p.ctx
+		if parent == nil {
+			parent = context.Background()
+		}
+		return resolveDomain(parent, p.originalResolver, p.originalTimeout, name, qType)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	case result := <-resultCh:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		msg, ok := result.Val.(*dns.Msg)
+		if !ok || msg == nil {
+			return nil, errors.New("original_resolver returned invalid shared result")
+		}
+		return msg.Copy(), nil
+	}
 }
 
 func (p *PreferDomain) matchRule(r *dns.Msg) (*compiledRule, netip.Addr, bool) {
@@ -412,15 +506,23 @@ func (p *PreferDomain) resolveAndStore(rule *compiledRule, qType uint16, forceRe
 }
 
 func (p *PreferDomain) resolvePreferred(parent context.Context, rule *compiledRule, qType uint16) (*dns.Msg, error) {
-	ctx, cancel := context.WithTimeout(parent, p.timeout)
+	return resolveDomain(parent, p.resolver, p.timeout, rule.preferDomain, qType)
+}
+
+func resolveDomain(parent context.Context, resolver sequence.Executable, timeout time.Duration, name string, qType uint16) (*dns.Msg, error) {
+	if resolver == nil {
+		return nil, errors.New("resolver is not configured")
+	}
+
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	q := new(dns.Msg)
-	q.SetQuestion(rule.preferDomain, qType)
+	q.SetQuestion(dns.Fqdn(name), qType)
 	q.RecursionDesired = true
 
 	subCtx := query_context.NewContext(q)
-	if err := p.resolver.Exec(ctx, subCtx); err != nil && !errors.Is(err, sequence.ErrExit) {
+	if err := resolver.Exec(ctx, subCtx); err != nil && !errors.Is(err, sequence.ErrExit) {
 		return nil, err
 	}
 
@@ -432,7 +534,7 @@ func (p *PreferDomain) resolvePreferred(parent context.Context, rule *compiledRu
 		return nil, fmt.Errorf("resolver returned rcode %d", r.Rcode)
 	}
 	if !hasWantedIP(r, qType) {
-		return nil, errors.New("preferred domain response has no wanted A/AAAA answer")
+		return nil, errors.New("resolver response has no wanted A/AAAA answer")
 	}
 	return r.Copy(), nil
 }
@@ -568,6 +670,26 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func parseFixedDuration(s string, defaultValue int64, unit time.Duration) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Duration(defaultValue) * unit, nil
+	}
+
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("must be an integer without a unit suffix")
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("duration must not be negative")
+	}
+	maxDuration := int64(^uint64(0) >> 1)
+	if unit <= 0 || n > maxDuration/int64(unit) {
+		return 0, fmt.Errorf("duration is too large")
+	}
+	return time.Duration(n) * unit, nil
 }
 
 func parseDurationWithDefault(s string, def time.Duration, plainNumberUnit time.Duration) (time.Duration, error) {

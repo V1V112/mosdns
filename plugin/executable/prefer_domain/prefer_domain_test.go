@@ -200,6 +200,280 @@ func TestWarmOnStartWorksWithoutWarmInterval(t *testing.T) {
 	}
 }
 
+func TestExecResolvesOriginalDomainBeforeMatching(t *testing.T) {
+	pluginCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	originalIP := netip.MustParseAddr("192.0.2.80")
+	preferredIP := "203.0.113.80"
+	var originalCalls atomic.Int32
+	var preferredCalls atomic.Int32
+	p := &PreferDomain{
+		logger: zap.NewNop(),
+		originalResolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			originalCalls.Add(1)
+			q := qCtx.Q()
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, newA(q.Question[0].Name, originalIP.String(), 300))
+			qCtx.SetResponse(r)
+			return nil
+		}),
+		resolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			preferredCalls.Add(1)
+			q := qCtx.Q()
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, newA(q.Question[0].Name, preferredIP, 300))
+			qCtx.SetResponse(r)
+			return nil
+		}),
+		rules: []compiledRule{{
+			preferDomain:  "preferred.example.",
+			preferDisplay: "preferred.example",
+			matcher: matcherFunc(func(addr netip.Addr) bool {
+				return addr == originalIP
+			}),
+		}},
+		originalTimeout: time.Second,
+		timeout:         time.Second,
+		cache:           make(map[string]cacheEntry),
+		ctx:             pluginCtx,
+		cancel:          cancel,
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+	if err := p.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+
+	r := qCtx.R()
+	if r == nil || len(r.Answer) != 1 {
+		t.Fatalf("Exec() response = %v, want one answer", r)
+	}
+	a, ok := r.Answer[0].(*dns.A)
+	if !ok || a.A.String() != preferredIP || a.Hdr.Name != "original.example." {
+		t.Fatalf("masked answer = %v, want original.example. -> %s", r.Answer[0], preferredIP)
+	}
+	if got := originalCalls.Load(); got != 1 {
+		t.Fatalf("original resolver calls = %d, want 1", got)
+	}
+	if got := preferredCalls.Load(); got != 1 {
+		t.Fatalf("preferred resolver calls = %d, want 1", got)
+	}
+}
+
+func TestExecOriginalResolverTimeoutExitsSequence(t *testing.T) {
+	pluginCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var preferredCalls atomic.Int32
+	p := &PreferDomain{
+		logger: zap.NewNop(),
+		originalResolver: sequence.ExecutableFunc(func(ctx context.Context, _ *query_context.Context) error {
+			<-ctx.Done()
+			return context.Cause(ctx)
+		}),
+		resolver: sequence.ExecutableFunc(func(_ context.Context, _ *query_context.Context) error {
+			preferredCalls.Add(1)
+			return nil
+		}),
+		rules: []compiledRule{{
+			preferDomain: "preferred.example.",
+			matcher:      matcherFunc(func(netip.Addr) bool { return true }),
+		}},
+		originalTimeout: 20 * time.Millisecond,
+		timeout:         time.Second,
+		cache:           make(map[string]cacheEntry),
+		ctx:             pluginCtx,
+		cancel:          cancel,
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+	start := time.Now()
+	if err := p.Exec(context.Background(), qCtx); !errors.Is(err, sequence.ErrExit) {
+		t.Fatalf("Exec() error = %v, want ErrExit", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Exec() did not return promptly after original timeout: %v", elapsed)
+	}
+	if qCtx.R() != nil {
+		t.Fatalf("original timeout modified qCtx response: %v", qCtx.R())
+	}
+	if got := preferredCalls.Load(); got != 0 {
+		t.Fatalf("preferred resolver calls = %d, want 0", got)
+	}
+}
+
+func TestExecOriginalResolverFailuresExitSequence(t *testing.T) {
+	tests := []struct {
+		name     string
+		resolver sequence.Executable
+	}{
+		{
+			name: "execution error",
+			resolver: sequence.ExecutableFunc(func(context.Context, *query_context.Context) error {
+				return errors.New("resolver failed")
+			}),
+		},
+		{
+			name: "no response",
+			resolver: sequence.ExecutableFunc(func(context.Context, *query_context.Context) error {
+				return nil
+			}),
+		},
+		{
+			name: "servfail response",
+			resolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+				r := new(dns.Msg)
+				r.SetReply(qCtx.Q())
+				r.Rcode = dns.RcodeServerFailure
+				qCtx.SetResponse(r)
+				return nil
+			}),
+		},
+		{
+			name: "response without address",
+			resolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+				r := new(dns.Msg)
+				r.SetReply(qCtx.Q())
+				qCtx.SetResponse(r)
+				return nil
+			}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &PreferDomain{
+				logger:           zap.NewNop(),
+				originalResolver: tt.resolver,
+				originalTimeout:  time.Second,
+			}
+
+			q := new(dns.Msg)
+			q.SetQuestion("original.example.", dns.TypeA)
+			qCtx := query_context.NewContext(q)
+			if err := p.Exec(context.Background(), qCtx); !errors.Is(err, sequence.ErrExit) {
+				t.Fatalf("Exec() error = %v, want ErrExit", err)
+			}
+			if qCtx.R() != nil {
+				t.Fatalf("failed original resolution modified qCtx response: %v", qCtx.R())
+			}
+		})
+	}
+}
+
+func TestExecOriginalResolverNonMatchContinuesWithoutResponse(t *testing.T) {
+	pluginCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var preferredCalls atomic.Int32
+	p := &PreferDomain{
+		logger: zap.NewNop(),
+		originalResolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			q := qCtx.Q()
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, newA(q.Question[0].Name, "198.51.100.90", 300))
+			qCtx.SetResponse(r)
+			return nil
+		}),
+		resolver: sequence.ExecutableFunc(func(_ context.Context, _ *query_context.Context) error {
+			preferredCalls.Add(1)
+			return nil
+		}),
+		rules: []compiledRule{{
+			preferDomain: "preferred.example.",
+			matcher:      matcherFunc(func(netip.Addr) bool { return false }),
+		}},
+		originalTimeout: time.Second,
+		timeout:         time.Second,
+		cache:           make(map[string]cacheEntry),
+		ctx:             pluginCtx,
+		cancel:          cancel,
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("original.example.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+	if err := p.Exec(context.Background(), qCtx); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	if qCtx.R() != nil {
+		t.Fatalf("non-matching original probe modified qCtx response: %v", qCtx.R())
+	}
+	if got := preferredCalls.Load(); got != 0 {
+		t.Fatalf("preferred resolver calls = %d, want 0", got)
+	}
+}
+
+func TestConcurrentOriginalResolutionUsesSingleflight(t *testing.T) {
+	pluginCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	resolverStarted := make(chan struct{})
+	allowResolver := make(chan struct{})
+	var startedOnce sync.Once
+	p := &PreferDomain{
+		originalResolver: sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			calls.Add(1)
+			startedOnce.Do(func() { close(resolverStarted) })
+			<-allowResolver
+			q := qCtx.Q()
+			r := new(dns.Msg)
+			r.SetReply(q)
+			r.Answer = append(r.Answer, newA(q.Question[0].Name, "192.0.2.100", 300))
+			qCtx.SetResponse(r)
+			return nil
+		}),
+		originalTimeout: time.Second,
+		ctx:             pluginCtx,
+		cancel:          cancel,
+	}
+
+	const concurrency = 16
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(concurrency)
+	done.Add(concurrency)
+	errs := make(chan error, concurrency)
+	for range concurrency {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			_, err := p.getOriginalResponse(context.Background(), "original.example.", dns.TypeA)
+			errs <- err
+		}()
+	}
+
+	ready.Wait()
+	close(start)
+	<-resolverStarted
+	// Keep the resolver in flight long enough for all released callers to
+	// join the same singleflight request.
+	time.Sleep(50 * time.Millisecond)
+	close(allowResolver)
+	done.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("getOriginalResponse() error = %v", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("original resolver calls = %d, want 1", got)
+	}
+}
+
 func TestConcurrentCacheMissUsesSingleflight(t *testing.T) {
 	pluginCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -296,6 +570,84 @@ func TestWarmAllDeduplicatesDomainAndQType(t *testing.T) {
 
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("resolver calls = %d, want 2 (one A and one AAAA)", got)
+	}
+}
+
+func TestParseFixedDurationDefaultsAndUnits(t *testing.T) {
+	tests := []struct {
+		name         string
+		value        string
+		defaultValue int64
+		unit         time.Duration
+		want         time.Duration
+		wantErr      bool
+	}{
+		{
+			name:         "original timeout default",
+			defaultValue: defaultOriginalTimeoutMilliseconds,
+			unit:         time.Millisecond,
+			want:         300 * time.Millisecond,
+		},
+		{
+			name:         "preferred timeout default",
+			defaultValue: defaultTimeoutMilliseconds,
+			unit:         time.Millisecond,
+			want:         500 * time.Millisecond,
+		},
+		{
+			name:         "warm interval default",
+			defaultValue: defaultWarmIntervalSeconds,
+			unit:         time.Second,
+			want:         300 * time.Second,
+		},
+		{
+			name:  "milliseconds",
+			value: "750",
+			unit:  time.Millisecond,
+			want:  750 * time.Millisecond,
+		},
+		{
+			name:  "seconds",
+			value: "60",
+			unit:  time.Second,
+			want:  time.Minute,
+		},
+		{
+			name:  "explicit zero",
+			value: "0",
+			unit:  time.Second,
+			want:  0,
+		},
+		{
+			name:    "unit suffix rejected",
+			value:   "500ms",
+			unit:    time.Millisecond,
+			wantErr: true,
+		},
+		{
+			name:    "negative rejected",
+			value:   "-1",
+			unit:    time.Millisecond,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseFixedDuration(tt.value, tt.defaultValue, tt.unit)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseFixedDuration() = %v, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseFixedDuration() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseFixedDuration() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -140,6 +140,16 @@ type fallbackResult struct {
 	success bool
 }
 
+// fallbackExecSucceeded treats ErrExit as a successful control signal only
+// when the branch has already produced a response. ErrExit without a response
+// must still allow the other branch to provide one.
+func fallbackExecSucceeded(err error, qCtx *query_context.Context) bool {
+	if qCtx.R() == nil {
+		return false
+	}
+	return err == nil || errors.Is(err, sequence.ErrExit)
+}
+
 func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) error {
 	runCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
@@ -152,15 +162,11 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 		defer cancel()
 
 		err := f.primary.Exec(execCtx, qCtxP)
-		primarySucceeded := false
-		if err != nil {
-			if errors.Is(err, sequence.ErrExit) {
-				primarySucceeded = true
-			} else {
+		primarySucceeded := fallbackExecSucceeded(err, qCtxP)
+		if err != nil && !errors.Is(err, sequence.ErrExit) {
+			if f.logger != nil {
 				f.logger.Warn("primary error", qCtxP.InfoField(), zap.Error(err))
 			}
-		} else if qCtxP.R() != nil {
-			primarySucceeded = true
 		}
 
 		sendFallbackResult(runCtx, resultChan, fallbackResult{
@@ -183,11 +189,11 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			defer cancel()
 
 			err := f.secondary.Exec(execCtx, qCtxS)
-			secondarySucceeded := false
-			if err != nil {
-				f.logger.Warn("secondary error", qCtxS.InfoField(), zap.Error(err))
-			} else if qCtxS.R() != nil {
-				secondarySucceeded = true
+			secondarySucceeded := fallbackExecSucceeded(err, qCtxS)
+			if err != nil && !errors.Is(err, sequence.ErrExit) {
+				if f.logger != nil {
+					f.logger.Warn("secondary error", qCtxS.InfoField(), zap.Error(err))
+				}
 			}
 
 			sendFallbackResult(runCtx, resultChan, fallbackResult{
