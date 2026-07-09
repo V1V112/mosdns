@@ -80,8 +80,12 @@ func NewSequence(bq BQ, ra[]RuleArgs) (*Sequence, error) {
 	}
 
 	var rc[]RuleConfig
-	for _, ra := range ra {
-		rc = append(rc, parseArgs(ra))
+	for i, ra := range ra {
+		rule, err := parseArgs(ra)
+		if err != nil {
+			return nil, fmt.Errorf("invalid rule #%d: %w", i, err)
+		}
+		rc = append(rc, rule)
 	}
 	if err := s.buildChain(bq, rc); err != nil {
 		_ = s.Close()

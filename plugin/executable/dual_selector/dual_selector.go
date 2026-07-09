@@ -77,7 +77,7 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	qName := key(q.Question[0].Name)
 	if qtype == s.prefer {
-		nextWalker := next
+		nextWalker := next.Fork()
 		err := nextWalker.ExecNext(ctx, qCtx)
 		if err != nil {
 			return err
@@ -114,7 +114,7 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		qCtx := qCtxPreferred
 		ctx, cancel := context.WithDeadline(context.Background(), ddl)
 		defer cancel()
-		nextWalker := next
+		nextWalker := next.Fork()
 		err := nextWalker.ExecNext(ctx, qCtx)
 		if err != nil {
 			s.L().Warn("reference query routine err", qCtx.InfoField(), zap.Error(err))
@@ -137,7 +137,7 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		qCtx := qCtxOrg
 		ctx, cancel := context.WithDeadline(context.Background(), ddl)
 		defer cancel()
-		nextWalker := next
+		nextWalker := next.Fork()
 		doneChan <- nextWalker.ExecNext(ctx, qCtx)
 	}()
 

@@ -47,28 +47,36 @@ type ExecConfig struct {
 	Args string
 }
 
-func parseArgs(ra RuleArgs) RuleConfig {
+func parseArgs(ra RuleArgs) (RuleConfig, error) {
 	var rc RuleConfig
-	for _, s := range normalizeStringList(ra.Matches) {
+	matches, err := normalizeStringList(ra.Matches)
+	if err != nil {
+		return rc, fmt.Errorf("invalid matches: %w", err)
+	}
+	for _, s := range matches {
 		rc.Matches = append(rc.Matches, parseMatch(s))
 	}
 
-	for _, s := range normalizeStringList(ra.Exec) {
+	execs, err := normalizeStringList(ra.Exec)
+	if err != nil {
+		return rc, fmt.Errorf("invalid exec: %w", err)
+	}
+	for _, s := range execs {
 		rc.Execs = append(rc.Execs, parseExecStr(s))
 	}
-	return rc
+	return rc, nil
 }
 
-func normalizeStringList(v any) []string {
+func normalizeStringList(v any) ([]string, error) {
 	switch x := v.(type) {
 	case nil:
-		return nil
+		return nil, nil
 	case string:
 		s := strings.TrimSpace(x)
 		if s == "" {
-			return nil
+			return nil, nil
 		}
-		return []string{s}
+		return []string{s}, nil
 	case []string:
 		out := make([]string, 0, len(x))
 		for _, item := range x {
@@ -76,22 +84,22 @@ func normalizeStringList(v any) []string {
 				out = append(out, s)
 			}
 		}
-		return out
+		return out, nil
 	case []any:
 		out := make([]string, 0, len(x))
-		for _, item := range x {
-			s := strings.TrimSpace(fmt.Sprint(item))
+		for i, item := range x {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("item %d must be a string, got %T", i, item)
+			}
+			s = strings.TrimSpace(s)
 			if s != "" {
 				out = append(out, s)
 			}
 		}
-		return out
+		return out, nil
 	default:
-		s := strings.TrimSpace(fmt.Sprint(x))
-		if s == "" || s == "<nil>" {
-			return nil
-		}
-		return []string{s}
+		return nil, fmt.Errorf("must be a string or list of strings, got %T", v)
 	}
 }
 

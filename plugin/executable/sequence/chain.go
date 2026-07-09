@@ -71,6 +71,19 @@ func NewChainWalker(ins []instruction, chain[]*ChainNode, jumpBack *ChainWalker,
 	}
 }
 
+// Fork returns an independent walker cursor for concurrent execution.
+// The instruction and chain slices are immutable after compilation and can be
+// shared, but every jump-back cursor must be copied recursively because
+// ExecNext mutates its position.
+func (w ChainWalker) Fork() ChainWalker {
+	fork := w
+	if w.jumpBack != nil {
+		jumpBackFork := w.jumpBack.Fork()
+		fork.jumpBack = &jumpBackFork
+	}
+	return fork
+}
+
 func (w *ChainWalker) ExecNext(ctx context.Context, qCtx *query_context.Context) error {
 	ins := w.ins
 	for w.p < len(ins) {

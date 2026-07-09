@@ -21,11 +21,11 @@ package sequence
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
 func Test_parseExecStr(t *testing.T) {
-
 	tests := []struct {
 		name     string
 		args     string
@@ -38,10 +38,8 @@ func Test_parseExecStr(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// [修改] 调用新的 parseExecStr 函数，接收结构体
 			got := parseExecStr(tt.args)
-			
-			// [修改] 验证结构体字段
+
 			if got.Tag != tt.wantTag {
 				t.Errorf("parseExecStr() gotTag = %v, want %v", got.Tag, tt.wantTag)
 			}
@@ -80,5 +78,60 @@ func Test_parseMatch(t *testing.T) {
 				t.Errorf("parseMatch() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeStringListAcceptsStringForms(t *testing.T) {
+	tests := []struct {
+		name string
+		in   any
+		want []string
+	}{
+		{name: "nil", in: nil, want: nil},
+		{name: "scalar", in: "  has_resp  ", want: []string{"has_resp"}},
+		{name: "string slice", in: []string{" has_resp ", "", "rcode 0"}, want: []string{"has_resp", "rcode 0"}},
+		{name: "any slice", in: []any{" has_resp ", "", "rcode 0"}, want: []string{"has_resp", "rcode 0"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeStringList(tt.in)
+			if err != nil {
+				t.Fatalf("normalizeStringList() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("normalizeStringList() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeStringListRejectsNonStrings(t *testing.T) {
+	tests := []struct {
+		name string
+		in   any
+	}{
+		{name: "scalar number", in: 1},
+		{name: "scalar bool", in: true},
+		{name: "map", in: map[string]any{"exec": "accept"}},
+		{name: "number in list", in: []any{"accept", 1}},
+		{name: "nil in list", in: []any{"accept", nil}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := normalizeStringList(tt.in); err == nil {
+				t.Fatal("normalizeStringList() accepted a non-string value")
+			}
+		})
+	}
+}
+
+func TestParseArgsReportsFieldForInvalidType(t *testing.T) {
+	if _, err := parseArgs(RuleArgs{Matches: []any{"has_resp", false}, Exec: "accept"}); err == nil || !strings.Contains(err.Error(), "matches") {
+		t.Fatalf("parseArgs() matches error = %v", err)
+	}
+	if _, err := parseArgs(RuleArgs{Matches: "has_resp", Exec: []any{"accept", 1}}); err == nil || !strings.Contains(err.Error(), "exec") {
+		t.Fatalf("parseArgs() exec error = %v", err)
 	}
 }

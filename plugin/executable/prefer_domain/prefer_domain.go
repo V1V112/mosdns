@@ -34,12 +34,14 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 const PluginType = "prefer_domain"
@@ -134,6 +136,7 @@ type compiledRule struct {
 
 type cacheEntry struct {
 	msg     *dns.Msg
+	stored  time.Time
 	expires time.Time
 }
 
@@ -153,6 +156,8 @@ type PreferDomain struct {
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
+
+	resolveGroup singleflight.Group
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -238,9 +243,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		cancel:                        cancel,
 	}
 
-	if p.warmInterval > 0 {
-		go p.warmLoop()
-	}
+	p.startWarmers()
 
 	bp.L().Info("prefer_domain plugin loaded",
 		zap.Int("rules", len(rules)),
@@ -279,7 +282,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		return nil
 	}
 
-	preferredResp, err := p.getPreferredResponse(ctx, rule, qType)
+	preferredResp, stale, err := p.getPreferredResponse(ctx, rule, qType)
 	if err != nil {
 		p.logger.Debug("failed to resolve preferred domain, keep original response",
 			zap.String("prefer_domain", rule.preferDisplay),
@@ -288,7 +291,13 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		return nil
 	}
 
-	maskedResp, ok := buildMaskedResponse(q, preferredResp, p.forcedResponseTTL())
+	forcedTTL := p.forcedResponseTTL()
+	if stale {
+		// Stale data is only an availability fallback. Do not let clients
+		// extend its lifetime, even when response TTL binding is enabled.
+		forcedTTL = 0
+	}
+	maskedResp, ok := buildMaskedResponse(q, preferredResp, forcedTTL)
 	if !ok {
 		p.logger.Debug("preferred domain has no usable answer, keep original response",
 			zap.String("prefer_domain", rule.preferDisplay),
@@ -307,13 +316,13 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 }
 
 func (p *PreferDomain) matchRule(r *dns.Msg) (*compiledRule, netip.Addr, bool) {
-	for _, rr := range r.Answer {
-		addr, ok := rrIP(rr)
-		if !ok {
-			continue
-		}
-		for i := range p.rules {
-			rule := &p.rules[i]
+	for i := range p.rules {
+		rule := &p.rules[i]
+		for _, rr := range r.Answer {
+			addr, ok := rrIP(rr)
+			if !ok {
+				continue
+			}
 			if rule.matcher != nil && rule.matcher.Match(addr) {
 				return rule, addr, true
 			}
@@ -322,7 +331,7 @@ func (p *PreferDomain) matchRule(r *dns.Msg) (*compiledRule, netip.Addr, bool) {
 	return nil, netip.Addr{}, false
 }
 
-func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledRule, qType uint16) (*dns.Msg, error) {
+func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledRule, qType uint16) (*dns.Msg, bool, error) {
 	key := cacheKey(rule.preferDomain, qType)
 	now := time.Now()
 
@@ -330,22 +339,76 @@ func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledR
 	ce, ok := p.cache[key]
 	if ok && now.Before(ce.expires) && ce.msg != nil {
 		msg := ce.msg.Copy()
+		stored := ce.stored
 		p.mu.RUnlock()
-		return msg, nil
+		if elapsed := now.Sub(stored); elapsed > 0 {
+			subtractTTLToZero(msg, durationToTTLSeconds(elapsed))
+		}
+		return msg, false, nil
 	}
 	stale := ce
 	p.mu.RUnlock()
 
-	msg, err := p.resolvePreferred(ctx, rule, qType)
-	if err != nil {
+	resultCh := p.resolveAndStore(rule, qType, false)
+	select {
+	case <-ctx.Done():
 		if p.serveStale && stale.msg != nil {
-			return stale.msg.Copy(), nil
+			msg := stale.msg.Copy()
+			dnsutils.SetTTL(msg, 0)
+			return msg, true, nil
 		}
-		return nil, err
-	}
+		return nil, false, context.Cause(ctx)
+	case result := <-resultCh:
+		if result.Err != nil {
+			if p.serveStale && stale.msg != nil {
+				msg := stale.msg.Copy()
+				dnsutils.SetTTL(msg, 0)
+				return msg, true, nil
+			}
+			return nil, false, result.Err
+		}
 
-	p.storePreferred(rule, qType, msg)
-	return msg.Copy(), nil
+		msg, ok := result.Val.(*dns.Msg)
+		if !ok || msg == nil {
+			return nil, false, errors.New("resolver returned invalid shared result")
+		}
+		return msg.Copy(), false, nil
+	}
+}
+
+func (p *PreferDomain) resolveAndStore(rule *compiledRule, qType uint16, forceRefresh bool) <-chan singleflight.Result {
+	key := cacheKey(rule.preferDomain, qType)
+	return p.resolveGroup.DoChan(key, func() (any, error) {
+		// Close the small race between the caller's cache lookup and joining
+		// singleflight. A previous flight may have populated the cache in that
+		// interval. Periodic warm-up deliberately bypasses this check.
+		if !forceRefresh {
+			now := time.Now()
+			p.mu.RLock()
+			ce, ok := p.cache[key]
+			if ok && now.Before(ce.expires) && ce.msg != nil {
+				msg := ce.msg.Copy()
+				stored := ce.stored
+				p.mu.RUnlock()
+				if elapsed := now.Sub(stored); elapsed > 0 {
+					subtractTTLToZero(msg, durationToTTLSeconds(elapsed))
+				}
+				return msg, nil
+			}
+			p.mu.RUnlock()
+		}
+
+		parent := p.ctx
+		if parent == nil {
+			parent = context.Background()
+		}
+		msg, err := p.resolvePreferred(parent, rule, qType)
+		if err != nil {
+			return nil, err
+		}
+		p.storePreferred(rule, qType, msg)
+		return msg, nil
+	})
 }
 
 func (p *PreferDomain) resolvePreferred(parent context.Context, rule *compiledRule, qType uint16) (*dns.Msg, error) {
@@ -380,20 +443,34 @@ func (p *PreferDomain) storePreferred(rule *compiledRule, qType uint16, msg *dns
 	}
 
 	ttl := p.cacheDuration(msg, qType)
+	key := cacheKey(rule.preferDomain, qType)
+	if ttl <= 0 {
+		p.mu.Lock()
+		delete(p.cache, key)
+		p.mu.Unlock()
+		return
+	}
+	now := time.Now()
 
 	p.mu.Lock()
-	p.cache[cacheKey(rule.preferDomain, qType)] = cacheEntry{
+	p.cache[key] = cacheEntry{
 		msg:     msg.Copy(),
-		expires: time.Now().Add(ttl),
+		stored:  now,
+		expires: now.Add(ttl),
 	}
 	p.mu.Unlock()
 }
 
-func (p *PreferDomain) warmLoop() {
+func (p *PreferDomain) startWarmers() {
 	if p.warmOnStart {
-		p.warmAll()
+		go p.warmAll()
 	}
+	if p.warmInterval > 0 {
+		go p.warmLoop()
+	}
+}
 
+func (p *PreferDomain) warmLoop() {
 	t := time.NewTicker(p.warmInterval)
 	defer t.Stop()
 	for {
@@ -407,24 +484,35 @@ func (p *PreferDomain) warmLoop() {
 }
 
 func (p *PreferDomain) warmAll() {
+	seen := make(map[string]struct{}, len(p.rules)*2)
 	for i := range p.rules {
 		rule := &p.rules[i]
 		for _, qType := range []uint16{dns.TypeA, dns.TypeAAAA} {
+			key := cacheKey(rule.preferDomain, qType)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+
 			select {
 			case <-p.ctx.Done():
 				return
 			default:
 			}
 
-			msg, err := p.resolvePreferred(p.ctx, rule, qType)
-			if err != nil {
+			resultCh := p.resolveAndStore(rule, qType, true)
+			select {
+			case <-p.ctx.Done():
+				return
+			case result := <-resultCh:
+				if result.Err == nil {
+					continue
+				}
 				p.logger.Debug("preferred domain warm-up failed",
 					zap.String("prefer_domain", rule.preferDisplay),
 					zap.Uint16("qtype", qType),
-					zap.Error(err))
-				continue
+					zap.Error(result.Err))
 			}
-			p.storePreferred(rule, qType, msg)
 		}
 	}
 }
@@ -437,9 +525,6 @@ func (p *PreferDomain) cacheDuration(msg *dns.Msg, qType uint16) time.Duration {
 	ttl := p.cacheTTL
 	if ttl <= 0 {
 		ttl = ttlFromAnswer(msg, qType)
-	}
-	if ttl <= 0 {
-		ttl = 60 * time.Second
 	}
 	return ttl
 }
@@ -566,8 +651,24 @@ func durationToTTLSeconds(d time.Duration) uint32 {
 	return uint32(sec)
 }
 
+func subtractTTLToZero(m *dns.Msg, delta uint32) {
+	for _, section := range [...][]dns.RR{m.Answer, m.Ns, m.Extra} {
+		for _, rr := range section {
+			if rr == nil || rr.Header() == nil || rr.Header().Rrtype == dns.TypeOPT {
+				continue
+			}
+			if rr.Header().Ttl > delta {
+				rr.Header().Ttl -= delta
+			} else {
+				rr.Header().Ttl = 0
+			}
+		}
+	}
+}
+
 func ttlFromAnswer(r *dns.Msg, qType uint16) time.Duration {
 	var minTTL uint32
+	found := false
 	for _, rr := range r.Answer {
 		if rr == nil || rr.Header() == nil {
 			continue
@@ -578,9 +679,13 @@ func ttlFromAnswer(r *dns.Msg, qType uint16) time.Duration {
 		if qType == dns.TypeAAAA && rr.Header().Rrtype != dns.TypeAAAA {
 			continue
 		}
-		if minTTL == 0 || rr.Header().Ttl < minTTL {
+		if !found || rr.Header().Ttl < minTTL {
 			minTTL = rr.Header().Ttl
+			found = true
 		}
+	}
+	if !found {
+		return 0
 	}
 	return time.Duration(minTTL) * time.Second
 }
@@ -597,10 +702,12 @@ func buildMaskedResponse(originalQ *dns.Msg, preferredResp *dns.Msg, forcedTTL u
 	masked := new(dns.Msg)
 	masked.SetReply(originalQ)
 	masked.Rcode = dns.RcodeSuccess
-	masked.Authoritative = preferredResp.Authoritative
 	masked.RecursionAvailable = preferredResp.RecursionAvailable
-	masked.AuthenticatedData = preferredResp.AuthenticatedData
-	masked.CheckingDisabled = preferredResp.CheckingDisabled
+	// The owner name and answer records below are synthesized. They are not
+	// authoritative or DNSSEC-authenticated for the original question.
+	masked.Authoritative = false
+	masked.AuthenticatedData = false
+	masked.CheckingDisabled = originalQ.CheckingDisabled
 
 	answers := make([]dns.RR, 0, len(preferredResp.Answer))
 	for _, rr := range preferredResp.Answer {
