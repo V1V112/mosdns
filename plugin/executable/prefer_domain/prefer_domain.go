@@ -19,7 +19,7 @@
 
 // Package prefer_domain implements an executable plugin that replaces an
 // existing A/AAAA response with the warmed result of a configured preferred
-// domain when the original response IP hits a configured ip_set/si_set tag.
+// domain when the original response IP hits a configured IP matcher provider tag.
 package prefer_domain
 
 import (
@@ -64,14 +64,17 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     warm_on_start: true
 //     serve_stale: true
 //     rules:
-//   - ip_set: cf_manual_ip
+//   - ip_matcher: cf_manual_ip
 //     prefer_domain: cf.example.com
 //
-// For a single rule, top-level ip_set/prefer_domain are also accepted.
+// For a single rule, top-level ip_matcher/prefer_domain are also accepted.
+// Legacy ip_set/ip_set_tag/ipset fields are still accepted as aliases.
 type Args struct {
 	Resolver string `yaml:"resolver"`
 
 	// Single-rule shorthand.
+	IPMatcher       string `yaml:"ip_matcher"`
+	Matcher         string `yaml:"matcher"`
 	IPSet           string `yaml:"ip_set"`
 	IPSetTag        string `yaml:"ip_set_tag"`
 	IPSetDeprecated string `yaml:"ipset"`
@@ -98,6 +101,8 @@ type Args struct {
 }
 
 type RuleArgs struct {
+	IPMatcher       string `yaml:"ip_matcher"`
+	Matcher         string `yaml:"matcher"`
 	IPSet           string `yaml:"ip_set"`
 	IPSetTag        string `yaml:"ip_set_tag"`
 	IPSetDeprecated string `yaml:"ipset"`
@@ -107,7 +112,7 @@ type RuleArgs struct {
 }
 
 type compiledRule struct {
-	ipSetTag      string
+	ipMatcherTag  string
 	preferDomain  string
 	preferDisplay string
 	matcher       netlist.Matcher
@@ -172,22 +177,22 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 	rules := make([]compiledRule, 0, len(ruleArgs))
 	for i, r := range ruleArgs {
-		ipSetTag := firstNonEmpty(r.IPSet, r.IPSetTag, r.IPSetDeprecated)
+		ipMatcherTag := firstNonEmpty(r.IPMatcher, r.Matcher, r.IPSet, r.IPSetTag, r.IPSetDeprecated)
 		preferDomain := firstNonEmpty(r.PreferDomain, r.Target, r.Prefer)
-		if ipSetTag == "" {
-			return nil, fmt.Errorf("%s: rules[%d].ip_set must be specified", PluginType, i)
+		if ipMatcherTag == "" {
+			return nil, fmt.Errorf("%s: rules[%d].ip_matcher must be specified", PluginType, i)
 		}
 		if preferDomain == "" {
 			return nil, fmt.Errorf("%s: rules[%d].prefer_domain must be specified", PluginType, i)
 		}
 
-		provider, _ := bp.M().GetPlugin(ipSetTag).(data_provider.IPMatcherProvider)
+		provider, _ := bp.M().GetPlugin(ipMatcherTag).(data_provider.IPMatcherProvider)
 		if provider == nil {
-			return nil, fmt.Errorf("%s: ip_set plugin %q is not an IPMatcherProvider", PluginType, ipSetTag)
+			return nil, fmt.Errorf("%s: ip_matcher plugin %q is not an IPMatcherProvider", PluginType, ipMatcherTag)
 		}
 
 		rules = append(rules, compiledRule{
-			ipSetTag:      ipSetTag,
+			ipMatcherTag:  ipMatcherTag,
 			preferDomain:  dns.Fqdn(preferDomain),
 			preferDisplay: strings.TrimSuffix(dns.Fqdn(preferDomain), "."),
 			matcher:       provider.GetIPMatcher(),
@@ -269,7 +274,7 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 	p.logger.Debug("response replaced by preferred domain",
 		zap.String("qname", strings.TrimSuffix(q.Question[0].Name, ".")),
 		zap.Uint16("qtype", qType),
-		zap.String("ip_set", rule.ipSetTag),
+		zap.String("ip_matcher", rule.ipMatcherTag),
 		zap.Stringer("matched_ip", addr),
 		zap.String("prefer_domain", rule.preferDisplay))
 	return nil
@@ -406,8 +411,10 @@ func (p *PreferDomain) warmAll() {
 
 func normalizeRuleArgs(cfg *Args) []RuleArgs {
 	out := make([]RuleArgs, 0, len(cfg.Rules)+1)
-	if ipSet := firstNonEmpty(cfg.IPSet, cfg.IPSetTag, cfg.IPSetDeprecated); ipSet != "" || firstNonEmpty(cfg.PreferDomain, cfg.Target, cfg.Prefer) != "" {
+	if ipMatcher := firstNonEmpty(cfg.IPMatcher, cfg.Matcher, cfg.IPSet, cfg.IPSetTag, cfg.IPSetDeprecated); ipMatcher != "" || firstNonEmpty(cfg.PreferDomain, cfg.Target, cfg.Prefer) != "" {
 		out = append(out, RuleArgs{
+			IPMatcher:       cfg.IPMatcher,
+			Matcher:         cfg.Matcher,
 			IPSet:           cfg.IPSet,
 			IPSetTag:        cfg.IPSetTag,
 			IPSetDeprecated: cfg.IPSetDeprecated,
