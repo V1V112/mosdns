@@ -83,6 +83,9 @@ func New(args Args) (*RateLimiter, error) {
 }
 
 func (s *RateLimiter) Match(ctx context.Context, qCtx *query_context.Context) (bool, error) {
+	if qCtx.IsCacheRefresh() {
+		return true, nil
+	}
 	addr := s.getMaskedClientAddr(qCtx)
 	if addr.IsValid() {
 		return s.l.Allow(addr), nil

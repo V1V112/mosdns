@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"bytes"
+	"container/heap"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -23,7 +25,6 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/cache"
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
-	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
@@ -35,7 +36,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/exp/constraints"
-	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 )
@@ -54,9 +54,10 @@ const (
 	expiredMsgTtl            = 5
 
 	minimumChangesToDump   = 1024
-	dumpHeader             = "mosdns_cache_v2"
+	dumpHeader             = "mosdns_cache_v3"
 	dumpBlockSize          = 128
 	dumpMaximumBlockLength = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
+	dumpMaximumTotalLength = 256 << 20
 
 	shardCount   = 256   // 256分段锁，平衡锁竞争与内存开销
 	l1TotalCap   = 51200 // L1 总容量限制
@@ -75,6 +76,7 @@ const (
 	defaultActiveRefreshMinInterval    = 30
 	defaultFallbackProbeTimeout        = 60
 	defaultFallbackProbeStaleExtendTTL = 60
+	defaultFallbackProbeMaxStale       = 300
 	activeRefreshTaskQueueCapacity     = 4096
 	maxActiveRefreshWorkers            = 256
 )
@@ -83,6 +85,7 @@ const (
 	adBit = 1 << iota
 	cdBit
 	doBit
+	rdBit
 )
 
 var _ sequence.RecursiveExecutable = (*Cache)(nil)
@@ -114,7 +117,12 @@ type item struct {
 	resp           []byte
 	storedTime     time.Time
 	expirationTime time.Time
+	lazyDeadline   time.Time
 	domainSet      string
+	upstreamOpt    *dns.OPT
+	staleDeadline  time.Time
+	isStale        bool
+	isTransient    bool
 }
 
 type l1Item struct {
@@ -122,6 +130,8 @@ type l1Item struct {
 	storedTime     time.Time
 	expirationTime time.Time
 	domainSet      string
+	upstreamOpt    *dns.OPT
+	source         *item
 }
 
 type l1Shard struct {
@@ -142,6 +152,7 @@ type FallbackProbeArgs struct {
 	Enabled        bool     `yaml:"enabled"`
 	TimeoutMS      int      `yaml:"timeout_ms"`
 	StaleExtendTTL int      `yaml:"stale_extend_ttl"`
+	MaxStale       int      `yaml:"max_stale"`
 	Probes         []string `yaml:"probes"`
 }
 
@@ -149,6 +160,7 @@ type fallbackProbeArgsRaw struct {
 	Enabled        bool        `yaml:"enabled"`
 	TimeoutMS      int         `yaml:"timeout_ms"`
 	StaleExtendTTL int         `yaml:"stale_extend_ttl"`
+	MaxStale       int         `yaml:"max_stale"`
 	Probes         interface{} `yaml:"probes"`
 }
 
@@ -169,6 +181,7 @@ func (a *FallbackProbeArgs) UnmarshalYAML(node *yaml.Node) error {
 	a.Enabled = raw.Enabled
 	a.TimeoutMS = raw.TimeoutMS
 	a.StaleExtendTTL = raw.StaleExtendTTL
+	a.MaxStale = raw.MaxStale
 
 	probes, err := stringListFromRaw(raw.Probes, "active_refresh.fallback_probe.probes")
 	if err != nil {
@@ -180,32 +193,34 @@ func (a *FallbackProbeArgs) UnmarshalYAML(node *yaml.Node) error {
 
 type ActiveRefreshArgs struct {
 	Enabled            bool                    `yaml:"enabled"`
+	RefreshSequence    string                  `yaml:"refresh_sequence"`
 	Threshold          int                     `yaml:"threshold"`
 	Interval           int                     `yaml:"interval"`
 	RequeryTimeoutMS   int                     `yaml:"requery_timeout_ms"`
 	Workers            int                     `yaml:"workers"`
 	MaxEntriesPerScan  int                     `yaml:"max_entries_per_scan"`
 	MaxRefreshTimes    int                     `yaml:"max_refresh_times"`
-	MaxIdleTime         int                     `yaml:"max_idle_time"`
+	MaxIdleTime        int                     `yaml:"max_idle_time"`
 	MinRefreshInterval int                     `yaml:"min_refresh_interval"`
 	ExcludeIPs         []string                `yaml:"exclude_ip"`
 	ExcludeDomain      ActiveRefreshDomainArgs `yaml:"exclude_domain"`
-	FallbackProbe       FallbackProbeArgs       `yaml:"fallback_probe"`
+	FallbackProbe      FallbackProbeArgs       `yaml:"fallback_probe"`
 }
 
 type activeRefreshArgsRaw struct {
 	Enabled            bool                    `yaml:"enabled"`
+	RefreshSequence    string                  `yaml:"refresh_sequence"`
 	Threshold          int                     `yaml:"threshold"`
 	Interval           int                     `yaml:"interval"`
 	RequeryTimeoutMS   int                     `yaml:"requery_timeout_ms"`
 	Workers            int                     `yaml:"workers"`
 	MaxEntriesPerScan  int                     `yaml:"max_entries_per_scan"`
 	MaxRefreshTimes    int                     `yaml:"max_refresh_times"`
-	MaxIdleTime         int                     `yaml:"max_idle_time"`
+	MaxIdleTime        int                     `yaml:"max_idle_time"`
 	MinRefreshInterval int                     `yaml:"min_refresh_interval"`
 	ExcludeIP          interface{}             `yaml:"exclude_ip"`
 	ExcludeDomain      ActiveRefreshDomainArgs `yaml:"exclude_domain"`
-	FallbackProbe       FallbackProbeArgs       `yaml:"fallback_probe"`
+	FallbackProbe      FallbackProbeArgs       `yaml:"fallback_probe"`
 }
 
 func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
@@ -223,6 +238,7 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	a.Enabled = raw.Enabled
+	a.RefreshSequence = raw.RefreshSequence
 	a.Threshold = raw.Threshold
 	a.Interval = raw.Interval
 	a.RequeryTimeoutMS = raw.RequeryTimeoutMS
@@ -312,6 +328,7 @@ func (a *ActiveRefreshArgs) init() {
 func (a *FallbackProbeArgs) init() {
 	utils.SetDefaultUnsignNum(&a.TimeoutMS, defaultFallbackProbeTimeout)
 	utils.SetDefaultUnsignNum(&a.StaleExtendTTL, defaultFallbackProbeStaleExtendTTL)
+	utils.SetDefaultUnsignNum(&a.MaxStale, defaultFallbackProbeMaxStale)
 	if len(a.Probes) == 0 {
 		a.Probes = []string{"tcp:443", "tcp:80", "ping"}
 	}
@@ -319,38 +336,93 @@ func (a *FallbackProbeArgs) init() {
 
 // 异步任务对象
 type lazyTask struct {
-	msgKey string
-	qCtx   *query_context.Context
-	next   sequence.ChainWalker
+	k        key
+	qCtx     *query_context.Context
+	next     sequence.ChainWalker
+	expected *item
+	epoch    uint64
+	flight   refreshFlightKey
 }
 
 type activeRefreshTask struct {
-	msgKey string
-	k      key
-	qCtx   *query_context.Context
-	next   sequence.ChainWalker
+	k        key
+	qCtx     *query_context.Context
+	next     sequence.ChainWalker
+	expected *item
+	epoch    uint64
+	flight   refreshFlightKey
 }
 
 type activeRefreshMeta struct {
-	sync.Mutex
+	k            key
 	qCtx         *query_context.Context
 	next         sequence.ChainWalker
-	lastAccess   time.Time
-	lastRefresh  time.Time
-	refreshCount int
+	expected     *item
+	lastAccess   atomic.Int64
+	refreshCount atomic.Int64
+	refreshAt    time.Time
+	due          time.Time
+	heapIndex    int
+	stopped      atomic.Bool
+}
+
+type activeRefreshHeap []*activeRefreshMeta
+
+func (h activeRefreshHeap) Len() int           { return len(h) }
+func (h activeRefreshHeap) Less(i, j int) bool { return h[i].due.Before(h[j].due) }
+func (h activeRefreshHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+func (h *activeRefreshHeap) Push(x any) {
+	m := x.(*activeRefreshMeta)
+	m.heapIndex = len(*h)
+	*h = append(*h, m)
+}
+func (h *activeRefreshHeap) Pop() any {
+	old := *h
+	n := len(old)
+	m := old[n-1]
+	old[n-1] = nil
+	m.heapIndex = -1
+	*h = old[:n-1]
+	return m
+}
+
+type refreshFlightKey struct {
+	k     key
+	epoch uint64
+}
+
+type preparedCacheEntry struct {
+	item            *item
+	cacheExpiration time.Time
+	msg             *dns.Msg
+}
+
+type decodedDumpEntry struct {
+	k               key
+	item            *item
+	cacheExpiration time.Time
 }
 
 type Cache struct {
 	args         *Args
 	logger       *zap.Logger
 	backend      *cache.Cache[key, *item]
-	lazyUpdateSF singleflight.Group
 	closeOnce    sync.Once
 	closeNotify  chan struct{}
+	lifecycleCtx context.Context
+	cancel       context.CancelFunc
 	updatedKey   atomic.Uint64
+	refreshEpoch atomic.Uint64
+	flushMu      sync.RWMutex
+	commitLocks  [shardCount]sync.Mutex
 
-	shards [shardCount]*l1Shard
-	dumpMu sync.Mutex
+	shards     [shardCount]*l1Shard
+	dumpMu     sync.Mutex
+	dumpLoopWG sync.WaitGroup
 
 	queryTotal    prometheus.Counter
 	hitTotal      prometheus.Counter
@@ -364,23 +436,29 @@ type Cache struct {
 	activeRefreshProbeTotal     prometheus.Counter
 	activeRefreshProbeKeepTotal prometheus.Counter
 	activeRefreshDropTotal      prometheus.Counter
+	activeRefreshDuration       prometheus.Histogram
+	activeRefreshQueueSize      prometheus.GaugeFunc
+	activeRefreshMetaSize       prometheus.GaugeFunc
 
-	excludeNets []*net.IPNet
+	excludeNets                []*net.IPNet
 	activeExcludeNets          []*net.IPNet
 	activeExcludeDomainMatcher domain.Matcher[struct{}]
 	activeExcludeDomainArgs    ActiveRefreshDomainArgs
 	activeExcludeDomainBQ      sequence.BQ
-	activeExcludeDomainMu      sync.Mutex
-	activeExcludeDomainErrLog  bool
+	activeExcludeDomainValid   bool
+	activeRefreshExec          sequence.Executable
+	activeRefreshConfigValid   bool
 
 	// 异步更新架构优化
-	inFlight     sync.Map       // 入队去重字典
-	lazyTaskChan chan *lazyTask // 工作队列
-	lazyWorkers  sync.WaitGroup // 优雅退出等待控制
-	activeMeta     sync.Map
-	activeInFlight sync.Map
-	activeTaskChan chan *activeRefreshTask
-	activeWorkers  sync.WaitGroup
+	refreshInFlight sync.Map       // active/lazy 共用的按 key、epoch 去重字典
+	lazyTaskChan    chan *lazyTask // 工作队列
+	lazyWorkers     sync.WaitGroup // 优雅退出等待控制
+	activeMu        sync.RWMutex
+	activeMeta      map[key]*activeRefreshMeta
+	activeHeap      activeRefreshHeap
+	activeWake      chan struct{}
+	activeTaskChan  chan *activeRefreshTask
+	activeWorkers   sync.WaitGroup
 }
 
 type Opts struct {
@@ -398,8 +476,13 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		MetricsTag: bp.Tag(),
 		BQ:         bq,
 	})
+	if cfg.ActiveRefresh.Enabled && !c.activeRefreshConfigValid {
+		_ = c.Close()
+		return nil, fmt.Errorf("invalid active_refresh configuration")
+	}
 
 	if err := c.RegMetricsTo(prometheus.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())); err != nil {
+		_ = c.Close()
 		return nil, fmt.Errorf("failed to register metrics, %w", err)
 	}
 	bp.RegAPI(c.Api())
@@ -420,10 +503,33 @@ func quickSetupCache(bq sequence.BQ, s string) (any, error) {
 
 func NewCache(args *Args, opts Opts) *Cache {
 	args.init()
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
 
 	logger := opts.Logger
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	if args.ActiveRefresh.FallbackProbe.Enabled {
+		validProbes := args.ActiveRefresh.FallbackProbe.Probes[:0]
+		for _, probe := range args.ActiveRefresh.FallbackProbe.Probes {
+			if probe == "ping" {
+				validProbes = append(validProbes, probe)
+				continue
+			}
+			if strings.HasPrefix(probe, "tcp:") {
+				port, err := strconv.Atoi(strings.TrimPrefix(probe, "tcp:"))
+				if err == nil && port >= 1 && port <= 65535 {
+					validProbes = append(validProbes, probe)
+					continue
+				}
+			}
+			logger.Warn("invalid active_refresh fallback probe, skip", zap.String("probe", probe))
+		}
+		args.ActiveRefresh.FallbackProbe.Probes = validProbes
+		if len(validProbes) == 0 {
+			args.ActiveRefresh.FallbackProbe.Enabled = false
+			logger.Warn("active_refresh fallback probe disabled because no valid probes remain")
+		}
 	}
 
 	var excludeNets []*net.IPNet
@@ -451,16 +557,22 @@ func NewCache(args *Args, opts Opts) *Cache {
 	backend := cache.New[key, *item](cache.Opts{Size: args.Size})
 	lb := map[string]string{"tag": opts.MetricsTag}
 	p := &Cache{
-		args:                        args,
-		logger:                      logger,
-		backend:                     backend,
-		closeNotify:                 make(chan struct{}),
-		excludeNets:                 excludeNets,
+		args:                       args,
+		logger:                     logger,
+		backend:                    backend,
+		closeNotify:                make(chan struct{}),
+		lifecycleCtx:               lifecycleCtx,
+		cancel:                     cancel,
+		excludeNets:                excludeNets,
 		activeExcludeNets:          activeExcludeNets,
 		activeExcludeDomainMatcher: activeExcludeDomainMatcher,
 		activeExcludeDomainArgs:    args.ActiveRefresh.ExcludeDomain,
 		activeExcludeDomainBQ:      opts.BQ,
+		activeExcludeDomainValid:   true,
+		activeRefreshConfigValid:   true,
 		lazyTaskChan:               make(chan *lazyTask, lazyTaskQueueCapacity),
+		activeMeta:                 make(map[key]*activeRefreshMeta),
+		activeWake:                 make(chan struct{}, 1),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name:        "query_total",
@@ -512,6 +624,12 @@ func NewCache(args *Args, opts Opts) *Cache {
 			Help:        "The total number of dropped active refresh tasks",
 			ConstLabels: lb,
 		}),
+		activeRefreshDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:        "active_refresh_duration_seconds",
+			Help:        "Duration of active refresh attempts",
+			ConstLabels: lb,
+			Buckets:     prometheus.DefBuckets,
+		}),
 		size: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name:        "size_current",
 			Help:        "Current cache size in records",
@@ -532,9 +650,47 @@ func NewCache(args *Args, opts Opts) *Cache {
 	// 启动异步任务池
 	if args.ActiveRefresh.Enabled {
 		p.activeTaskChan = make(chan *activeRefreshTask, activeRefreshTaskQueueCapacity)
+		if p.activeExcludeDomainMatcher == nil {
+			matcher, err := buildActiveExcludeDomainMatcher(p.activeExcludeDomainBQ, p.activeExcludeDomainArgs)
+			if err != nil {
+				p.activeExcludeDomainValid = false
+				p.activeRefreshConfigValid = false
+				p.logger.Warn("invalid active_refresh.exclude_domain, active refresh disabled for safety", zap.Error(err))
+			} else {
+				p.activeExcludeDomainMatcher = matcher
+			}
+		}
+		if tag := strings.TrimSpace(args.ActiveRefresh.RefreshSequence); tag != "" {
+			if opts.BQ == nil || opts.BQ.M() == nil {
+				p.activeRefreshConfigValid = false
+				p.logger.Warn("active_refresh.refresh_sequence requires mosdns context", zap.String("tag", tag))
+			} else if execPlugin, ok := opts.BQ.M().GetPlugin(tag).(sequence.Executable); !ok || execPlugin == nil {
+				p.activeRefreshConfigValid = false
+				p.logger.Warn("active_refresh.refresh_sequence is not executable", zap.String("tag", tag))
+			} else {
+				p.activeRefreshExec = execPlugin
+			}
+		}
 	}
+	p.activeRefreshQueueSize = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "active_refresh_queue_size", Help: "Current number of queued active refresh tasks", ConstLabels: lb,
+	}, func() float64 {
+		if p.activeTaskChan == nil {
+			return 0
+		}
+		return float64(len(p.activeTaskChan))
+	})
+	p.activeRefreshMetaSize = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "active_refresh_meta_size", Help: "Current number of tracked active refresh entries", ConstLabels: lb,
+	}, func() float64 {
+		p.activeMu.RLock()
+		defer p.activeMu.RUnlock()
+		return float64(len(p.activeMeta))
+	})
 
-	p.startWorkerPool()
+	if args.LazyCacheTTL > 0 {
+		p.startWorkerPool()
+	}
 
 	if err := p.loadDump(); err != nil {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
@@ -546,12 +702,18 @@ func NewCache(args *Args, opts Opts) *Cache {
 }
 
 // 架构优化：去除内部的 msg.Copy()，改为外部拷贝后传入，极大降低持锁时间
-func (s *l1Shard) updateL1(k key, msg *dns.Msg, storedTime, expirationTime time.Time, domainSet string) {
+func (s *l1Shard) updateL1(k key, msg *dns.Msg, source *item) {
+	if source == nil {
+		return
+	}
 	s.Lock()
 	defer s.Unlock()
 
 	if _, ok := s.items[k]; ok {
-		s.items[k] = &l1Item{msg: msg, storedTime: storedTime, expirationTime: expirationTime, domainSet: domainSet}
+		s.items[k] = &l1Item{
+			msg: msg, storedTime: source.storedTime, expirationTime: source.expirationTime,
+			domainSet: source.domainSet, upstreamOpt: copyOPT(source.upstreamOpt), source: source,
+		}
 		s.ref[k] = true
 		return
 	}
@@ -571,7 +733,10 @@ func (s *l1Shard) updateL1(k key, msg *dns.Msg, storedTime, expirationTime time.
 		break
 	}
 
-	s.items[k] = &l1Item{msg: msg, storedTime: storedTime, expirationTime: expirationTime, domainSet: domainSet}
+	s.items[k] = &l1Item{
+		msg: msg, storedTime: source.storedTime, expirationTime: source.expirationTime,
+		domainSet: source.domainSet, upstreamOpt: copyOPT(source.upstreamOpt), source: source,
+	}
 	s.order[s.pos] = k
 	s.ref[k] = true
 	s.pos = (s.pos + 1) % shardMaxSize
@@ -612,6 +777,9 @@ func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
 		c.activeRefreshProbeTotal,
 		c.activeRefreshProbeKeepTotal,
 		c.activeRefreshDropTotal,
+		c.activeRefreshDuration,
+		c.activeRefreshQueueSize,
+		c.activeRefreshMetaSize,
 		c.size,
 	} {
 		if err := r.Register(collector); err != nil {
@@ -643,24 +811,16 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	shard.RUnlock()
 
 	now := time.Now()
-	activeEnabled := c.activeRefreshEnabled()
-	var activeMsgKey string
-	var activeQCtx *query_context.Context
-	var activeNext sequence.ChainWalker
-	if activeEnabled {
-		activeMsgKey = string(msgKeyBuf)
-		activeQCtx = copyContextWithoutResp(qCtx)
-		activeNext = next.Fork()
-	}
 	if ok1 && now.Before(v1.expirationTime) {
 		c.hitTotal.Inc()
-		if activeEnabled {
-			c.resetActiveRefreshMeta(activeMsgKey, activeQCtx, activeNext, now)
-		}
+		c.observeActiveRefresh(k, v1.source, qCtx, next, now, v1.msg)
 		r := v1.msg.Copy() // 从 L1 提取时执行 Copy，保护缓存稳定
 		dnsutils.SubtractTTL(r, uint32(now.Sub(v1.storedTime).Seconds()))
 		r.Id = q.Id
 		qCtx.SetResponse(r)
+		if v1.upstreamOpt != nil {
+			qCtx.SetUpstreamOpt(v1.upstreamOpt)
+		}
 		if v1.domainSet != "" {
 			qCtx.StoreValue(query_context.KeyDomainSet, v1.domainSet)
 		}
@@ -671,84 +831,90 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	}
 
 	// L1 未命中或过期，执行安全的深拷贝生成持久化 Key
-	msgKey := activeMsgKey
-	if msgKey == "" {
-		msgKey = string(msgKeyBuf)
-	}
+	msgKey := string(msgKeyBuf)
 	kReal := key(msgKey)
 	keyBufferPool.Put(bufPtr) // 拷贝完成后安全归还
 
 	// --- L2 深度路径 ---
-	cachedResp, lazyHit, domainSet := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
-	if lazyHit {
-		c.lazyHitTotal.Inc()
-		c.doLazyUpdate(msgKey, qCtx, next)
-	}
+	c.flushMu.RLock()
+	observedEpoch := c.refreshEpoch.Load()
+	cachedResp, lazyHit, cachedItem := getRespFromCache(msgKey, c.backend, c.args.LazyCacheTTL > 0, expiredMsgTtl)
+	c.flushMu.RUnlock()
 	if cachedResp != nil {
 		c.hitTotal.Inc()
-		if activeEnabled {
-			c.resetActiveRefreshMeta(msgKey, activeQCtx, activeNext, now)
+		c.observeActiveRefresh(kReal, cachedItem, qCtx, next, now, cachedResp)
+		if lazyHit {
+			c.lazyHitTotal.Inc()
+			c.doLazyUpdate(kReal, cachedItem, qCtx, next)
 		}
 		cachedResp.Id = q.Id
 		qCtx.SetResponse(cachedResp)
-		if domainSet != "" {
-			qCtx.StoreValue(query_context.KeyDomainSet, domainSet)
+		if cachedItem.upstreamOpt != nil {
+			qCtx.SetUpstreamOpt(cachedItem.upstreamOpt)
+		}
+		if cachedItem.domainSet != "" {
+			qCtx.StoreValue(query_context.KeyDomainSet, cachedItem.domainSet)
 		}
 
 		if !lazyHit {
-			v2, _, _ := c.backend.Get(kReal)
-			if v2 != nil {
-				// 极客优化 1：消除无效双重深拷贝
-				// cachedResp 已经是 Unpack 后生成的新对象，直接存入 L1 复用该对象即可
-				shard.updateL1(kReal, cachedResp, v2.storedTime, v2.expirationTime, v2.domainSet)
-			}
+			c.promoteL1IfCurrent(kReal, cachedItem, observedEpoch, cachedResp)
 		}
 		return nil
+	}
+
+	var refreshCtx *query_context.Context
+	var refreshNext sequence.ChainWalker
+	if c.activeRefreshEnabled() {
+		refreshCtx = qCtx.CopyWithoutResponse()
+		refreshNext = next.Fork()
+		if cachedItem != nil {
+			retainedMsg := new(dns.Msg)
+			if retainedMsg.Unpack(cachedItem.resp) == nil {
+				c.trackActiveRefresh(kReal, cachedItem, refreshCtx, refreshNext, now, retainedMsg)
+			}
+		}
 	}
 
 	err := next.ExecNext(ctx, qCtx)
 	r := qCtx.R()
 
 	if r != nil && !c.containsExcluded(r) {
-		if saveRespToCache(msgKey, qCtx, c.backend, c.args.LazyCacheTTL) {
-			c.updatedKey.Add(1)
-			if activeEnabled {
-				c.resetActiveRefreshMeta(msgKey, activeQCtx, activeNext, time.Now())
+		// A privately retained fallback item is not directly serveable, but it
+		// still protects useful response bytes. Do not let a transient failure
+		// replace it, and only commit a healthy foreground result if the cache is
+		// still absent or still contains the version this miss observed.
+		allowTransientFailure := cachedItem == nil
+		if prepared, ok := c.prepareCacheEntry(qCtx, allowTransientFailure); ok && c.commitPreparedForeground(kReal, cachedItem, observedEpoch, prepared) {
+			if refreshCtx != nil {
+				c.trackActiveRefresh(kReal, prepared.item, refreshCtx, refreshNext, time.Now(), prepared.msg)
 			}
-			minTTL := dnsutils.GetMinimalTTL(r)
-			var dset string
-			if val, ok := qCtx.GetValue(query_context.KeyDomainSet); ok {
-				if s, isString := val.(string); isString {
-					dset = s
-				}
-			}
-			// 在锁外部完成安全的单次 Copy
-			shard.updateL1(kReal, r.Copy(), now, now.Add(time.Duration(minTTL)*time.Second), dset)
 		}
 	}
 
 	return err
 }
 
-func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker) {
-	// 架构优化：入队去重拦截器，防过期风暴重入
-	if _, loaded := c.inFlight.LoadOrStore(msgKey, struct{}{}); loaded {
+func (c *Cache) doLazyUpdate(k key, expected *item, qCtx *query_context.Context, next sequence.ChainWalker) {
+	c.flushMu.RLock()
+	defer c.flushMu.RUnlock()
+	if c.lifecycleCtx.Err() != nil {
 		return
 	}
-
-	// 神优化：剥离庞大 Response 对象消除 qCtx.Copy() 耗时，直降 GC 开销
-	oldResp := qCtx.R()
-	qCtx.SetResponse(nil)
-	fastCtx := qCtx.Copy()
-	qCtx.SetResponse(oldResp)
-
-	task := &lazyTask{msgKey: msgKey, qCtx: fastCtx, next: next.Fork()}
+	epoch := c.refreshEpoch.Load()
+	flight := refreshFlightKey{k: k, epoch: epoch}
+	if _, loaded := c.refreshInFlight.LoadOrStore(flight, struct{}{}); loaded {
+		return
+	}
+	task := &lazyTask{
+		k: k, expected: expected,
+		qCtx: qCtx.CopyWithoutResponse(), next: next.Fork(), epoch: epoch, flight: flight,
+	}
 
 	select {
 	case c.lazyTaskChan <- task:
 	default:
 		c.lazyDropTotal.Inc() // 队列满则丢弃，保障主干 CPU 平滑
-		c.inFlight.Delete(msgKey)
+		c.refreshInFlight.Delete(flight)
 	}
 }
 
@@ -766,69 +932,132 @@ func (c *Cache) startWorkerPool() {
 		c.lazyWorkers.Add(1)
 		go func() {
 			defer c.lazyWorkers.Done()
-			for task := range c.lazyTaskChan {
-				c.lazyUpdateSF.Do(task.msgKey, func() (any, error) {
-					defer c.lazyUpdateSF.Forget(task.msgKey)
-					defer c.inFlight.Delete(task.msgKey) // 执行完从去重表摘除
-
-					ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
-					defer cancel()
-
-					err := task.next.ExecNext(ctx, task.qCtx)
-					if err != nil && err != sequence.ErrExit {
-						// 极客优化 3：砍掉 Warn 级别的 I/O 锁竞争，降级为 Debug
-						// 利用 Zap 特性在生产环境直接 Bypass 该方法，防止上游异常时拖死系统
-						c.logger.Debug("failed to update lazy cache", task.qCtx.InfoField(), zap.Error(err))
+			for {
+				select {
+				case <-c.closeNotify:
+					return
+				default:
+				}
+				select {
+				case <-c.closeNotify:
+					return
+				case task := <-c.lazyTaskChan:
+					if task != nil {
+						c.runLazyUpdateTask(task)
 					}
-
-					r := task.qCtx.R()
-					if r != nil && !c.containsExcluded(r) {
-						if saveRespToCache(task.msgKey, task.qCtx, c.backend, c.args.LazyCacheTTL) {
-							c.updatedKey.Add(1)
-							k := key(task.msgKey)
-							h := k.Sum()
-							shard := c.shards[h%shardCount]
-							minTTL := dnsutils.GetMinimalTTL(r)
-							var dset string
-							if val, ok := task.qCtx.GetValue(query_context.KeyDomainSet); ok {
-								if s, isString := val.(string); isString {
-									dset = s
-								}
-							}
-							// 异步写回时也将 Copy 移至锁外
-							shard.updateL1(k, r.Copy(), time.Now(), time.Now().Add(time.Duration(minTTL)*time.Second), dset)
-						}
-					}
-					return nil, nil
-				})
+				}
 			}
 		}()
 	}
 }
 
-func (c *Cache) activeRefreshEnabled() bool {
-	return c.args != nil && c.args.ActiveRefresh.Enabled
-}
-
-func copyContextWithoutResp(qCtx *query_context.Context) *query_context.Context {
-	copied := qCtx.Copy()
-	copied.SetResponse(nil)
-	return copied
-}
-
-func (c *Cache) resetActiveRefreshMeta(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker, now time.Time) {
-	if !c.activeRefreshEnabled() || qCtx == nil {
+func (c *Cache) runLazyUpdateTask(task *lazyTask) {
+	defer c.refreshInFlight.Delete(task.flight)
+	if c.lifecycleCtx.Err() != nil || task.epoch != c.refreshEpoch.Load() {
 		return
 	}
-	k := key(msgKey)
-	v, _ := c.activeMeta.LoadOrStore(k, &activeRefreshMeta{})
-	meta := v.(*activeRefreshMeta)
-	meta.Lock()
-	meta.qCtx = qCtx
-	meta.next = next.Fork()
-	meta.lastAccess = now
-	meta.refreshCount = 0
-	meta.Unlock()
+	if current, _, ok := c.backend.Get(task.k); !ok || current != task.expected {
+		return
+	}
+	task.qCtx.MarkCacheRefresh()
+	ctx, cancel := context.WithTimeout(c.lifecycleCtx, defaultLazyUpdateTimeout)
+	defer cancel()
+	if ctx.Err() != nil {
+		return
+	}
+
+	err := task.next.ExecNext(ctx, task.qCtx)
+	if err != nil && !errors.Is(err, sequence.ErrExit) {
+		c.logger.Debug("failed to update lazy cache", task.qCtx.InfoField(), zap.Error(err))
+		return
+	}
+	if ctx.Err() != nil || task.qCtx.R() == nil || c.containsExcluded(task.qCtx.R()) {
+		return
+	}
+	prepared, ok := c.prepareCacheEntry(task.qCtx, false)
+	if !ok || !c.commitPrepared(task.k, task.expected, task.epoch, prepared) {
+		return
+	}
+	c.updateActiveRefreshAfterCommit(task.k, task.expected, prepared.item, time.Now())
+}
+
+func (c *Cache) activeRefreshEnabled() bool {
+	return c.args != nil && c.args.ActiveRefresh.Enabled && c.activeRefreshConfigValid && c.lifecycleCtx.Err() == nil
+}
+
+func (c *Cache) observeActiveRefresh(k key, expected *item, qCtx *query_context.Context, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
+	if !c.activeRefreshEnabled() || expected == nil || qCtx == nil {
+		return
+	}
+	c.activeMu.RLock()
+	meta := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if meta != nil {
+		meta.lastAccess.Store(now.UnixNano())
+		meta.refreshCount.Store(0)
+		if meta.stopped.Swap(false) {
+			c.rescheduleStoppedActiveMeta(meta, now)
+		}
+		return
+	}
+	if !c.activeExcludeDomainValid || c.activeDomainExcluded(qCtx.QQuestion().Name) || c.containsActiveExcluded(response) {
+		return
+	}
+	// k can be an unsafe zero-copy view over the pooled request buffer on the
+	// L1 path. Clone it before retaining it in metadata.
+	durableKey := key(strings.Clone(string(k)))
+	c.trackActiveRefresh(durableKey, expected, qCtx.CopyWithoutResponse(), next.Fork(), now, response)
+}
+
+func (c *Cache) trackActiveRefresh(k key, expected *item, qCtx *query_context.Context, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
+	if !c.activeRefreshEnabled() || expected == nil || qCtx == nil || !c.activeExcludeDomainValid {
+		return
+	}
+	if question, ok := questionFromKey(k); !ok || c.activeDomainExcluded(question.Name) {
+		return
+	}
+	if response != nil && c.containsActiveExcluded(response) {
+		return
+	}
+	c.flushMu.RLock()
+	current, _, ok := c.backend.Get(k)
+	if !ok || current != expected {
+		c.flushMu.RUnlock()
+		return
+	}
+
+	c.activeMu.Lock()
+	if meta := c.activeMeta[k]; meta != nil {
+		meta.lastAccess.Store(now.UnixNano())
+		meta.refreshCount.Store(0)
+		meta.stopped.Store(false)
+		meta.expected = expected
+		meta.qCtx = qCtx
+		meta.next = next.Fork()
+		c.scheduleActiveMetaLocked(meta, c.activeRefreshAt(k, expected), now)
+		c.activeMu.Unlock()
+		c.flushMu.RUnlock()
+		c.notifyActiveScheduler()
+		return
+	}
+
+	maxMeta := c.args.Size
+	if maxMeta < 1 {
+		maxMeta = 1
+	}
+	if len(c.activeMeta) >= maxMeta {
+		for oldKey, oldMeta := range c.activeMeta {
+			c.removeActiveMetaLocked(oldKey, oldMeta)
+			break
+		}
+	}
+	meta := &activeRefreshMeta{k: k, qCtx: qCtx, next: next.Fork(), expected: expected, heapIndex: -1}
+	meta.lastAccess.Store(now.UnixNano())
+	c.activeMeta[k] = meta
+	c.scheduleActiveMetaLocked(meta, c.activeRefreshAt(k, expected), now)
+	c.activeMu.Unlock()
+	c.flushMu.RUnlock()
+	c.notifyActiveScheduler()
 }
 
 func (c *Cache) startActiveRefresh() {
@@ -852,6 +1081,11 @@ func (c *Cache) startActiveRefresh() {
 				select {
 				case <-c.closeNotify:
 					return
+				default:
+				}
+				select {
+				case <-c.closeNotify:
+					return
 				case task := <-c.activeTaskChan:
 					if task != nil {
 						c.runActiveRefreshTask(task)
@@ -864,101 +1098,144 @@ func (c *Cache) startActiveRefresh() {
 	c.activeWorkers.Add(1)
 	go func() {
 		defer c.activeWorkers.Done()
-		ticker := time.NewTicker(time.Duration(c.args.ActiveRefresh.Interval) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-c.closeNotify:
-				return
-			case now := <-ticker.C:
-				c.scanActiveRefresh(now)
-				c.cleanupActiveRefreshMeta(now)
-			}
-		}
+		c.activeSchedulerLoop()
 	}()
 }
 
-func (c *Cache) scanActiveRefresh(now time.Time) {
-	queued := 0
-	stopIteration := errors.New("active refresh scan limit")
-	err := c.backend.Range(func(k key, v *item, cacheExpirationTime time.Time) error {
-		if queued >= c.args.ActiveRefresh.MaxEntriesPerScan {
-			return stopIteration
+func (c *Cache) activeSchedulerLoop() {
+	for {
+		c.activeMu.Lock()
+		if len(c.activeHeap) == 0 {
+			c.activeMu.Unlock()
+			select {
+			case <-c.closeNotify:
+				return
+			case <-c.activeWake:
+				continue
+			}
 		}
-		if cacheExpirationTime.Before(now) {
-			c.activeMeta.Delete(k)
-			return nil
+		due := c.activeHeap[0].due
+		c.activeMu.Unlock()
+
+		delay := time.Until(due)
+		if delay < 0 {
+			delay = 0
 		}
-		task := c.makeActiveRefreshTask(k, v, now)
-		if task == nil {
-			return nil
-		}
-		if _, loaded := c.activeInFlight.LoadOrStore(k, struct{}{}); loaded {
-			return nil
-		}
+		timer := time.NewTimer(delay)
 		select {
-		case c.activeTaskChan <- task:
-			queued++
 		case <-c.closeNotify:
-			c.activeInFlight.Delete(k)
-			return stopIteration
-		default:
-			c.activeRefreshDropTotal.Inc()
-			c.activeInFlight.Delete(k)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-c.activeWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case now := <-timer.C:
+			c.dispatchDueActiveRefresh(now)
+			// Prevent a large cohort of equally due entries from turning a full
+			// queue into a busy loop. Workers remain the primary rate limiter.
+			pause := time.NewTimer(10 * time.Millisecond)
+			select {
+			case <-c.closeNotify:
+				if !pause.Stop() {
+					select {
+					case <-pause.C:
+					default:
+					}
+				}
+				return
+			case <-pause.C:
+			}
 		}
-		return nil
-	})
-	if err != nil && err != stopIteration {
-		c.logger.Debug("failed to scan active refresh cache", zap.Error(err))
 	}
 }
 
-func (c *Cache) makeActiveRefreshTask(k key, v *item, now time.Time) *activeRefreshTask {
-	question, ok := questionFromKey(k)
-	if !ok {
-		return nil
+func (c *Cache) dispatchDueActiveRefresh(now time.Time) {
+	c.flushMu.RLock()
+	defer c.flushMu.RUnlock()
+	if c.lifecycleCtx.Err() != nil {
+		return
 	}
-	if c.activeDomainExcluded(question.Name) {
-		return nil
+	limit := c.args.ActiveRefresh.MaxEntriesPerScan
+	if limit < 1 {
+		limit = 1
 	}
-	if !c.needsActiveRefresh(v, now) {
-		return nil
-	}
-	if c.cachedRespHasActiveExcludedIP(v) {
-		return nil
-	}
+	for dispatched := 0; dispatched < limit; {
+		c.activeMu.Lock()
+		if len(c.activeHeap) == 0 || c.activeHeap[0].due.After(now) {
+			c.activeMu.Unlock()
+			return
+		}
+		meta := heap.Pop(&c.activeHeap).(*activeRefreshMeta)
+		if c.activeMeta[meta.k] != meta {
+			c.activeMu.Unlock()
+			continue
+		}
+		lastAccess := time.Unix(0, meta.lastAccess.Load())
+		if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 && now.Sub(lastAccess) >= time.Duration(maxIdle)*time.Second {
+			c.removeActiveMetaLocked(meta.k, meta)
+			c.activeMu.Unlock()
+			continue
+		}
+		if now.Before(meta.refreshAt) {
+			c.scheduleActiveMetaLocked(meta, meta.refreshAt, now)
+			c.activeMu.Unlock()
+			continue
+		}
+		if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && meta.refreshCount.Load() >= int64(maxRefresh) {
+			meta.stopped.Store(true)
+			c.activeMu.Unlock()
+			continue
+		}
+		expected := meta.expected
+		current, _, ok := c.backend.Get(meta.k)
+		if !ok || current != expected {
+			c.removeActiveMetaLocked(meta.k, meta)
+			c.activeMu.Unlock()
+			continue
+		}
+		epoch := c.refreshEpoch.Load()
+		flight := refreshFlightKey{k: meta.k, epoch: epoch}
+		if _, loaded := c.refreshInFlight.LoadOrStore(flight, struct{}{}); loaded {
+			c.scheduleActiveMetaLocked(meta, now.Add(c.activeRetryInterval()), now)
+			c.activeMu.Unlock()
+			continue
+		}
+		task := &activeRefreshTask{
+			k: meta.k, qCtx: meta.qCtx.Copy(), next: meta.next.Fork(),
+			expected: expected, epoch: epoch, flight: flight,
+		}
+		c.activeMu.Unlock()
 
-	metaValue, ok := c.activeMeta.Load(k)
-	if !ok {
-		return nil
-	}
-	meta := metaValue.(*activeRefreshMeta)
-
-	meta.Lock()
-	defer meta.Unlock()
-	if meta.qCtx == nil {
-		return nil
-	}
-	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 && now.Sub(meta.lastAccess) > time.Duration(maxIdle)*time.Second {
-		return nil
-	}
-	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && meta.refreshCount >= maxRefresh {
-		return nil
-	}
-	if minInterval := c.args.ActiveRefresh.MinRefreshInterval; minInterval > 0 && !meta.lastRefresh.IsZero() && now.Sub(meta.lastRefresh) < time.Duration(minInterval)*time.Second {
-		return nil
-	}
-
-	meta.lastRefresh = now
-	return &activeRefreshTask{
-		msgKey: string(k),
-		k:      k,
-		qCtx:   meta.qCtx.Copy(),
-		next:   meta.next.Fork(),
+		select {
+		case c.activeTaskChan <- task:
+			meta.refreshCount.Add(1)
+			dispatched++
+		case <-c.closeNotify:
+			c.refreshInFlight.Delete(flight)
+			return
+		default:
+			c.activeRefreshDropTotal.Inc()
+			c.refreshInFlight.Delete(flight)
+			c.rescheduleActiveFailure(meta.k, expected, now)
+			return
+		}
 	}
 }
 
 func (c *Cache) needsActiveRefresh(v *item, now time.Time) bool {
+	if v == nil {
+		return false
+	}
 	threshold := time.Duration(c.args.ActiveRefresh.Threshold) * time.Second
 	if originalTTL := v.expirationTime.Sub(v.storedTime); originalTTL > 0 {
 		threshold = min(threshold, originalTTL/3)
@@ -967,77 +1244,190 @@ func (c *Cache) needsActiveRefresh(v *item, now time.Time) bool {
 }
 
 func (c *Cache) runActiveRefreshTask(task *activeRefreshTask) {
-	defer c.activeInFlight.Delete(task.k)
+	defer c.refreshInFlight.Delete(task.flight)
+	if c.lifecycleCtx.Err() != nil || task.epoch != c.refreshEpoch.Load() {
+		return
+	}
+	if current, _, ok := c.backend.Get(task.k); !ok || current != task.expected {
+		return
+	}
 	c.activeRefreshTotal.Inc()
-	c.markActiveRefreshAttempt(task.k)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.args.ActiveRefresh.RequeryTimeoutMS)*time.Millisecond)
+	timer := prometheus.NewTimer(c.activeRefreshDuration)
+	defer timer.ObserveDuration()
+	task.qCtx.MarkCacheRefresh()
+	ctx, cancel := context.WithTimeout(c.lifecycleCtx, time.Duration(c.args.ActiveRefresh.RequeryTimeoutMS)*time.Millisecond)
 	defer cancel()
+	if ctx.Err() != nil {
+		return
+	}
 
-	err := task.next.ExecNext(ctx, task.qCtx)
+	var err error
+	if c.activeRefreshExec != nil {
+		err = c.activeRefreshExec.Exec(ctx, task.qCtx)
+	} else {
+		err = task.next.ExecNext(ctx, task.qCtx)
+	}
 	if err != nil && !errors.Is(err, sequence.ErrExit) {
 		c.logger.Debug("active refresh requery failed", task.qCtx.InfoField(), zap.Error(err))
 	}
-	if c.saveActiveRefreshResponse(task.msgKey, task.qCtx) {
-		c.activeRefreshSuccessTotal.Inc()
-		return
-	}
-
-	if c.tryFallbackProbeKeepalive(task.k) {
-		c.activeRefreshProbeKeepTotal.Inc()
-		return
-	}
-	c.activeRefreshFailedTotal.Inc()
-}
-
-func (c *Cache) saveActiveRefreshResponse(msgKey string, qCtx *query_context.Context) bool {
-	r := qCtx.R()
-	if r == nil || c.containsExcluded(r) || c.containsActiveExcluded(r) {
-		return false
-	}
-	if !saveRespToCache(msgKey, qCtx, c.backend, c.args.LazyCacheTTL) {
-		return false
-	}
-
-	c.updatedKey.Add(1)
-	k := key(msgKey)
-	shard := c.shards[k.Sum()%shardCount]
-	minTTL := dnsutils.GetMinimalTTL(r)
-	var dset string
-	if val, ok := qCtx.GetValue(query_context.KeyDomainSet); ok {
-		if s, isString := val.(string); isString {
-			dset = s
+	if ctx.Err() == nil && (err == nil || errors.Is(err, sequence.ErrExit)) {
+		r := task.qCtx.R()
+		if r != nil && !c.containsExcluded(r) && !c.containsActiveExcluded(r) {
+			if prepared, ok := c.prepareCacheEntry(task.qCtx, false); ok && c.commitPrepared(task.k, task.expected, task.epoch, prepared) {
+				c.activeRefreshSuccessTotal.Inc()
+				c.updateActiveRefreshAfterCommit(task.k, task.expected, prepared.item, time.Now())
+				return
+			}
 		}
 	}
-	now := time.Now()
-	shard.updateL1(k, r.Copy(), now, now.Add(time.Duration(minTTL)*time.Second), dset)
-	return true
+
+	if c.lifecycleCtx.Err() == nil {
+		probeBudget := time.Duration(c.args.ActiveRefresh.RequeryTimeoutMS) * time.Millisecond
+		if probeBudget <= 0 {
+			probeBudget = time.Duration(defaultActiveRefreshRequeryTimeout) * time.Millisecond
+		}
+		probeCtx, probeCancel := context.WithTimeout(c.lifecycleCtx, probeBudget)
+		keptAlive := c.tryFallbackProbeKeepalive(probeCtx, task)
+		probeCancel()
+		if keptAlive {
+			c.activeRefreshProbeKeepTotal.Inc()
+			return
+		}
+	}
+	c.activeRefreshFailedTotal.Inc()
+	c.rescheduleActiveFailure(task.k, task.expected, time.Now())
 }
 
-func (c *Cache) markActiveRefreshAttempt(k key) {
-	metaValue, ok := c.activeMeta.Load(k)
-	if !ok {
+func (c *Cache) activeRefreshAt(k key, v *item) time.Time {
+	if v == nil {
+		return time.Now()
+	}
+	threshold := time.Duration(c.args.ActiveRefresh.Threshold) * time.Second
+	if originalTTL := v.expirationTime.Sub(v.storedTime); originalTTL > 0 {
+		threshold = min(threshold, originalTTL/3)
+	}
+	if threshold <= 0 {
+		return v.expirationTime
+	}
+	due := v.expirationTime.Add(-threshold)
+	jitterWindow := min(threshold/5, time.Duration(c.args.ActiveRefresh.Interval)*time.Second/2)
+	if jitterWindow > 0 && k != "" {
+		due = due.Add(time.Duration(k.Sum() % uint64(jitterWindow)))
+	}
+	return due
+}
+
+func (c *Cache) activeRetryInterval() time.Duration {
+	d := time.Duration(c.args.ActiveRefresh.MinRefreshInterval) * time.Second
+	if d <= 0 {
+		d = time.Second
+	}
+	return d
+}
+
+func (c *Cache) scheduleActiveMetaLocked(meta *activeRefreshMeta, refreshAt, now time.Time) {
+	meta.refreshAt = refreshAt
+	due := refreshAt
+	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
+		idleAt := time.Unix(0, meta.lastAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
+		if idleAt.Before(due) {
+			due = idleAt
+		}
+	}
+	if due.Before(now) {
+		due = now
+	}
+	meta.due = due
+	if meta.heapIndex >= 0 {
+		heap.Fix(&c.activeHeap, meta.heapIndex)
+	} else {
+		heap.Push(&c.activeHeap, meta)
+	}
+}
+
+func (c *Cache) removeActiveMetaLocked(k key, meta *activeRefreshMeta) {
+	if c.activeMeta[k] != meta {
 		return
 	}
-	meta := metaValue.(*activeRefreshMeta)
-	meta.Lock()
-	meta.refreshCount++
-	meta.Unlock()
+	if meta.heapIndex >= 0 {
+		heap.Remove(&c.activeHeap, meta.heapIndex)
+	}
+	delete(c.activeMeta, k)
 }
 
-func (c *Cache) tryFallbackProbeKeepalive(k key) bool {
+func (c *Cache) notifyActiveScheduler() {
+	select {
+	case c.activeWake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Cache) rescheduleStoppedActiveMeta(meta *activeRefreshMeta, now time.Time) {
+	c.activeMu.Lock()
+	if c.activeMeta[meta.k] == meta && meta.heapIndex < 0 {
+		c.scheduleActiveMetaLocked(meta, c.activeRefreshAt(meta.k, meta.expected), now)
+	}
+	c.activeMu.Unlock()
+	c.notifyActiveScheduler()
+}
+
+func (c *Cache) updateActiveRefreshAfterCommit(k key, expected, updated *item, now time.Time) {
+	if !c.activeRefreshEnabled() || updated == nil {
+		return
+	}
+	c.activeMu.Lock()
+	meta := c.activeMeta[k]
+	if meta == nil || meta.expected != expected {
+		c.activeMu.Unlock()
+		return
+	}
+	meta.expected = updated
+	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && meta.refreshCount.Load() >= int64(maxRefresh) {
+		meta.stopped.Store(true)
+	} else {
+		c.scheduleActiveMetaLocked(meta, c.activeRefreshAt(k, updated), now)
+	}
+	c.activeMu.Unlock()
+	c.notifyActiveScheduler()
+}
+
+func (c *Cache) rescheduleActiveFailure(k key, expected *item, now time.Time) {
+	if !c.activeRefreshEnabled() {
+		return
+	}
+	c.activeMu.Lock()
+	meta := c.activeMeta[k]
+	if meta == nil || meta.expected != expected {
+		c.activeMu.Unlock()
+		return
+	}
+	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && meta.refreshCount.Load() >= int64(maxRefresh) {
+		meta.stopped.Store(true)
+	} else {
+		retryAt := now.Add(c.activeRetryInterval())
+		// A healthy answer should remain untouched until its real expiration.
+		// Retry at that boundary so fallback probing can start without first
+		// degrading the still-valid answer to a short stale TTL.
+		if expected != nil && now.Before(expected.expirationTime) && expected.expirationTime.Before(retryAt) {
+			retryAt = expected.expirationTime
+		}
+		c.scheduleActiveMetaLocked(meta, retryAt, now)
+	}
+	c.activeMu.Unlock()
+	c.notifyActiveScheduler()
+}
+
+func (c *Cache) tryFallbackProbeKeepalive(ctx context.Context, task *activeRefreshTask) bool {
 	cfg := c.args.ActiveRefresh.FallbackProbe
-	if !cfg.Enabled {
+	if !cfg.Enabled || task.expected == nil {
 		return false
 	}
-
-	v, cacheExpirationTime, ok := c.backend.Get(k)
-	if !ok || v == nil {
+	if time.Now().Before(task.expected.expirationTime) {
 		return false
 	}
 
 	msg := new(dns.Msg)
-	if err := msg.Unpack(v.resp); err != nil {
+	if err := msg.Unpack(task.expected.resp); err != nil {
 		return false
 	}
 	if c.containsActiveExcluded(msg) {
@@ -1051,73 +1441,110 @@ func (c *Cache) tryFallbackProbeKeepalive(k key) bool {
 	timeout := time.Duration(cfg.TimeoutMS) * time.Millisecond
 	for _, probe := range cfg.Probes {
 		for _, ip := range ips {
+			if ctx.Err() != nil {
+				return false
+			}
 			c.activeRefreshProbeTotal.Inc()
-			if probeCachedIP(probe, ip, timeout) {
-				return c.extendStaleCache(k, v, cacheExpirationTime, msg, cfg.StaleExtendTTL)
+			if probeCachedIP(ctx, probe, ip, timeout) {
+				prepared, ok := c.prepareStaleEntry(task.expected, msg, time.Now())
+				if !ok || !c.commitPrepared(task.k, task.expected, task.epoch, prepared) {
+					return false
+				}
+				c.updateActiveRefreshAfterCommit(task.k, task.expected, prepared.item, time.Now())
+				return true
 			}
 		}
 	}
 	return false
 }
 
-func (c *Cache) extendStaleCache(k key, old *item, cacheExpirationTime time.Time, msg *dns.Msg, ttl int) bool {
-	if ttl <= 0 {
-		return false
+func (c *Cache) prepareStaleEntry(old *item, msg *dns.Msg, now time.Time) (*preparedCacheEntry, bool) {
+	cfg := c.args.ActiveRefresh.FallbackProbe
+	if old == nil || msg == nil || cfg.StaleExtendTTL <= 0 || cfg.MaxStale <= 0 {
+		return nil, false
 	}
-	staleTTL := time.Duration(ttl) * time.Second
+	deadline := old.staleDeadline
+	if deadline.IsZero() {
+		deadline = old.expirationTime.Add(time.Duration(cfg.MaxStale) * time.Second)
+	}
+	if !now.Before(deadline) {
+		return nil, false
+	}
+	staleTTL := min(time.Duration(cfg.StaleExtendTTL)*time.Second, deadline.Sub(now))
+	if staleTTL <= 0 {
+		return nil, false
+	}
 	msgToCache := copyNoOpt(msg)
-	dnsutils.SetTTL(msgToCache, uint32(ttl))
+	msgToCache.AuthenticatedData = false
+	advertisedTTL := min(staleTTL, 5*time.Second)
+	if advertisedTTL < time.Second {
+		advertisedTTL = time.Second
+	}
+	dnsutils.SetTTL(msgToCache, uint32(advertisedTTL/time.Second))
+	if old.upstreamOpt != nil {
+		msgToCache.Extra = append(msgToCache.Extra, copyOPT(old.upstreamOpt))
+	}
 	packedMsg, err := msgToCache.Pack()
 	if err != nil {
-		return false
+		return nil, false
 	}
-
-	now := time.Now()
 	msgExpirationTime := now.Add(staleTTL)
 	newItem := &item{
 		resp:           packedMsg,
 		storedTime:     now,
 		expirationTime: msgExpirationTime,
 		domainSet:      old.domainSet,
+		upstreamOpt:    copyOPT(old.upstreamOpt),
+		staleDeadline:  deadline,
+		isStale:        true,
 	}
-	if cacheExpirationTime.Before(msgExpirationTime) {
-		cacheExpirationTime = msgExpirationTime
-	}
-	c.backend.Store(k, newItem, cacheExpirationTime)
-	c.updatedKey.Add(1)
-	c.shards[k.Sum()%shardCount].updateL1(k, msgToCache.Copy(), now, msgExpirationTime, old.domainSet)
-	return true
-}
-
-func (c *Cache) cleanupActiveRefreshMeta(now time.Time) {
-	maxIdle := c.args.ActiveRefresh.MaxIdleTime
-	if maxIdle <= 0 {
-		return
-	}
-	expireBefore := now.Add(-time.Duration(maxIdle*2) * time.Second)
-	c.activeMeta.Range(func(k, v any) bool {
-		meta := v.(*activeRefreshMeta)
-		meta.Lock()
-		shouldDelete := !meta.lastAccess.IsZero() && meta.lastAccess.Before(expireBefore)
-		meta.Unlock()
-		if shouldDelete {
-			c.activeMeta.Delete(k)
-		}
-		return true
-	})
+	// Keep the bytes privately until the absolute stale deadline so a later
+	// active attempt can probe and extend them again. getRespFromCache still
+	// stops serving at expirationTime unless a new probe succeeds.
+	return &preparedCacheEntry{item: newItem, cacheExpiration: deadline, msg: msgToCache}, true
 }
 
 func (c *Cache) Close() error {
+	c.closeOnce.Do(func() {
+		c.flushMu.Lock()
+		c.refreshEpoch.Add(1)
+		c.cancel()
+		close(c.closeNotify)
+		c.flushMu.Unlock()
+	})
+	c.lazyWorkers.Wait()
+	c.activeWorkers.Wait()
+	c.dumpLoopWG.Wait()
+	c.drainPendingRefreshTasks()
+	c.refreshInFlight.Clear()
 	if err := c.dumpCache(); err != nil {
 		c.logger.Error("failed to dump cache", zap.Error(err))
 	}
-	c.closeOnce.Do(func() {
-		close(c.closeNotify)
-		close(c.lazyTaskChan) // 优雅关闭 Worker Pool
-	})
-	c.lazyWorkers.Wait() // 挂起等待落盘任务安全结束
-	c.activeWorkers.Wait()
 	return c.backend.Close()
+}
+
+func (c *Cache) drainPendingRefreshTasks() {
+	for {
+		select {
+		case <-c.lazyTaskChan:
+			continue
+		default:
+			goto active
+		}
+	}
+
+active:
+	if c.activeTaskChan == nil {
+		return
+	}
+	for {
+		select {
+		case <-c.activeTaskChan:
+			continue
+		default:
+			return
+		}
+	}
 }
 
 func (c *Cache) loadDump() error {
@@ -1145,7 +1572,9 @@ func (c *Cache) startDumpLoop() {
 	if len(c.args.DumpFile) == 0 {
 		return
 	}
+	c.dumpLoopWG.Add(1)
 	go func() {
+		defer c.dumpLoopWG.Done()
 		ticker := time.NewTicker(time.Duration(c.args.DumpInterval) * time.Second)
 		defer ticker.Stop()
 		for {
@@ -1157,6 +1586,7 @@ func (c *Cache) startDumpLoop() {
 					continue
 				}
 				if err := c.dumpCache(); err != nil {
+					c.updatedKey.Add(keyUpdated)
 					c.logger.Error("dump cache", zap.Error(err))
 				}
 			case <-c.closeNotify:
@@ -1192,35 +1622,23 @@ func (c *Cache) Api() *chi.Mux {
 
 	r.Get("/flush", coremain.WithAsyncGC(func(w http.ResponseWriter, req *http.Request) {
 		c.logger.Info("flushing cache via api")
+		c.flushMu.Lock()
+		c.refreshEpoch.Add(1)
 		c.backend.Flush()
+		c.clearRuntimeViews()
+		c.updatedKey.Store(0)
+		dumpErr := c.dumpCache()
+		c.flushMu.Unlock()
+		c.notifyActiveScheduler()
 
-		for i := 0; i < shardCount; i++ {
-			c.shards[i].Lock()
-			c.shards[i].items = make(map[key]*l1Item, shardMaxSize)
-			c.shards[i].order = make([]key, shardMaxSize)
-			c.shards[i].pos = 0
-			c.shards[i].ref = make(map[key]bool, shardMaxSize)
-			c.shards[i].Unlock()
+		if dumpErr != nil {
+			c.logger.Error("failed to dump cache after flushing", zap.Error(dumpErr))
+			http.Error(w, "cache was flushed but the empty dump could not be persisted", http.StatusInternalServerError)
+			return
 		}
 
-		c.updatedKey.Store(0)
-		c.activeMeta.Range(func(k, _ any) bool {
-			c.activeMeta.Delete(k)
-			return true
-		})
-		c.activeInFlight.Range(func(k, _ any) bool {
-			c.activeInFlight.Delete(k)
-			return true
-		})
-
-		go func() {
-			if err := c.dumpCache(); err != nil {
-				c.logger.Error("failed to dump cache after flushing", zap.Error(err))
-			}
-		}()
-
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("Cache flushed and a background dump has been triggered.\n"))
+		_, _ = w.Write([]byte("Cache flushed and the empty dump was persisted.\n"))
 	}))
 
 	r.Get("/dump", coremain.WithAsyncGC(func(w http.ResponseWriter, req *http.Request) {
@@ -1347,6 +1765,27 @@ func (c *Cache) Api() *chi.Mux {
 	return r
 }
 
+// clearRuntimeViews invalidates state derived from the L2 backend. The caller
+// must hold flushMu for writing so no cache commit can repopulate the views
+// halfway through the reset.
+func (c *Cache) clearRuntimeViews() {
+	for i := 0; i < shardCount; i++ {
+		c.shards[i].Lock()
+		c.shards[i].items = make(map[key]*l1Item, shardMaxSize)
+		c.shards[i].order = make([]key, shardMaxSize)
+		c.shards[i].pos = 0
+		c.shards[i].ref = make(map[key]bool, shardMaxSize)
+		c.shards[i].Unlock()
+	}
+
+	c.activeMu.Lock()
+	for k, meta := range c.activeMeta {
+		c.removeActiveMetaLocked(k, meta)
+	}
+	c.activeHeap = nil
+	c.activeMu.Unlock()
+}
+
 func keyToString(k key) string {
 	data := []byte(k)
 	offset := 0
@@ -1367,15 +1806,19 @@ func keyToString(k key) string {
 	if flagsByte&doBit != 0 {
 		flags = append(flags, "DO")
 	}
+	if flagsByte&rdBit != 0 {
+		flags = append(flags, "RD")
+	}
 
-	if len(data) < offset+2 {
-		return fmt.Sprintf("invalid_key(len<3): %x", data)
+	if len(data) < offset+4 {
+		return fmt.Sprintf("invalid_key(missing_question_fields): %x", data)
 	}
 	qtype := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
-
+	qclass := binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
 	if len(data) < offset+1 {
-		return fmt.Sprintf("invalid_key(len<4): %x", data)
+		return fmt.Sprintf("invalid_key(missing_name_len): %x", data)
 	}
 	nameLen := int(data[offset])
 	offset++
@@ -1383,28 +1826,29 @@ func keyToString(k key) string {
 		return fmt.Sprintf("invalid_key(incomplete_name): %x", data)
 	}
 	qname := string(data[offset : offset+nameLen])
-	parts = append(parts, qname, dns.TypeToString[qtype], "IN")
+	className := dns.ClassToString[qclass]
+	if className == "" {
+		className = strconv.Itoa(int(qclass))
+	}
+	parts = append(parts, qname, dns.TypeToString[qtype], className)
 	offset += nameLen
 
 	if len(flags) > 0 {
 		parts = append(parts, fmt.Sprintf("[flags:%s]", strings.Join(flags, ",")))
 	}
-
 	if offset < len(data) {
-		if len(data) < offset+1 {
-			parts = append(parts, "[ecs:invalid_len_byte]")
+		if len(data) < offset+2 {
+			parts = append(parts, "[ecs:invalid_len]")
 		} else {
-			ecsLen := int(data[offset])
-			offset++
+			ecsLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+			offset += 2
 			if len(data) < offset+ecsLen {
-				parts = append(parts, "[ecs:incomplete_string]")
-			} else {
-				ecs := string(data[offset : offset+ecsLen])
-				parts = append(parts, fmt.Sprintf("[ecs:%s]", ecs))
+				parts = append(parts, "[ecs:incomplete]")
+			} else if ecsLen > 0 {
+				parts = append(parts, fmt.Sprintf("[ecs:%x]", data[offset:offset+ecsLen]))
 			}
 		}
 	}
-
 	return strings.Join(parts, " ")
 }
 
@@ -1440,26 +1884,36 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 	}
 
 	now := time.Now()
+	entries := make([]*CachedEntry, 0, c.backend.Len())
 	rangeFunc := func(k key, v *item, cacheExpirationTime time.Time) error {
-		if cacheExpirationTime.Before(now) {
+		// A probe-retained stale answer carries an absolute in-memory age
+		// budget. Do not persist it and accidentally reset that budget after
+		// restart.
+		if cacheExpirationTime.Before(now) || v.isStale || v.isTransient {
 			return nil
 		}
-		e := &CachedEntry{
+		entries = append(entries, &CachedEntry{
 			Key:                 []byte(k),
 			CacheExpirationTime: cacheExpirationTime.Unix(),
 			MsgExpirationTime:   v.expirationTime.Unix(),
 			MsgStoredTime:       v.storedTime.Unix(),
 			Msg:                 v.resp,
 			DomainSet:           v.domainSet,
-		}
-		block.Entries = append(block.Entries, e)
-		if len(block.Entries) >= dumpBlockSize {
-			return writeBlock()
-		}
+		})
 		return nil
 	}
 	if err := c.backend.Range(rangeFunc); err != nil {
 		return en, err
+	}
+	// Serialize after releasing backend shard locks. A slow disk or HTTP dump
+	// consumer must not stall ordinary cache Get/Store operations.
+	for _, entry := range entries {
+		block.Entries = append(block.Entries, entry)
+		if len(block.Entries) >= dumpBlockSize {
+			if err := writeBlock(); err != nil {
+				return en, err
+			}
+		}
 	}
 	if len(block.GetEntries()) > 0 {
 		if err := writeBlock(); err != nil {
@@ -1470,82 +1924,222 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 }
 
 func (c *Cache) readDump(r io.Reader) (int, error) {
-	en := 0
+	if c.lifecycleCtx.Err() != nil {
+		return 0, context.Canceled
+	}
+	entries, err := c.decodeDump(r)
+	if err != nil {
+		return 0, err
+	}
+	if c.lifecycleCtx.Err() != nil {
+		return 0, context.Canceled
+	}
+	if len(entries) == 0 {
+		return 0, nil
+	}
+
+	// Parsing happens outside flushMu. Applying an already validated staging
+	// set is intentionally the only write-locked part, so a slow upload cannot
+	// block Close, flush, or ordinary cache commits.
+	c.flushMu.Lock()
+	if c.lifecycleCtx.Err() != nil {
+		c.flushMu.Unlock()
+		return 0, context.Canceled
+	}
+	c.refreshEpoch.Add(1)
+	for _, entry := range entries {
+		c.backend.Store(entry.k, entry.item, entry.cacheExpiration)
+	}
+	// Loading is merge-compatible at L2, but any overwritten entry makes its
+	// L1 pointer and active-refresh expectation stale.
+	c.clearRuntimeViews()
+	c.flushMu.Unlock()
+	c.notifyActiveScheduler()
+	return len(entries), nil
+}
+
+func (c *Cache) decodeDump(r io.Reader) ([]decodedDumpEntry, error) {
 	gr, err := gzip.NewReader(r)
 	if err != nil {
-		return en, fmt.Errorf("failed to read gzip header, %w", err)
+		return nil, fmt.Errorf("failed to read gzip header, %w", err)
 	}
+	defer gr.Close()
 	if gr.Name != dumpHeader {
-		return en, fmt.Errorf("invalid or old cache dump, header is %s, want %s", gr.Name, dumpHeader)
+		return nil, fmt.Errorf("invalid or old cache dump, header is %s, want %s", gr.Name, dumpHeader)
 	}
 
-	var errReadHeaderEOF = errors.New("")
-	readBlock := func() error {
-		h := pool.GetBuf(8)
-		defer pool.ReleaseBuf(h)
-		_, err := io.ReadFull(gr, *h)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return errReadHeaderEOF
-			}
-			return fmt.Errorf("failed to read block header, %w", err)
+	maxEntries := max(c.args.Size, 1024)
+	entries := make([]decodedDumpEntry, 0, min(maxEntries, dumpBlockSize))
+	totalLength := uint64(0)
+	blockCount := 0
+	decodedEntryCount := 0
+	now := time.Now()
+	for {
+		var header [8]byte
+		_, err := io.ReadFull(gr, header[:])
+		if errors.Is(err, io.EOF) {
+			break
 		}
-		u := binary.BigEndian.Uint64(*h)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read block header, %w", err)
+		}
+		blockCount++
+		if blockCount > maxEntries+1 {
+			return nil, fmt.Errorf("cache dump contains too many blocks")
+		}
+
+		u := binary.BigEndian.Uint64(header[:])
 		if u > dumpMaximumBlockLength {
-			return fmt.Errorf("invalid header, block length is big, %d", u)
+			return nil, fmt.Errorf("invalid header, block length is big, %d", u)
 		}
-		b := pool.GetBuf(int(u))
-		defer pool.ReleaseBuf(b)
-		_, err = io.ReadFull(gr, *b)
+		totalLength += u
+		if totalLength > dumpMaximumTotalLength {
+			return nil, fmt.Errorf("cache dump decoded data exceeds %d bytes", dumpMaximumTotalLength)
+		}
+		b := make([]byte, int(u))
+		_, err = io.ReadFull(gr, b)
 		if err != nil {
-			return fmt.Errorf("failed to read block data, %w", err)
+			return nil, fmt.Errorf("failed to read block data, %w", err)
 		}
 		block := new(CacheDumpBlock)
-		if err := proto.Unmarshal(*b, block); err != nil {
-			return fmt.Errorf("failed to decode block data, %w", err)
+		if err := proto.Unmarshal(b, block); err != nil {
+			return nil, fmt.Errorf("failed to decode block data, %w", err)
 		}
 
-		en += len(block.GetEntries())
+		decodedEntryCount += len(block.GetEntries())
+		if decodedEntryCount > maxEntries {
+			return nil, fmt.Errorf("cache dump contains more than %d entries", maxEntries)
+		}
 		for _, entry := range block.GetEntries() {
 			cacheExpTime := time.Unix(entry.GetCacheExpirationTime(), 0)
+			if !now.Before(cacheExpTime) {
+				continue
+			}
 			msgExpTime := time.Unix(entry.GetMsgExpirationTime(), 0)
 			storedTime := time.Unix(entry.GetMsgStoredTime(), 0)
-
+			resp := append([]byte(nil), entry.GetMsg()...)
+			restored := new(dns.Msg)
+			if err := restored.Unpack(resp); err != nil {
+				return nil, fmt.Errorf("cache dump contains an invalid DNS message, %w", err)
+			}
+			// Transient failures are never persisted by current versions. Ignore
+			// them when importing an older or externally supplied v3 dump too, so
+			// they cannot be restored as healthy fallback candidates.
+			if restored.Rcode == dns.RcodeServerFailure {
+				continue
+			}
 			i := &item{
-				resp:           entry.GetMsg(),
+				resp:           resp,
 				storedTime:     storedTime,
 				expirationTime: msgExpTime,
 				domainSet:      entry.GetDomainSet(),
 			}
-			c.backend.Store(key(entry.GetKey()), i, cacheExpTime)
-		}
-		return nil
-	}
-
-	for {
-		err = readBlock()
-		if err != nil {
-			if err == errReadHeaderEOF {
-				err = nil
+			i.upstreamOpt = copyCacheableUpstreamOPT(restored.IsEdns0())
+			if c.args.LazyCacheTTL > 0 && restored.Rcode == dns.RcodeSuccess {
+				i.lazyDeadline = maxTime(i.expirationTime, storedTime.Add(time.Duration(c.args.LazyCacheTTL)*time.Second))
 			}
-			break
+			if c.args.ActiveRefresh.Enabled && c.activeRefreshConfigValid && c.args.ActiveRefresh.FallbackProbe.Enabled && c.args.ActiveRefresh.FallbackProbe.MaxStale > 0 && len(collectMsgIPs(restored)) > 0 {
+				i.staleDeadline = i.expirationTime.Add(time.Duration(c.args.ActiveRefresh.FallbackProbe.MaxStale) * time.Second)
+			}
+			k := key(string(entry.GetKey()))
+			if _, ok := questionFromKey(k); !ok {
+				return nil, fmt.Errorf("cache dump contains an invalid cache key")
+			}
+			entries = append(entries, decodedDumpEntry{
+				k: k, item: i, cacheExpiration: cacheExpTime,
+			})
 		}
 	}
-
-	if err != nil {
-		return en, err
-	}
-	return en, gr.Close()
+	return entries, nil
 }
 
-func getECSClient(qCtx *query_context.Context) string {
-	queryOpt := qCtx.QOpt()
-	for _, o := range queryOpt.Option {
-		if o.Option() == dns.EDNS0SUBNET {
-			return o.String()
+// getECSClient returns a canonical ECS key fragment. valid is false when the
+// query contains an ECS option that cannot be represented safely; callers
+// should bypass caching instead of collapsing it into the non-ECS key.
+func getECSClient(qCtx *query_context.Context) (client []byte, valid bool) {
+	ecs, valid := singleECSOption(qCtx.QOpt())
+	if !valid || ecs == nil {
+		return nil, valid
+	}
+	return canonicalECS(ecs, true)
+}
+
+// singleECSOption rejects duplicate ECS options and options that claim the
+// ECS code with a different concrete representation. The latter can be
+// constructed by plugins even though it cannot originate from normal wire
+// decoding.
+func singleECSOption(opt *dns.OPT) (*dns.EDNS0_SUBNET, bool) {
+	if opt == nil {
+		return nil, true
+	}
+	var found *dns.EDNS0_SUBNET
+	for _, option := range opt.Option {
+		if option == nil {
+			return nil, false
+		}
+		if ecs, ok := option.(*dns.EDNS0_SUBNET); ok {
+			if ecs == nil || found != nil {
+				return nil, false
+			}
+			found = ecs
+			continue
+		}
+		if option.Option() == dns.EDNS0SUBNET {
+			return nil, false
 		}
 	}
-	return ""
+	return found, true
+}
+
+func canonicalECS(ecs *dns.EDNS0_SUBNET, requireZeroScope bool) ([]byte, bool) {
+	if ecs == nil || (requireZeroScope && ecs.SourceScope != 0) {
+		return nil, false
+	}
+
+	var ip net.IP
+	maxBits := 0
+	switch ecs.Family {
+	case 1:
+		ip = ecs.Address.To4()
+		maxBits = net.IPv4len * 8
+	case 2:
+		// To16 also accepts an IPv4 address. Reject that representation for
+		// family 2, matching miekg/dns's wire encoder.
+		if ecs.Address.To4() != nil {
+			return nil, false
+		}
+		ip = ecs.Address.To16()
+		maxBits = net.IPv6len * 8
+	default:
+		return nil, false
+	}
+	if ip == nil || int(ecs.SourceNetmask) > maxBits || int(ecs.SourceScope) > maxBits {
+		return nil, false
+	}
+
+	bits := int(ecs.SourceNetmask)
+	masked := ip.Mask(net.CIDRMask(bits, maxBits))
+	byteLen := (bits + 7) / 8
+	client := make([]byte, 0, 3+byteLen)
+	client = append(client, byte(ecs.Family>>8), byte(ecs.Family), ecs.SourceNetmask)
+	client = append(client, masked[:byteLen]...)
+	return client, true
+}
+
+func getClientIdentitySubnet(qCtx *query_context.Context) []byte {
+	addr := qCtx.ServerMeta.ClientAddr.Unmap()
+	if !addr.IsValid() {
+		return nil
+	}
+	if addr.Is4() {
+		ip := addr.As4()
+		return append([]byte{0, 1, 32}, ip[:]...)
+	}
+	if addr.Is6() {
+		ip := addr.As16()
+		return append([]byte{0, 2, 128}, ip[:]...)
+	}
+	return nil
 }
 
 func getMsgKeyBytes(q *dns.Msg, qCtx *query_context.Context, useECS bool) ([]byte, *[]byte) {
@@ -1554,12 +2148,23 @@ func getMsgKeyBytes(q *dns.Msg, qCtx *query_context.Context, useECS bool) ([]byt
 	}
 
 	question := q.Question[0]
-	totalLen := 1 + 2 + 1 + len(question.Name)
-	ecs := ""
-	if useECS {
-		ecs = getECSClient(qCtx)
-		totalLen += 1 + len(ecs)
+	if len(question.Name) == 0 || len(question.Name) > 255 {
+		return nil, nil
 	}
+	// Existing ECS always participates in the key. If enable_ecs is set but the
+	// ECS handler is placed after cache, isolate by full client address rather
+	// than allowing one client's regional answer to enter a shared key.
+	ecs, validECS := getECSClient(qCtx)
+	if !validECS {
+		return nil, nil
+	}
+	if len(ecs) == 0 && useECS {
+		ecs = getClientIdentitySubnet(qCtx)
+		if len(ecs) == 0 {
+			return nil, nil
+		}
+	}
+	totalLen := 1 + 2 + 2 + 1 + len(question.Name) + 2 + len(ecs)
 
 	bufPtr := keyBufferPool.Get().(*[]byte)
 	buf := (*bufPtr)[:0]
@@ -1577,15 +2182,17 @@ func getMsgKeyBytes(q *dns.Msg, qCtx *query_context.Context, useECS bool) ([]byt
 	if opt := q.IsEdns0(); opt != nil && opt.Do() {
 		b = b | doBit
 	}
+	if q.RecursionDesired {
+		b = b | rdBit
+	}
 
 	buf = append(buf, b)
 	buf = append(buf, byte(question.Qtype>>8), byte(question.Qtype))
+	buf = append(buf, byte(question.Qclass>>8), byte(question.Qclass))
 	buf = append(buf, byte(len(question.Name)))
 	buf = append(buf, question.Name...)
-	if len(ecs) > 0 {
-		buf = append(buf, byte(len(ecs)))
-		buf = append(buf, ecs...)
-	}
+	buf = append(buf, byte(len(ecs)>>8), byte(len(ecs)))
+	buf = append(buf, ecs...)
 
 	*bufPtr = buf
 	return buf, bufPtr
@@ -1635,6 +2242,20 @@ func copyNoOpt(m *dns.Msg) *dns.Msg {
 
 func min[T constraints.Ordered](a, b T) T {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max[T constraints.Ordered](a, b T) T {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
 		return a
 	}
 	return b
@@ -1711,74 +2332,50 @@ func buildActiveExcludeDomainMatcher(bq sequence.BQ, args ActiveRefreshDomainArg
 
 func questionFromKey(k key) (dns.Question, bool) {
 	data := []byte(k)
+	if len(data) == 0 || data[0]&^(adBit|cdBit|doBit|rdBit) != 0 {
+		return dns.Question{}, false
+	}
 	offset := 1
-	if len(data) < offset+2 {
+	if len(data) < offset+4 {
 		return dns.Question{}, false
 	}
 	qtype := binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	qclass := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
 	if len(data) < offset+1 {
 		return dns.Question{}, false
 	}
 	nameLen := int(data[offset])
 	offset++
-	if len(data) < offset+nameLen {
+	if nameLen == 0 || len(data) < offset+nameLen {
+		return dns.Question{}, false
+	}
+	nameEnd := offset + nameLen
+	if len(data) < nameEnd+2 {
+		return dns.Question{}, false
+	}
+	ecsLen := int(binary.BigEndian.Uint16(data[nameEnd : nameEnd+2]))
+	if ecsLen > 19 || len(data) != nameEnd+2+ecsLen {
 		return dns.Question{}, false
 	}
 	return dns.Question{
 		Name:   string(data[offset : offset+nameLen]),
 		Qtype:  qtype,
-		Qclass: dns.ClassINET,
+		Qclass: qclass,
 	}, true
 }
 
 func (c *Cache) activeDomainExcluded(qname string) bool {
-	matcher, buildOK := c.getActiveExcludeDomainMatcher()
-	if !buildOK {
+	if !c.activeExcludeDomainValid {
 		return true
 	}
+	matcher := c.activeExcludeDomainMatcher
 	if matcher == nil {
 		return false
 	}
 	_, ok := matcher.Match(qname)
 	return ok
-}
-
-func (c *Cache) getActiveExcludeDomainMatcher() (domain.Matcher[struct{}], bool) {
-	if c.activeExcludeDomainMatcher != nil {
-		return c.activeExcludeDomainMatcher, true
-	}
-	args := c.activeExcludeDomainArgs
-	if len(args.Exps)+len(args.Files)+len(args.DomainSets) == 0 {
-		return nil, true
-	}
-
-	c.activeExcludeDomainMu.Lock()
-	defer c.activeExcludeDomainMu.Unlock()
-	if c.activeExcludeDomainMatcher != nil {
-		return c.activeExcludeDomainMatcher, true
-	}
-	matcher, err := buildActiveExcludeDomainMatcher(c.activeExcludeDomainBQ, args)
-	if err != nil {
-		if !c.activeExcludeDomainErrLog {
-			c.logger.Warn("invalid active_refresh.exclude_domain, active refresh will skip entries until it is valid", zap.Error(err))
-			c.activeExcludeDomainErrLog = true
-		}
-		return nil, false
-	}
-	c.activeExcludeDomainMatcher = matcher
-	return c.activeExcludeDomainMatcher, true
-}
-
-func (c *Cache) cachedRespHasActiveExcludedIP(v *item) bool {
-	if len(c.activeExcludeNets) == 0 || v == nil {
-		return false
-	}
-	msg := new(dns.Msg)
-	if err := msg.Unpack(v.resp); err != nil {
-		return false
-	}
-	return c.containsActiveExcluded(msg)
 }
 
 func (c *Cache) containsActiveExcluded(msg *dns.Msg) bool {
@@ -1816,19 +2413,19 @@ func collectMsgIPs(msg *dns.Msg) []net.IP {
 	return ips
 }
 
-func probeCachedIP(probe string, ip net.IP, timeout time.Duration) bool {
+func probeCachedIP(parent context.Context, probe string, ip net.IP, timeout time.Duration) bool {
 	if timeout <= 0 {
 		timeout = time.Duration(defaultFallbackProbeTimeout) * time.Millisecond
 	}
 	if probe == "ping" {
-		return probePing(ip, timeout)
+		return probePing(parent, ip, timeout)
 	}
 	if strings.HasPrefix(probe, "tcp:") {
 		port := strings.TrimPrefix(probe, "tcp:")
 		if port == "" {
 			return false
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
 		dialer := net.Dialer{Timeout: timeout}
 		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
@@ -1841,8 +2438,8 @@ func probeCachedIP(probe string, ip net.IP, timeout time.Duration) bool {
 	return false
 }
 
-func probePing(ip net.IP, timeout time.Duration) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func probePing(parent context.Context, ip net.IP, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	timeoutMS := int(timeout / time.Millisecond)
@@ -1864,7 +2461,7 @@ func probePing(ip net.IP, timeout time.Duration) bool {
 	return cmd.Run() == nil
 }
 
-func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, bool, string) {
+func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCacheEnabled bool, lazyTtl int) (*dns.Msg, bool, *item) {
 	v, _, _ := backend.Get(key(msgKey))
 	if v != nil {
 		now := time.Now()
@@ -1873,74 +2470,65 @@ func getRespFromCache(msgKey string, backend *cache.Cache[key, *item], lazyCache
 		defer dnsMsgPool.Put(m)
 
 		if err := m.Unpack(v.resp); err != nil {
-			return nil, false, ""
+			return nil, false, v
 		}
 
 		if now.Before(v.expirationTime) {
 			r := m.Copy()
 			dnsutils.SubtractTTL(r, uint32(now.Sub(v.storedTime).Seconds()))
-			return r, false, v.domainSet
+			return r, false, v
 		}
 
-		if lazyCacheEnabled {
+		if lazyCacheEnabled && !v.lazyDeadline.IsZero() && now.Before(v.lazyDeadline) {
 			r := m.Copy()
 			dnsutils.SetTTL(r, uint32(lazyTtl))
-			return r, true, v.domainSet
+			return r, true, v
 		}
+		return nil, false, v
 	}
-	return nil, false, ""
+	return nil, false, nil
 }
 
-// 极客优化 2：展平 TTL 计算逻辑，降低分支预测阻力
-func saveRespToCache(msgKey string, qCtx *query_context.Context, backend *cache.Cache[key, *item], lazyCacheTtl int) bool {
+func (c *Cache) prepareCacheEntry(qCtx *query_context.Context, allowTransientFailure bool) (*preparedCacheEntry, bool) {
 	r := qCtx.R()
-	if r == nil || r.Truncated != false {
-		return false
+	if r == nil || r.Truncated {
+		return nil, false
+	}
+	msgTTL, ok := cacheableResponseTTL(r, allowTransientFailure)
+	if !ok || msgTTL <= 0 {
+		return nil, false
 	}
 
-	var msgTtl time.Duration
-	var cacheTtl time.Duration
-
-	switch r.Rcode {
-	case dns.RcodeNameError:
-		msgTtl = time.Second * 30
-	case dns.RcodeServerFailure:
-		msgTtl = time.Second * 5
-	case dns.RcodeSuccess:
-		minTTL := dnsutils.GetMinimalTTL(r)
-		// 展平空响应上限判断逻辑
-		if len(r.Answer) == 0 && minTTL > 300 {
-			minTTL = 300
-		}
-		msgTtl = time.Duration(minTTL) * time.Second
-	}
-
-	// 统一处理 CacheTtl (避免由于层级嵌套引起流水线打断)
-	if lazyCacheTtl > 0 && r.Rcode == dns.RcodeSuccess {
-		cacheTtl = time.Duration(lazyCacheTtl) * time.Second
-	} else {
-		cacheTtl = msgTtl
-	}
-
-	const minCacheableTTL = 5 * time.Second
-	if msgTtl <= 0 {
-		msgTtl = minCacheableTTL
-	}
-	if cacheTtl <= 0 {
-		cacheTtl = minCacheableTTL
+	cacheTTL := msgTTL
+	if c.args.LazyCacheTTL > 0 && r.Rcode == dns.RcodeSuccess {
+		cacheTTL = max(cacheTTL, time.Duration(c.args.LazyCacheTTL)*time.Second)
 	}
 
 	msgToCache := copyNoOpt(r)
+	dnsutils.ApplyMaximumTTL(msgToCache, uint32(msgTTL/time.Second))
+	upstreamOpt, validUpstreamOpt := validatedCacheableUpstreamOPT(qCtx.QOpt(), qCtx.UpstreamOpt())
+	if !validUpstreamOpt {
+		return nil, false
+	}
+	if upstreamOpt != nil {
+		msgToCache.Extra = append(msgToCache.Extra, copyOPT(upstreamOpt))
+	}
 	packedMsg, err := msgToCache.Pack()
 	if err != nil {
-		return false
+		return nil, false
 	}
 
 	now := time.Now()
+	cacheExpiration := now.Add(cacheTTL)
 	v := &item{
 		resp:           packedMsg,
 		storedTime:     now,
-		expirationTime: now.Add(msgTtl),
+		expirationTime: now.Add(msgTTL),
+		upstreamOpt:    upstreamOpt,
+		isTransient:    r.Rcode == dns.RcodeServerFailure,
+	}
+	if c.args.LazyCacheTTL > 0 && r.Rcode == dns.RcodeSuccess {
+		v.lazyDeadline = cacheExpiration
 	}
 
 	if val, ok := qCtx.GetValue(query_context.KeyDomainSet); ok {
@@ -1948,7 +2536,177 @@ func saveRespToCache(msgKey string, qCtx *query_context.Context, backend *cache.
 			v.domainSet = name
 		}
 	}
+	if !v.isTransient && c.activeRefreshEnabled() && c.args.ActiveRefresh.FallbackProbe.Enabled && c.args.ActiveRefresh.FallbackProbe.MaxStale > 0 && len(collectMsgIPs(msgToCache)) > 0 {
+		v.staleDeadline = v.expirationTime.Add(time.Duration(c.args.ActiveRefresh.FallbackProbe.MaxStale) * time.Second)
+		cacheExpiration = maxTime(cacheExpiration, v.staleDeadline)
+	}
+	return &preparedCacheEntry{item: v, cacheExpiration: cacheExpiration, msg: msgToCache}, true
+}
 
-	backend.Store(key(msgKey), v, now.Add(cacheTtl))
+func cacheableResponseTTL(r *dns.Msg, allowTransientFailure bool) (time.Duration, bool) {
+	switch r.Rcode {
+	case dns.RcodeSuccess:
+		if len(r.Answer) == 0 {
+			ttl, ok := negativeResponseTTL(r)
+			if !ok {
+				return 0, false
+			}
+			return min(ttl, 300*time.Second), true
+		}
+		ttl := dnsutils.GetMinimalTTL(r)
+		if ttl == 0 {
+			return 0, false
+		}
+		return time.Duration(ttl) * time.Second, true
+	case dns.RcodeNameError:
+		return negativeResponseTTL(r)
+	case dns.RcodeServerFailure:
+		if allowTransientFailure {
+			return 5 * time.Second, true
+		}
+	}
+	return 0, false
+}
+
+func negativeResponseTTL(r *dns.Msg) (time.Duration, bool) {
+	var minTTL uint32
+	found := false
+	for _, rr := range r.Ns {
+		soa, ok := rr.(*dns.SOA)
+		if !ok {
+			continue
+		}
+		ttl := min(soa.Hdr.Ttl, soa.Minttl)
+		if ttl == 0 {
+			continue
+		}
+		if !found || ttl < minTTL {
+			minTTL = ttl
+			found = true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	return time.Duration(minTTL) * time.Second, true
+}
+
+func (c *Cache) commitPrepared(k key, expected *item, epoch uint64, prepared *preparedCacheEntry) bool {
+	if expected == nil {
+		return c.commitPreparedMatching(k, epoch, false, nil, prepared)
+	}
+	return c.commitPreparedMatching(k, epoch, true, func(current *item, ok bool) bool {
+		return ok && current == expected
+	}, prepared)
+}
+
+func (c *Cache) promoteL1IfCurrent(k key, expected *item, epoch uint64, msg *dns.Msg) bool {
+	if expected == nil || msg == nil || c.lifecycleCtx.Err() != nil {
+		return false
+	}
+	// qCtx owns the response object. L1 keeps an independent copy so later
+	// response processing cannot mutate the cached hot-path template.
+	l1Msg := msg.Copy()
+	c.flushMu.RLock()
+	defer c.flushMu.RUnlock()
+	if c.lifecycleCtx.Err() != nil || epoch != c.refreshEpoch.Load() {
+		return false
+	}
+	commitMu := &c.commitLocks[k.Sum()%shardCount]
+	commitMu.Lock()
+	defer commitMu.Unlock()
+	current, _, ok := c.backend.Get(k)
+	if !ok || current != expected {
+		return false
+	}
+	c.shards[k.Sum()%shardCount].updateL1(k, l1Msg, expected)
 	return true
+}
+
+func (c *Cache) commitPreparedForeground(k key, observed *item, epoch uint64, prepared *preparedCacheEntry) bool {
+	return c.commitPreparedMatching(k, epoch, true, func(current *item, ok bool) bool {
+		if observed == nil {
+			// The first healthy answer wins an absent-miss race, but a healthy
+			// answer may heal a short-lived SERVFAIL inserted by an earlier peer.
+			return !ok || (current != nil && current.isTransient && !prepared.item.isTransient)
+		}
+		// Eviction or expiry can legitimately remove the observed retained item
+		// while the upstream query is running. Epoch protects flush/load, so an
+		// absent current value is still safe to fill.
+		return !ok || current == observed
+	}, prepared)
+}
+
+func (c *Cache) commitPreparedMatching(k key, epoch uint64, checkEpoch bool, match func(current *item, ok bool) bool, prepared *preparedCacheEntry) bool {
+	if prepared == nil || prepared.item == nil || prepared.msg == nil || c.lifecycleCtx.Err() != nil {
+		return false
+	}
+	c.flushMu.RLock()
+	defer c.flushMu.RUnlock()
+	if c.lifecycleCtx.Err() != nil || (checkEpoch && epoch != c.refreshEpoch.Load()) {
+		return false
+	}
+	commitMu := &c.commitLocks[k.Sum()%shardCount]
+	commitMu.Lock()
+	defer commitMu.Unlock()
+	if match != nil {
+		if !c.backend.StoreIf(k, prepared.item, prepared.cacheExpiration, match) {
+			return false
+		}
+	} else {
+		c.backend.Store(k, prepared.item, prepared.cacheExpiration)
+	}
+	c.shards[k.Sum()%shardCount].updateL1(k, prepared.msg.Copy(), prepared.item)
+	c.updatedKey.Add(1)
+	return true
+}
+
+func copyOPT(opt *dns.OPT) *dns.OPT {
+	if opt == nil {
+		return nil
+	}
+	return dns.Copy(opt).(*dns.OPT)
+}
+
+func copyCacheableUpstreamOPT(opt *dns.OPT) *dns.OPT {
+	if opt == nil {
+		return nil
+	}
+	filtered := copyOPT(opt)
+	options := filtered.Option
+	filtered.Option = make([]dns.EDNS0, 0, len(options))
+	for _, option := range options {
+		if option.Option() == dns.EDNS0SUBNET {
+			filtered.Option = append(filtered.Option, option)
+		}
+	}
+	if len(filtered.Option) == 0 {
+		return nil
+	}
+	return filtered
+}
+
+// validatedCacheableUpstreamOPT keeps response ECS metadata only when it is a
+// valid reply to the current query ECS. RFC 7871 requires the response family,
+// source prefix length and address prefix to match the query, and forbids an
+// unsolicited response ECS option.
+func validatedCacheableUpstreamOPT(queryOpt, upstreamOpt *dns.OPT) (*dns.OPT, bool) {
+	responseECS, valid := singleECSOption(upstreamOpt)
+	if !valid {
+		return nil, false
+	}
+	if responseECS == nil {
+		return nil, true
+	}
+
+	queryECS, valid := singleECSOption(queryOpt)
+	if !valid || queryECS == nil {
+		return nil, false
+	}
+	queryPrefix, validQuery := canonicalECS(queryECS, true)
+	responsePrefix, validResponse := canonicalECS(responseECS, false)
+	if !validQuery || !validResponse || !bytes.Equal(queryPrefix, responsePrefix) {
+		return nil, false
+	}
+	return copyCacheableUpstreamOPT(upstreamOpt), true
 }

@@ -47,11 +47,14 @@ func NewMap[K Hashable, V any]() *Map[K, V] {
 }
 
 // NewMapCache returns a cache with a maximum size.
-// Note that, because this it has multiple (MapShardSize) shards,
-// the actual maximum size is MapShardSize*(size / MapShardSize).
+// Note that, because it has multiple (MapShardSize) shards, the actual maximum
+// size is MapShardSize*max(1, size/MapShardSize) for a positive size.
 // If size <=0, it's equal to NewMap().
 func NewMapCache[K Hashable, V any](size int) *Map[K, V] {
 	sizePreShard := size / MapShardSize
+	if size > 0 && sizePreShard == 0 {
+		sizePreShard = 1
+	}
 	m := new(Map[K, V])
 	for i := range m.shards {
 		m.shards[i] = newShard[K, V](sizePreShard)
@@ -125,7 +128,8 @@ func (m *shard[K, V]) get(key K) (V, bool) {
 func (m *shard[K, V]) set(key K, v V) {
 	m.l.Lock()
 	defer m.l.Unlock()
-	if m.max > 0 && len(m.m)+1 > m.max {
+	_, exists := m.m[key]
+	if !exists && m.max > 0 && len(m.m)+1 > m.max {
 		for k := range m.m {
 			delete(m.m, k)
 			if len(m.m)+1 <= m.max {
@@ -149,6 +153,14 @@ func (m *shard[K, V]) testAndSet(key K, f func(v V, ok bool) (newV V, setV, delV
 	newV, setV, deleteV := f(v, ok)
 	switch {
 	case setV:
+		if !ok && m.max > 0 && len(m.m)+1 > m.max {
+			for k := range m.m {
+				delete(m.m, k)
+				if len(m.m)+1 <= m.max {
+					break
+				}
+			}
+		}
 		m.m[key] = newV
 	case deleteV && ok:
 		delete(m.m, key)
@@ -162,8 +174,8 @@ func (m *shard[K, V]) len() int {
 }
 
 func (m *shard[K, V]) flush() {
-	m.l.RLock()
-	defer m.l.RUnlock()
+	m.l.Lock()
+	defer m.l.Unlock()
 	m.m = make(map[K]V)
 }
 

@@ -65,7 +65,8 @@ type elem[V Value] struct {
 }
 
 // New initializes a Cache.
-// The minimum size is 1024.
+// The default size is 1024. Because storage is sharded, positive sizes below
+// the shard count have an effective maximum of one entry per shard.
 // cleanerInterval specifies the interval that Cache scans
 // and discards expired values. If cleanerInterval <= 0, a default
 // interval will be used.
@@ -90,7 +91,11 @@ func (c *Cache[K, V]) Close() error {
 func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 	if e, hasEntry := c.m.Get(key); hasEntry {
 		if e.expirationTime.Before(time.Now()) {
-			c.m.Del(key)
+			// Delete only the element that was observed as expired. A concurrent
+			// Store may already have installed a fresh element for the same key.
+			c.m.TestAndSet(key, func(current *elem[V], ok bool) (newV *elem[V], setV, delV bool) {
+				return nil, false, ok && current == e
+			})
 			return
 		}
 		return e.v, e.expirationTime, true
@@ -121,6 +126,51 @@ func (c *Cache[K, V]) Store(key K, v V, expirationTime time.Time) {
 	}
 	c.m.Set(key, e)
 	return
+}
+
+// StoreIf atomically stores v when match accepts the current logical value.
+// Expired values are presented to match as absent and are removed when match
+// rejects them. The predicate and store run while holding the same underlying
+// map-shard lock, so another Store, Get expiry deletion, or cache eviction
+// cannot interleave between them.
+//
+// match must be non-nil and must not call back into this Cache.
+func (c *Cache[K, V]) StoreIf(key K, v V, expirationTime time.Time, match func(current V, ok bool) bool) bool {
+	if match == nil || expirationTime.Before(time.Now()) {
+		return false
+	}
+
+	stored := false
+	c.m.TestAndSet(key, func(current *elem[V], ok bool) (newV *elem[V], setV, delV bool) {
+		now := time.Now()
+		if expirationTime.Before(now) {
+			return nil, false, false
+		}
+
+		logicalOK := ok && !current.expirationTime.Before(now)
+		var currentValue V
+		if logicalOK {
+			currentValue = current.v
+		}
+		if !match(currentValue, logicalOK) {
+			return nil, false, ok && !logicalOK
+		}
+
+		stored = true
+		return &elem[V]{v: v, expirationTime: expirationTime}, true, false
+	})
+	return stored
+}
+
+// ReplaceIf atomically replaces an unexpired value when match accepts it.
+// An absent or expired current value never matches.
+func (c *Cache[K, V]) ReplaceIf(key K, v V, expirationTime time.Time, match func(current V) bool) bool {
+	if match == nil {
+		return false
+	}
+	return c.StoreIf(key, v, expirationTime, func(current V, ok bool) bool {
+		return ok && match(current)
+	})
 }
 
 func (c *Cache[K, V]) gcLoop(interval time.Duration) {

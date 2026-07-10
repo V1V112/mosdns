@@ -139,6 +139,82 @@ func TestConcurrentMap_TestAndSet(t *testing.T) {
 	}
 }
 
+func TestMapCacheSmallPositiveSizeIsBounded(t *testing.T) {
+	m := NewMapCache[testMapHashable, int](1)
+	// Both keys land in shard zero, whose minimum positive capacity is one.
+	m.Set(0, 1)
+	m.Set(MapShardSize, 2)
+	if got := m.Len(); got != 1 {
+		t.Fatalf("small positive cache size is unbounded: len=%d", got)
+	}
+	if got, ok := m.Get(MapShardSize); !ok || got != 2 {
+		t.Fatalf("latest value = (%d, %v), want (2, true)", got, ok)
+	}
+}
+
+func TestMapCacheUpdatingExistingKeyDoesNotEvict(t *testing.T) {
+	m := NewMapCache[testMapHashable, int](2 * MapShardSize)
+	// Both keys land in shard zero, whose capacity is two.
+	m.Set(0, 1)
+	m.Set(MapShardSize, 2)
+	m.Set(0, 3)
+	if got := m.Len(); got != 2 {
+		t.Fatalf("updating an existing key changed cache length: %d", got)
+	}
+	if got, ok := m.Get(0); !ok || got != 3 {
+		t.Fatalf("updated value = (%d, %v), want (3, true)", got, ok)
+	}
+	if got, ok := m.Get(MapShardSize); !ok || got != 2 {
+		t.Fatalf("peer value was evicted: (%d, %v)", got, ok)
+	}
+}
+
+func TestConcurrentMap_GetSetFlush(t *testing.T) {
+	const (
+		goroutines = 8
+		iterations = 1000
+	)
+
+	m := NewMap[testMapHashable, int]()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < goroutines; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				key := testMapHashable(worker*iterations + i)
+				m.Set(key, i)
+				m.Get(key)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			m.Flush()
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+
+	m.Set(1, 1)
+	if v, ok := m.Get(1); !ok || v != 1 {
+		t.Fatalf("map is unusable after concurrent flush: got (%d, %v)", v, ok)
+	}
+	m.Flush()
+	if got := m.Len(); got != 0 {
+		t.Fatalf("Flush() left %d entries", got)
+	}
+}
+
 func BenchmarkConcurrentMap_Get_And_Set(b *testing.B) {
 	keys := make([]testMapHashable, 2048)
 	m := NewMap[testMapHashable, int]()

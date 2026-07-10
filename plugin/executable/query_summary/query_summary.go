@@ -21,6 +21,7 @@ package query_summary
 
 import (
 	"context"
+
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"go.uber.org/zap"
@@ -60,7 +61,11 @@ func NewSummaryLogger(l *zap.Logger, msg string) *SummaryLogger {
 }
 
 func (l *SummaryLogger) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
+	refreshing := qCtx.IsCacheRefresh()
 	err := next.ExecNext(ctx, qCtx)
+	if refreshing {
+		return err
+	}
 	l.l.Info(
 		l.msg,
 		zap.Inline(qCtx),

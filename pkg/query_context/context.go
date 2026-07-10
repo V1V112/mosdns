@@ -36,6 +36,11 @@ const (
 	// KeyPreferOriginalResponse stores an original-domain response deferred by
 	// prefer_domain until the use_orig sequence action explicitly promotes it.
 	KeyPreferOriginalResponse
+
+	// KeyCacheRefresh marks an internal cache refresh replay. Its value is the
+	// boolean true. Plugins with client-visible side effects should use
+	// IsCacheRefresh instead of reading the raw value.
+	KeyCacheRefresh
 )
 
 const (
@@ -60,8 +65,8 @@ type Context struct {
 	upstreamOpt *dns.OPT // may be nil
 
 	// lazy init.
-	kv    map[uint32]any
-	marks map[uint32]struct{}
+	kv        map[uint32]any
+	marks     map[uint32]struct{}
 	fastFlags uint64
 
 	// Extreme Performance Patch: Cache for fast matching
@@ -206,6 +211,30 @@ func (ctx *Context) UpstreamOpt() *dns.OPT {
 	return ctx.upstreamOpt
 }
 
+// SetUpstreamOpt replaces the OPT received from upstream. Passing nil clears
+// the existing OPT. The supplied OPT remains owned by the caller; Context
+// stores and owns a deep copy of it.
+//
+// When restoring a response and its upstream OPT separately (for example from
+// a cache), call SetResponse before SetUpstreamOpt because SetResponse updates
+// the upstream OPT extracted from the response.
+func (ctx *Context) SetUpstreamOpt(opt *dns.OPT) {
+	ctx.upstreamOpt = copyOpt(opt)
+}
+
+// MarkCacheRefresh marks this Context as an internal cache refresh replay.
+func (ctx *Context) MarkCacheRefresh() {
+	ctx.StoreValue(KeyCacheRefresh, true)
+}
+
+// IsCacheRefresh reports whether this Context is an internal cache refresh
+// replay.
+func (ctx *Context) IsCacheRefresh() bool {
+	v, _ := ctx.GetValue(KeyCacheRefresh)
+	refreshing, _ := v.(bool)
+	return refreshing
+}
+
 // InfoField returns a zap.Field contains a brief summary of this Context.
 // Useful in log.
 func (ctx *Context) InfoField() zap.Field {
@@ -218,6 +247,36 @@ func (ctx *Context) Copy() *Context {
 	newCtx := new(Context)
 	ctx.CopyTo(newCtx)
 	return newCtx
+}
+
+// CopyWithoutResponse deep copies this Context without copying its response
+// or upstream OPT. The returned Context retains the query state, response OPT,
+// values, marks, fast flags, and server metadata needed to replay the query.
+//
+// As with CopyTo, values stored by StoreValue are not deep-copied, but the
+// values map itself is copied. In particular, deferred values such as
+// KeyPreferOriginalResponse are preserved.
+func (ctx *Context) CopyWithoutResponse() *Context {
+	d := &Context{
+		TraceID:   ctx.TraceID,
+		id:        ctx.id,
+		startTime: ctx.startTime,
+
+		ServerMeta: ctx.ServerMeta,
+		query:      ctx.query.Copy(),
+		clientOpt:  copyOpt(ctx.clientOpt),
+
+		kv:        copyMap(ctx.kv),
+		marks:     copyMap(ctx.marks),
+		fastFlags: ctx.fastFlags,
+
+		FastQName: ctx.FastQName,
+		FastQType: ctx.FastQType,
+	}
+	if ctx.respOpt != nil {
+		d.respOpt = copyOpt(ctx.respOpt)
+	}
+	return d
 }
 
 // CopyTo deep copies this Context to d.
@@ -341,6 +400,13 @@ func copyMap[K comparable, V any](m map[K]V) map[K]V {
 		cm[k] = v
 	}
 	return cm
+}
+
+func copyOpt(opt *dns.OPT) *dns.OPT {
+	if opt == nil {
+		return nil
+	}
+	return dns.Copy(opt).(*dns.OPT)
 }
 
 func addNewAndSwapOldOpt(m *dns.Msg) *dns.OPT {
