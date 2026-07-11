@@ -47,20 +47,11 @@ import (
 const (
 	PluginType = "prefer_domain"
 
-	defaultOriginalTimeoutMilliseconds = 300
-	defaultTimeoutMilliseconds         = 500
-	defaultWarmIntervalSeconds         = 300
+	defaultTimeoutMilliseconds = 500
+	defaultWarmIntervalSeconds = 300
 )
 
-type reuseOriginalResponseMode uint8
-
-const (
-	reuseOriginalNever reuseOriginalResponseMode = iota
-	reuseOriginalOnNonMatch
-	reuseOriginalOnFailure
-	reuseOriginalAlways
-	reuseOriginalDeferred
-)
+var internalQueryKey = query_context.RegKey()
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
@@ -76,10 +67,6 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //   - tag: cf_prefer
 //     type: prefer_domain
 //     args:
-//     original_resolver: smartdns_direct # optional: resolve the original name when no response exists
-//     original_timeout: 300 # milliseconds
-//     exit_on_original_failure: false
-//     reuse_original_response: defer # use "use_orig" later to promote it
 //     resolver: fallback_direct
 //     timeout: 500         # milliseconds
 //     warm_interval: 300   # seconds
@@ -92,37 +79,15 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //   - ip_matcher: cf_manual_ip
 //     prefer_domain: cf.example.com
 //
-// A later sequence rule can promote the deferred response and optionally fall
-// back to its normal resolver when no deferred response is available:
+// Run the plugin after the resolver whose response should be inspected:
 //
-//   - matches: qname $direct_domains
-//     exec: use_orig $smartdns_direct
+//   - exec: [$smartdns_direct, $cf_prefer]
 //
 // For a single rule, top-level ip_matcher/prefer_domain are also accepted.
 // Legacy ip_set/ip_set_tag/ipset fields are still accepted as aliases.
 type Args struct {
 	// Resolver resolves the configured preferred domain after an IP rule matches.
 	Resolver string `yaml:"resolver"`
-
-	// original_resolver optionally resolves the client-requested domain when
-	// the plugin runs before any response has been produced. Its result is
-	// used for IP matching and can optionally be reused as the response.
-	OriginalResolver string `yaml:"original_resolver"`
-
-	// original_timeout is always milliseconds. Default is 300.
-	OriginalTimeout string `yaml:"original_timeout"`
-
-	// exit_on_original_failure stops the current sequence with ErrExit when
-	// original_resolver times out, fails, or returns no usable A/AAAA response.
-	// Disabled by default so downstream fallback processing remains available.
-	ExitOnOriginalFailure bool `yaml:"exit_on_original_failure"`
-
-	// reuse_original_response controls whether a successful original_resolver
-	// probe is reused when no replacement is made. "defer" stores it outside
-	// qCtx.R so downstream domain matchers still run; use the sequence action
-	// "use_orig" to promote it later. Supported values: never (default),
-	// on_non_match, on_failure, always, defer.
-	ReuseOriginalResponse string `yaml:"reuse_original_response"`
 
 	// Single-rule shorthand.
 	IPMatcher       string `yaml:"ip_matcher"`
@@ -196,13 +161,9 @@ type cacheEntry struct {
 type PreferDomain struct {
 	logger *zap.Logger
 
-	originalResolver sequence.Executable
-	resolver         sequence.Executable
-	rules            []compiledRule
+	resolver sequence.Executable
+	rules    []compiledRule
 
-	originalTimeout               time.Duration
-	exitOnOriginalFailure         bool
-	reuseOriginalResponse         reuseOriginalResponseMode
 	timeout                       time.Duration
 	warmInterval                  time.Duration
 	cacheTTL                      time.Duration
@@ -210,13 +171,12 @@ type PreferDomain struct {
 	bindResponseTTLToWarmInterval bool
 	warmOnStart                   bool
 	serveStale                    bool
-	maxStale                     time.Duration
+	maxStale                      time.Duration
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
 
-	originalResolveGroup singleflight.Group
-	resolveGroup         singleflight.Group
+	resolveGroup singleflight.Group
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -237,33 +197,6 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		return nil, fmt.Errorf("%s: resolver plugin %q is not executable", PluginType, cfg.Resolver)
 	}
 
-	var originalResolver sequence.Executable
-	if cfg.OriginalResolver != "" {
-		originalResolverPlugin := bp.M().GetPlugin(cfg.OriginalResolver)
-		if originalResolverPlugin == nil {
-			return nil, fmt.Errorf("%s: original_resolver plugin %q not found", PluginType, cfg.OriginalResolver)
-		}
-		originalResolver = sequence.ToExecutable(originalResolverPlugin)
-		if originalResolver == nil {
-			return nil, fmt.Errorf("%s: original_resolver plugin %q is not executable", PluginType, cfg.OriginalResolver)
-		}
-	} else {
-		if strings.TrimSpace(cfg.OriginalTimeout) != "" {
-			return nil, fmt.Errorf("%s: original_timeout requires original_resolver", PluginType)
-		}
-		if cfg.ExitOnOriginalFailure {
-			return nil, fmt.Errorf("%s: exit_on_original_failure requires original_resolver", PluginType)
-		}
-	}
-
-	originalTimeout, err := parseFixedDuration(
-		cfg.OriginalTimeout,
-		defaultOriginalTimeoutMilliseconds,
-		time.Millisecond,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("%s: invalid original_timeout: %w", PluginType, err)
-	}
 	timeout, err := parseFixedDuration(
 		cfg.Timeout,
 		defaultTimeoutMilliseconds,
@@ -288,10 +221,6 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid max_stale: %w", PluginType, err)
 	}
-	reuseOriginalResponse, err := parseReuseOriginalResponseMode(cfg.ReuseOriginalResponse)
-	if err != nil {
-		return nil, fmt.Errorf("%s: invalid reuse_original_response: %w", PluginType, err)
-	}
 	if cfg.BindTTLToWarmInterval && warmInterval <= 0 {
 		return nil, fmt.Errorf("%s: bind_ttl_to_warm_interval requires warm_interval > 0", PluginType)
 	}
@@ -301,10 +230,6 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if maxStale > 0 && !cfg.ServeStale {
 		return nil, fmt.Errorf("%s: max_stale requires serve_stale", PluginType)
 	}
-	if reuseOriginalResponse != reuseOriginalNever && originalResolver == nil {
-		return nil, fmt.Errorf("%s: reuse_original_response requires original_resolver", PluginType)
-	}
-
 	ruleArgs := normalizeRuleArgs(cfg)
 	if len(ruleArgs) == 0 {
 		return nil, fmt.Errorf("%s: at least one rule is required", PluginType)
@@ -337,12 +262,8 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &PreferDomain{
 		logger:                        bp.L(),
-		originalResolver:              originalResolver,
 		resolver:                      resolver,
 		rules:                         rules,
-		originalTimeout:               originalTimeout,
-		exitOnOriginalFailure:         cfg.ExitOnOriginalFailure,
-		reuseOriginalResponse:         reuseOriginalResponse,
 		timeout:                       timeout,
 		warmInterval:                  warmInterval,
 		cacheTTL:                      cacheTTL,
@@ -360,10 +281,6 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 	bp.L().Info("prefer_domain plugin loaded",
 		zap.Int("rules", len(rules)),
-		zap.String("original_resolver", cfg.OriginalResolver),
-		zap.Duration("original_timeout", p.originalTimeout),
-		zap.Bool("exit_on_original_failure", p.exitOnOriginalFailure),
-		zap.String("reuse_original_response", reuseOriginalResponse.String()),
 		zap.String("resolver", cfg.Resolver),
 		zap.Duration("timeout", p.timeout),
 		zap.Duration("warm_interval", p.warmInterval),
@@ -380,6 +297,13 @@ func (p *PreferDomain) Close() error {
 }
 
 func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) error {
+	if qCtx == nil {
+		return nil
+	}
+	if internal, _ := qCtx.GetValue(internalQueryKey); internal == p {
+		return nil
+	}
+
 	q := qCtx.Q()
 	if len(q.Question) != 1 || q.Question[0].Qclass != dns.ClassINET {
 		return nil
@@ -391,33 +315,12 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 	}
 
 	r := qCtx.R()
-	resolvedOriginal := false
-	if r == nil && p.originalResolver != nil {
-		var err error
-		r, err = p.getOriginalResponse(ctx, q.Question[0].Name, qType)
-		if err != nil {
-			p.logger.Debug("failed to resolve original domain",
-				zap.String("qname", strings.TrimSuffix(q.Question[0].Name, ".")),
-				zap.Uint16("qtype", qType),
-				zap.Bool("exit_sequence", p.exitOnOriginalFailure),
-				zap.Error(err))
-			if ctx.Err() != nil {
-				return context.Cause(ctx)
-			}
-			if p.exitOnOriginalFailure {
-				return sequence.ErrExit
-			}
-			return nil
-		}
-		resolvedOriginal = true
-	}
 	if r == nil || r.Rcode != dns.RcodeSuccess {
 		return nil
 	}
 
-	rule, addr, ok := p.matchRule(r)
+	rule, addr, owner, ok := p.matchRule(r, qType)
 	if !ok {
-		p.reuseOriginal(qCtx, q, r, resolvedOriginal, reuseOriginalOnNonMatch)
 		return nil
 	}
 
@@ -427,7 +330,6 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 			zap.String("prefer_domain", rule.preferDisplay),
 			zap.Stringer("matched_ip", addr),
 			zap.Error(err))
-		p.reuseOriginal(qCtx, q, r, resolvedOriginal, reuseOriginalOnFailure)
 		return nil
 	}
 
@@ -437,16 +339,17 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		// extend its lifetime, even when response TTL binding is enabled.
 		forcedTTL = 0
 	}
-	maskedResp, ok := buildMaskedResponse(q, preferredResp, forcedTTL)
+	replacedResp, ok := buildReplacedResponse(r, preferredResp, qType, owner, forcedTTL)
 	if !ok {
 		p.logger.Debug("preferred domain has no usable answer, keep original response",
 			zap.String("prefer_domain", rule.preferDisplay),
 			zap.Stringer("matched_ip", addr))
-		p.reuseOriginal(qCtx, q, r, resolvedOriginal, reuseOriginalOnFailure)
 		return nil
 	}
 
-	qCtx.SetResponse(maskedResp)
+	upstreamOpt := qCtx.UpstreamOpt()
+	qCtx.SetResponse(replacedResp)
+	qCtx.SetUpstreamOpt(upstreamOpt)
 	p.logger.Debug("response replaced by preferred domain",
 		zap.String("qname", strings.TrimSuffix(q.Question[0].Name, ".")),
 		zap.Uint16("qtype", qType),
@@ -456,68 +359,24 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 	return nil
 }
 
-func (p *PreferDomain) reuseOriginal(qCtx *query_context.Context, q, r *dns.Msg, resolvedOriginal bool, reason reuseOriginalResponseMode) {
-	if !resolvedOriginal || qCtx == nil || q == nil || r == nil {
-		return
+func (p *PreferDomain) matchRule(r *dns.Msg, qType uint16) (*compiledRule, netip.Addr, string, bool) {
+	if r == nil || (qType != dns.TypeA && qType != dns.TypeAAAA) {
+		return nil, netip.Addr{}, "", false
 	}
-	if p.reuseOriginalResponse != reuseOriginalAlways &&
-		p.reuseOriginalResponse != reuseOriginalDeferred &&
-		p.reuseOriginalResponse != reason {
-		return
-	}
-
-	reused := r.Copy()
-	reused.Id = q.Id
-	reused.Question = append([]dns.Question(nil), q.Question...)
-	reused.Opcode = q.Opcode
-	reused.RecursionDesired = q.RecursionDesired
-	reused.CheckingDisabled = q.CheckingDisabled
-	if p.reuseOriginalResponse == reuseOriginalDeferred {
-		qCtx.StoreValue(query_context.KeyPreferOriginalResponse, reused)
-		return
-	}
-	qCtx.SetResponse(reused)
-}
-
-func (p *PreferDomain) getOriginalResponse(ctx context.Context, name string, qType uint16) (*dns.Msg, error) {
-	key := cacheKey(name, qType)
-	resultCh := p.originalResolveGroup.DoChan(key, func() (any, error) {
-		parent := p.ctx
-		if parent == nil {
-			parent = context.Background()
-		}
-		return resolveDomain(parent, p.originalResolver, p.originalTimeout, name, qType)
-	})
-
-	select {
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
-	case result := <-resultCh:
-		if result.Err != nil {
-			return nil, result.Err
-		}
-		msg, ok := result.Val.(*dns.Msg)
-		if !ok || msg == nil {
-			return nil, errors.New("original_resolver returned invalid shared result")
-		}
-		return msg.Copy(), nil
-	}
-}
-
-func (p *PreferDomain) matchRule(r *dns.Msg) (*compiledRule, netip.Addr, bool) {
+	addressRRSet := wantedAddressRRSet(r, qType)
 	for i := range p.rules {
 		rule := &p.rules[i]
-		for _, rr := range r.Answer {
+		for _, rr := range addressRRSet {
 			addr, ok := rrIP(rr)
 			if !ok {
 				continue
 			}
 			if rule.matcher != nil && rule.matcher.Match(addr) {
-				return rule, addr, true
+				return rule, addr, rr.Header().Name, true
 			}
 		}
 	}
-	return nil, netip.Addr{}, false
+	return nil, netip.Addr{}, "", false
 }
 
 func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledRule, qType uint16) (*dns.Msg, bool, error) {
@@ -610,10 +469,10 @@ func (p *PreferDomain) resolveAndStore(rule *compiledRule, qType uint16, forceRe
 }
 
 func (p *PreferDomain) resolvePreferred(parent context.Context, rule *compiledRule, qType uint16) (*dns.Msg, error) {
-	return resolveDomain(parent, p.resolver, p.timeout, rule.preferDomain, qType)
+	return resolveDomain(parent, p.resolver, p.timeout, rule.preferDomain, qType, p)
 }
 
-func resolveDomain(parent context.Context, resolver sequence.Executable, timeout time.Duration, name string, qType uint16) (*dns.Msg, error) {
+func resolveDomain(parent context.Context, resolver sequence.Executable, timeout time.Duration, name string, qType uint16, internalPlugin *PreferDomain) (*dns.Msg, error) {
 	if resolver == nil {
 		return nil, errors.New("resolver is not configured")
 	}
@@ -626,6 +485,7 @@ func resolveDomain(parent context.Context, resolver sequence.Executable, timeout
 	q.RecursionDesired = true
 
 	subCtx := query_context.NewContext(q)
+	subCtx.StoreValue(internalQueryKey, internalPlugin)
 	if err := resolver.Exec(ctx, subCtx); err != nil && !errors.Is(err, sequence.ErrExit) {
 		return nil, err
 	}
@@ -796,38 +656,6 @@ func parseFixedDuration(s string, defaultValue int64, unit time.Duration) (time.
 	return time.Duration(n) * unit, nil
 }
 
-func parseReuseOriginalResponseMode(s string) (reuseOriginalResponseMode, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "never":
-		return reuseOriginalNever, nil
-	case "on_non_match":
-		return reuseOriginalOnNonMatch, nil
-	case "on_failure":
-		return reuseOriginalOnFailure, nil
-	case "always":
-		return reuseOriginalAlways, nil
-	case "defer", "deferred":
-		return reuseOriginalDeferred, nil
-	default:
-		return reuseOriginalNever, fmt.Errorf("must be one of never, on_non_match, on_failure, always, defer")
-	}
-}
-
-func (m reuseOriginalResponseMode) String() string {
-	switch m {
-	case reuseOriginalOnNonMatch:
-		return "on_non_match"
-	case reuseOriginalOnFailure:
-		return "on_failure"
-	case reuseOriginalAlways:
-		return "always"
-	case reuseOriginalDeferred:
-		return "defer"
-	default:
-		return "never"
-	}
-}
-
 func cacheKey(name string, qType uint16) string {
 	return strings.ToLower(dns.Fqdn(name)) + "|" + strconv.Itoa(int(qType))
 }
@@ -852,19 +680,58 @@ func netIPToAddr(ip net.IP) (netip.Addr, bool) {
 }
 
 func hasWantedIP(r *dns.Msg, qType uint16) bool {
-	for _, rr := range r.Answer {
-		switch rr.(type) {
-		case *dns.A:
-			if qType == dns.TypeA {
-				return true
+	return len(wantedAddressRRSet(r, qType)) > 0
+}
+
+// wantedAddressRRSet returns usable addresses belonging to the terminal owner
+// of the response's CNAME chain. Responses without an echoed Question retain
+// the legacy behavior and accept all usable addresses of the requested type.
+func wantedAddressRRSet(r *dns.Msg, qType uint16) []dns.RR {
+	if r == nil || (qType != dns.TypeA && qType != dns.TypeAAAA) {
+		return nil
+	}
+
+	owner := ""
+	restrictOwner := len(r.Question) == 1
+	if restrictOwner {
+		owner = dns.Fqdn(r.Question[0].Name)
+		seen := make(map[string]struct{})
+		for {
+			ownerKey := strings.ToLower(owner)
+			if _, duplicate := seen[ownerKey]; duplicate {
+				return nil
 			}
-		case *dns.AAAA:
-			if qType == dns.TypeAAAA {
-				return true
+			seen[ownerKey] = struct{}{}
+
+			nextOwner := ""
+			for _, rr := range r.Answer {
+				cname, ok := rr.(*dns.CNAME)
+				if !ok || !strings.EqualFold(dns.Fqdn(cname.Hdr.Name), owner) {
+					continue
+				}
+				nextOwner = dns.Fqdn(cname.Target)
+				break
 			}
+			if nextOwner == "" {
+				break
+			}
+			owner = nextOwner
 		}
 	}
-	return false
+
+	addresses := make([]dns.RR, 0, len(r.Answer))
+	for _, rr := range r.Answer {
+		if rr == nil || rr.Header() == nil || rr.Header().Rrtype != qType {
+			continue
+		}
+		if restrictOwner && !strings.EqualFold(dns.Fqdn(rr.Header().Name), owner) {
+			continue
+		}
+		if _, ok := rrIP(rr); ok {
+			addresses = append(addresses, rr)
+		}
+	}
+	return addresses
 }
 
 func durationToTTLSeconds(d time.Duration) uint32 {
@@ -924,61 +791,75 @@ func ttlFromAnswer(r *dns.Msg, qType uint16) time.Duration {
 	return time.Duration(minTTL) * time.Second
 }
 
-func buildMaskedResponse(originalQ *dns.Msg, preferredResp *dns.Msg, forcedTTL uint32) (*dns.Msg, bool) {
-	if originalQ == nil || preferredResp == nil || len(originalQ.Question) != 1 {
+func buildReplacedResponse(originalResp *dns.Msg, preferredResp *dns.Msg, qType uint16, owner string, forcedTTL uint32) (*dns.Msg, bool) {
+	if originalResp == nil || preferredResp == nil || owner == "" {
 		return nil, false
 	}
-	q := originalQ.Question[0]
-	if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
+	if qType != dns.TypeA && qType != dns.TypeAAAA {
 		return nil, false
 	}
 
-	masked := new(dns.Msg)
-	masked.SetReply(originalQ)
-	masked.Rcode = dns.RcodeSuccess
-	masked.RecursionAvailable = preferredResp.RecursionAvailable
-	// The owner name and answer records below are synthesized. They are not
-	// authoritative or DNSSEC-authenticated for the original question.
-	masked.Authoritative = false
-	masked.AuthenticatedData = false
-	masked.CheckingDisabled = originalQ.CheckingDisabled
-
-	answers := make([]dns.RR, 0, len(preferredResp.Answer))
-	for _, rr := range preferredResp.Answer {
+	preferredRRSet := wantedAddressRRSet(preferredResp, qType)
+	preferredAddresses := make([]dns.RR, 0, len(preferredRRSet))
+	for _, rr := range preferredRRSet {
 		switch rr := rr.(type) {
 		case *dns.A:
-			if q.Qtype != dns.TypeA {
-				continue
-			}
 			ttl := rr.Hdr.Ttl
 			if forcedTTL > 0 {
 				ttl = forcedTTL
 			}
-			answers = append(answers, &dns.A{
-				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+			preferredAddresses = append(preferredAddresses, &dns.A{
+				Hdr: dns.RR_Header{Name: owner, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
 				A:   append(net.IP(nil), rr.A...),
 			})
 		case *dns.AAAA:
-			if q.Qtype != dns.TypeAAAA {
-				continue
-			}
 			ttl := rr.Hdr.Ttl
 			if forcedTTL > 0 {
 				ttl = forcedTTL
 			}
-			answers = append(answers, &dns.AAAA{
-				Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
+			preferredAddresses = append(preferredAddresses, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: owner, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
 				AAAA: append(net.IP(nil), rr.AAAA...),
 			})
 		}
 	}
 
-	if len(answers) == 0 {
+	if len(preferredAddresses) == 0 {
 		return nil, false
 	}
 
-	// The returned DNS message must look like it was answered for the original domain.
-	// Do not leak the preferred domain or its CNAME chain to the client.
-	masked.Answer = answers
-	return masked, true
+	replaced := originalResp.Copy()
+	answers := make([]dns.RR, 0, len(replaced.Answer)+len(preferredAddresses))
+	inserted := false
+	for _, rr := range replaced.Answer {
+		if rr == nil || rr.Header() == nil {
+			answers = append(answers, rr)
+			continue
+		}
+
+		sameOwner := strings.EqualFold(dns.Fqdn(rr.Header().Name), dns.Fqdn(owner))
+		if sameOwner && rr.Header().Rrtype == qType {
+			if !inserted {
+				answers = append(answers, preferredAddresses...)
+				inserted = true
+			}
+			continue
+		}
+		if sameOwner {
+			if sig, ok := rr.(*dns.RRSIG); ok && sig.TypeCovered == qType {
+				continue
+			}
+		}
+		answers = append(answers, rr)
+	}
+	if !inserted {
+		return nil, false
+	}
+
+	// The address RRset is synthesized for the original response and can no
+	// longer be claimed as authoritative or DNSSEC authenticated.
+	replaced.Authoritative = false
+	replaced.AuthenticatedData = false
+	replaced.Answer = answers
+	return replaced, true
 }

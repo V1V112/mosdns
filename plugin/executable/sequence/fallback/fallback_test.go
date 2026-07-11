@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
@@ -182,6 +183,81 @@ func TestSecondaryExitWithResponseIsSuccessful(t *testing.T) {
 				t.Fatalf("Exec() error = %v", err)
 			}
 			assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
+		})
+	}
+}
+
+func TestOuterMultiExecContinuesAfterFallbackBranchExit(t *testing.T) {
+	primaryResp := new(dns.Msg)
+	primaryResp.Id = 4101
+	secondaryResp := new(dns.Msg)
+	secondaryResp.Id = 4102
+
+	tests := []struct {
+		name               string
+		primary            sequence.Executable
+		secondary          sequence.Executable
+		primaryFailureOnly bool
+		wantResp           *dns.Msg
+	}{
+		{
+			name:      "primary",
+			primary:   stubExecutable{err: sequence.ErrExit, resp: primaryResp},
+			secondary: stubExecutable{},
+			wantResp:  primaryResp,
+		},
+		{
+			name:               "secondary",
+			primary:            stubExecutable{},
+			secondary:          stubExecutable{err: sequence.ErrExit, resp: secondaryResp},
+			primaryFailureOnly: true,
+			wantResp:           secondaryResp,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fallback{
+				primary:              tt.primary,
+				secondary:            tt.secondary,
+				fastFallbackDuration: defaultFallbackThreshold,
+				primaryFailureOnly:   tt.primaryFailureOnly,
+			}
+
+			postCalls := 0
+			postSawResponse := false
+			post := executableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+				postCalls++
+				postSawResponse = qCtx.R() != nil && qCtx.R().Id == tt.wantResp.Id
+				return nil
+			})
+
+			plugins := map[string]any{
+				"fallback": f,
+				"post":     post,
+			}
+			m := coremain.NewTestMosdnsWithPlugins(plugins)
+			outer, err := sequence.NewSequence(coremain.NewBP("outer", m), []sequence.RuleArgs{
+				{Exec: []string{"$fallback", "$post"}},
+			})
+			if err != nil {
+				t.Fatalf("NewSequence() error = %v", err)
+			}
+
+			q := new(dns.Msg)
+			q.SetQuestion("example.org.", dns.TypeA)
+			qCtx := query_context.NewContext(q)
+			if err := outer.Exec(context.Background(), qCtx); err != nil {
+				t.Fatalf("Exec() error = %v", err)
+			}
+
+			if postCalls != 1 {
+				t.Fatalf("post calls = %d, want 1", postCalls)
+			}
+			if !postSawResponse {
+				t.Fatalf("post did not observe fallback response %v", tt.wantResp)
+			}
+			assertDNSMsgEqual(t, qCtx.R(), tt.wantResp)
 		})
 	}
 }

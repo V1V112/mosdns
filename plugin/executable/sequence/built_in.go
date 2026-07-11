@@ -110,9 +110,10 @@ func setupTry(bq BQ, s string) (any, error) {
 	return &ActionTry{Target: exec}, nil
 }
 
-// ActionUseOrig promotes the original-domain response deferred by
-// prefer_domain. If no deferred response exists, it optionally executes a
-// configured fallback plugin.
+// ActionUseOrig promotes a legacy deferred original-domain response. If no
+// deferred response exists, it optionally executes a configured fallback
+// plugin. prefer_domain no longer creates deferred responses, but the action is
+// retained so older sequences continue to load and use their fallback target.
 type ActionUseOrig struct {
 	Fallback Executable
 }
@@ -222,7 +223,7 @@ func setupJump(bq BQ, s string) (any, error) {
 var _ RecursiveExecutable = (*ActionGoto)(nil)
 
 type ActionGoto struct {
-	ToChain[]*ChainNode
+	ToChain []*ChainNode
 	ToIns   []instruction
 }
 
