@@ -11,6 +11,8 @@ message CachedEntry {
   int64 msg_expiration_time = 4;
   int64 msg_stored_time = 5;
   string domain_set = 6;
+  int64 last_real_access_time = 7;
+  uint32 consecutive_refresh_successes = 8;
 }
 
 message CacheDumpBlock {

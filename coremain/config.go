@@ -44,6 +44,10 @@ type PluginConfig struct {
 	// The type of Args is depended on RegNewPluginFunc.
 	// If it's a map[string]any, it will be converted by mapstruct.
 	Args any `yaml:"args"`
+
+	// baseDir is the directory of the config file that declared this plugin.
+	// It is populated while loading Config values and is never decoded from YAML.
+	baseDir string `yaml:"-"`
 }
 
 type APIConfig struct {

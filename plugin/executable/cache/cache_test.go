@@ -21,13 +21,14 @@ package cache
 
 import (
 	"bytes"
-	"container/heap"
 	"context"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
+	"gopkg.in/yaml.v3"
 )
 
 func newTestQuery(name string, qtype, qclass uint16, recursionDesired bool) *query_context.Context {
@@ -113,8 +115,31 @@ func testNegativeResponse(q *dns.Msg, rcode int, soaTTL, minimumTTL uint32) *dns
 	return r
 }
 
+func newCacheForTest(t *testing.T, args *Args, opts Opts) *Cache {
+	t.Helper()
+	c, err := NewCacheWithError(args, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func cloneItemForTest(src *item) *item {
+	dst := &item{
+		generation: src.generation, staleSourceGeneration: src.staleSourceGeneration,
+		resp:       append([]byte(nil), src.resp...),
+		storedTime: src.storedTime, expirationTime: src.expirationTime,
+		lazyDeadline: src.lazyDeadline, domainSet: src.domainSet,
+		upstreamOpt: copyOPT(src.upstreamOpt), staleDeadline: src.staleDeadline,
+		isStale: src.isStale, isTransient: src.isTransient,
+	}
+	dst.lastRealAccess.Store(src.lastRealAccess.Load())
+	dst.refreshSuccess.Store(src.refreshSuccess.Load())
+	return dst
+}
+
 func Test_cachePlugin_Dump(t *testing.T) {
-	c := NewCache(&Args{Size: 16 * dumpBlockSize}, Opts{}) // Big enough to create dump fragments.
+	c := newCacheForTest(t, &Args{Size: 16 * dumpBlockSize}, Opts{}) // Big enough to create dump fragments.
 	defer c.Close()
 
 	resp := new(dns.Msg)
@@ -163,17 +188,23 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 		"size":       1024,
 		"exclude_ip": []any{"203.0.113.0/24"},
 		"active_refresh": map[string]any{
-			"enabled":              true,
-			"refresh_sequence":     "refresh_dns",
-			"threshold":            60,
-			"interval":             30,
-			"requery_timeout_ms":   5000,
-			"workers":              16,
-			"max_entries_per_scan": 256,
-			"max_refresh_times":    0,
-			"max_idle_time":        3600,
-			"min_refresh_interval": 30,
-			"exclude_ip":           []any{"198.18.0.0/15"},
+			"enabled":             true,
+			"refresh_sequence":    "refresh_dns",
+			"threshold":           60,
+			"requery_timeout_ms":  1000,
+			"workers":             16,
+			"max_refresh_qps":     30,
+			"refresh_burst":       60,
+			"max_tasks_per_batch": 256,
+			"max_pending_tasks":   2048,
+			"max_retry_times":     0,
+			"max_refresh_times":   0,
+			"max_idle_time":       3600,
+			"exclude_ip": map[string]any{
+				"cidrs":   []any{"198.18.0.0/15"},
+				"ip_sets": []any{"geoip:cloudflare"},
+				"files":   []any{"no-active-refresh-ip.txt"},
+			},
 			"exclude_domain": map[string]any{
 				"exps":  []any{"domain:fakeip.local"},
 				"files": []any{"/tmp/no_active_refresh.txt"},
@@ -203,14 +234,18 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 	if ar.RefreshSequence != "refresh_dns" {
 		t.Fatalf("refresh sequence = %q, want refresh_dns", ar.RefreshSequence)
 	}
-	if ar.RequeryTimeoutMS != 5000 {
-		t.Fatalf("requery timeout = %d, want 5000", ar.RequeryTimeoutMS)
+	if ar.RequeryTimeoutMS != 1000 || ar.MaxRefreshQPS != 30 || ar.RefreshBurst != 60 {
+		t.Fatalf("active limits mismatch: %#v", ar)
 	}
-	if ar.MaxRefreshTimes != 0 {
-		t.Fatalf("max refresh times = %d, want unlimited 0", ar.MaxRefreshTimes)
+	if ar.MaxRetryTimes != 0 || ar.MaxRefreshTimes != 0 {
+		t.Fatalf("retry/refresh limits = %d/%d, want 0/0", ar.MaxRetryTimes, ar.MaxRefreshTimes)
 	}
-	if len(ar.ExcludeIPs) != 1 || ar.ExcludeIPs[0] != "198.18.0.0/15" {
-		t.Fatalf("exclude ip mismatch: %#v", ar.ExcludeIPs)
+	exclude, err := normalizeActiveRefreshExcludeIP(ar.ExcludeIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exclude.CIDRs) != 1 || len(exclude.IPSets) != 1 || len(exclude.Files) != 1 {
+		t.Fatalf("exclude ip mismatch: %#v", exclude)
 	}
 	if len(ar.ExcludeDomain.Exps) != 1 || ar.ExcludeDomain.Exps[0] != "domain:fakeip.local" {
 		t.Fatalf("exclude domain exps mismatch: %#v", ar.ExcludeDomain.Exps)
@@ -227,17 +262,119 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 	if got := ar.FallbackProbe.Probes[1]; got != "tcp:8443" {
 		t.Fatalf("probe order mismatch, got %s", got)
 	}
+
+	for field, want := range removedActiveRefreshFields {
+		t.Run("removed_"+field, func(t *testing.T) {
+			invalid := map[string]any{"active_refresh": map[string]any{field: 1}}
+			var decoded Args
+			err := utils.WeakDecode(invalid, &decoded)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestActiveRefreshArgsRejectNonPositiveLimits(t *testing.T) {
+	for _, field := range []string{
+		"workers", "max_refresh_qps", "refresh_burst", "max_tasks_per_batch", "max_pending_tasks",
+	} {
+		t.Run(field, func(t *testing.T) {
+			var args Args
+			err := utils.WeakDecode(map[string]any{
+				"active_refresh": map[string]any{field: 0},
+			}, &args)
+			if err == nil || !strings.Contains(err.Error(), "active_refresh."+field+" must be greater than 0") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestActiveRefreshArgsRejectInvalidValuesAcrossDecodePaths(t *testing.T) {
+	t.Run("weak_decode_non_finite_qps", func(t *testing.T) {
+		var args Args
+		err := utils.WeakDecode(map[string]any{
+			"active_refresh": map[string]any{"max_refresh_qps": math.NaN()},
+		}, &args)
+		if err == nil || !strings.Contains(err.Error(), "must be a finite number") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("direct_yaml_explicit_zero", func(t *testing.T) {
+		var args Args
+		err := yaml.Unmarshal([]byte("active_refresh:\n  workers: 0\n"), &args)
+		if err == nil || !strings.Contains(err.Error(), "active_refresh.workers must be greater than 0") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("programmatic_negative_before_defaults", func(t *testing.T) {
+		_, err := NewCacheWithError(&Args{ActiveRefresh: ActiveRefreshArgs{Workers: -1}}, Opts{})
+		if err == nil || !strings.Contains(err.Error(), "active_refresh.workers") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("programmatic_infinite_qps", func(t *testing.T) {
+		_, err := NewCacheWithError(&Args{ActiveRefresh: ActiveRefreshArgs{MaxRefreshQPS: math.Inf(1)}}, Opts{})
+		if err == nil || !strings.Contains(err.Error(), "active_refresh.max_refresh_qps must be finite") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
+
+func TestActiveRefreshArgsWeakDecodeLegacyExcludeIPList(t *testing.T) {
+	var args Args
+	if err := utils.WeakDecode(map[string]any{
+		"active_refresh": map[string]any{
+			"enabled":    true,
+			"exclude_ip": []any{"198.18.0.0/15", "2001:db8::/32"},
+		},
+	}, &args); err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := normalizeActiveRefreshExcludeIP(args.ActiveRefresh.ExcludeIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(normalized.CIDRs) != 2 || normalized.CIDRs[0] != "198.18.0.0/15" || normalized.CIDRs[1] != "2001:db8::/32" {
+		t.Fatalf("legacy exclude_ip = %#v", normalized.CIDRs)
+	}
 }
 
 func TestActiveRefresh_LowTTLScheduledBeforeExpiration(t *testing.T) {
-	c := NewCache(&Args{
-		ActiveRefresh: ActiveRefreshArgs{Threshold: 60, Interval: 30},
+	c := newCacheForTest(t, &Args{
+		ActiveRefresh: ActiveRefreshArgs{Threshold: 60},
 	}, Opts{})
 	defer c.Close()
 
 	stored := time.Unix(1700000000, 0)
-	for _, ttl := range []time.Duration{time.Second, 5 * time.Second, 30 * time.Second} {
-		t.Run(ttl.String(), func(t *testing.T) {
+	for _, tc := range []struct {
+		ttl       time.Duration
+		window    time.Duration
+		refreshIn time.Duration
+	}{
+		{30 * time.Second, 10 * time.Second, 20 * time.Second},
+		{60 * time.Second, 20 * time.Second, 40 * time.Second},
+		{90 * time.Second, 30 * time.Second, 60 * time.Second},
+		{300 * time.Second, 60 * time.Second, 240 * time.Second},
+	} {
+		t.Run(tc.ttl.String(), func(t *testing.T) {
+			window, ok := calculateRefreshWindow(tc.ttl, 60*time.Second)
+			if !ok || window != tc.window {
+				t.Fatalf("window = %s, %v; want %s", window, ok, tc.window)
+			}
+			v := &item{storedTime: stored, expirationTime: stored.Add(tc.ttl)}
+			due := c.activeRefreshAt(key("ttl-"+tc.ttl.String()), v)
+			if got := due.Sub(stored); got != tc.refreshIn {
+				t.Fatalf("refresh in %s, want %s", got, tc.refreshIn)
+			}
+		})
+	}
+	for _, ttl := range []time.Duration{time.Second, 3 * time.Second, 5 * time.Second} {
+		t.Run("short_"+ttl.String(), func(t *testing.T) {
 			v := &item{storedTime: stored, expirationTime: stored.Add(ttl)}
 			due := c.activeRefreshAt(key("low-ttl-"+ttl.String()), v)
 			if !due.After(v.storedTime) {
@@ -258,18 +395,15 @@ func TestActiveRefresh_LowTTLScheduledBeforeExpiration(t *testing.T) {
 	}
 }
 
-func TestActiveRefresh_MaxRefreshTimesCountsAttempts(t *testing.T) {
+func TestActiveRefresh_MaxRefreshTimesCountsSuccesses(t *testing.T) {
 	args := &Args{
 		ActiveRefresh: ActiveRefreshArgs{
+			Enabled:         true,
 			Threshold:       60,
 			MaxRefreshTimes: 1,
 		},
 	}
-	// Build with active refresh disabled so no worker can consume a wrongly
-	// dispatched task and make the queue-length assertion pass accidentally.
-	c := NewCache(args, Opts{})
-	args.ActiveRefresh.Enabled = true
-	c.activeTaskChan = make(chan *activeRefreshTask, 1)
+	c := newCacheForTest(t, args, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("example.com.", dns.TypeA, dns.ClassINET, true)
@@ -281,44 +415,28 @@ func TestActiveRefresh_MaxRefreshTimesCountsAttempts(t *testing.T) {
 	now := time.Now()
 	c.trackActiveRefresh(k, prepared.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, now, prepared.msg)
 
-	c.activeMu.Lock()
+	c.activeMu.RLock()
 	meta := c.activeMeta[k]
+	c.activeMu.RUnlock()
 	if meta == nil {
-		c.activeMu.Unlock()
 		t.Fatal("active refresh metadata was not tracked")
 	}
 	meta.refreshCount.Store(1)
-	meta.refreshAt = now.Add(-time.Second)
-	meta.due = meta.refreshAt
-	heap.Fix(&c.activeHeap, meta.heapIndex)
-	c.activeMu.Unlock()
-
-	c.dispatchDueActiveRefresh(now)
-	if got := len(c.activeTaskChan); got != 0 {
-		t.Fatalf("queued tasks = %d, want 0 after max refresh attempts", got)
-	}
-
-	c.activeMu.RLock()
-	stopped := meta.stopped.Load()
-	heapIndex := meta.heapIndex
-	c.activeMu.RUnlock()
-	if !stopped || heapIndex >= 0 {
-		t.Fatalf("maxed metadata stopped=%v heapIndex=%d, want stopped and unscheduled", stopped, heapIndex)
-	}
+	meta.stopped.Store(true)
 
 	c.observeActiveRefresh(k, prepared.item, qCtx, sequence.ChainWalker{}, now.Add(time.Second), prepared.msg)
 	c.activeMu.RLock()
 	refreshCount := meta.refreshCount.Load()
-	stopped = meta.stopped.Load()
-	heapIndex = meta.heapIndex
+	stopped := meta.stopped.Load()
+	task := meta.task
 	c.activeMu.RUnlock()
-	if refreshCount != 0 || stopped || heapIndex < 0 {
-		t.Fatalf("access reset count=%d stopped=%v heapIndex=%d", refreshCount, stopped, heapIndex)
+	if refreshCount != 0 || stopped || task == nil || task.scheduleIndex < 0 {
+		t.Fatalf("access reset count=%d stopped=%v task=%#v", refreshCount, stopped, task)
 	}
 }
 
 func TestActiveRefresh_TransientResponseDoesNotReplaceHealthyEntry(t *testing.T) {
-	c := NewCache(&Args{
+	c := newCacheForTest(t, &Args{
 		Size: 16,
 		ActiveRefresh: ActiveRefreshArgs{
 			Enabled: true,
@@ -347,14 +465,14 @@ func TestActiveRefresh_TransientResponseDoesNotReplaceHealthyEntry(t *testing.T)
 			transient.Rcode = tc.rcode
 			qCtx.SetResponse(transient)
 			epoch := c.refreshEpoch.Load()
-			flight := refreshFlightKey{k: k, epoch: epoch}
-			c.runActiveRefreshTask(&activeRefreshTask{
-				k:        k,
-				qCtx:     qCtx,
-				next:     sequence.ChainWalker{},
-				expected: healthy.item,
-				epoch:    epoch,
-				flight:   flight,
+			flight := refreshFlightKey{k: k, generation: healthy.item.generation}
+			task := &refreshTask{
+				key: k, expireAt: healthy.item.expirationTime,
+				refreshWindow: 20 * time.Second, generation: healthy.item.generation,
+			}
+			c.runActiveRefreshTask(&activeRefreshWork{
+				task: task, qCtx: qCtx, next: sequence.ChainWalker{},
+				expected: healthy.item, epoch: epoch, flight: flight,
 			})
 
 			got, _, ok := c.backend.Get(k)
@@ -376,7 +494,7 @@ func TestActiveRefresh_TransientResponseDoesNotReplaceHealthyEntry(t *testing.T)
 }
 
 func TestCommitPreparedRejectsStaleExpectedAndFlushEpoch(t *testing.T) {
-	c := NewCache(&Args{Size: 16}, Opts{})
+	c := newCacheForTest(t, &Args{Size: 16}, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("commit.example.", dns.TypeA, dns.ClassINET, true)
@@ -421,7 +539,7 @@ func TestCommitPreparedRejectsStaleExpectedAndFlushEpoch(t *testing.T) {
 }
 
 func TestForegroundMissCannotOverwriteRetainedOrNewerEntry(t *testing.T) {
-	c := NewCache(&Args{Size: 16}, Opts{})
+	c := newCacheForTest(t, &Args{Size: 16}, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("foreground-race.example.", dns.TypeA, dns.ClassINET, true)
@@ -507,8 +625,41 @@ func TestForegroundMissCannotOverwriteRetainedOrNewerEntry(t *testing.T) {
 	}
 }
 
+func TestHealthyForegroundAnswerReplacesProbeStaleDerivative(t *testing.T) {
+	c := newCacheForTest(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{
+		FallbackProbe: FallbackProbeArgs{Enabled: true, StaleExtendTTL: 60, MaxStale: 300},
+	}}, Opts{})
+	defer c.Close()
+
+	qCtx := newTestQuery("foreground-wins-probe.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	old := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Minute)
+	old.item.staleDeadline = old.item.expirationTime.Add(5 * time.Minute)
+	old.cacheExpiration = old.item.staleDeadline
+	if !c.commitPrepared(k, nil, 0, old) {
+		t.Fatal("failed to seed retained answer")
+	}
+
+	stale, ok := c.prepareStaleEntry(old.item, old.msg, time.Now())
+	if !ok || !c.commitPrepared(k, old.item, c.refreshEpoch.Load(), stale) {
+		t.Fatal("failed to install probe-stale derivative")
+	}
+	if !stale.item.isStale || stale.item.staleSourceGeneration != old.item.generation {
+		t.Fatalf("stale lineage = %#v", stale.item)
+	}
+
+	fresh := testPreparedA(t, qCtx.Q(), "192.0.2.99", 2*time.Minute)
+	if !c.commitPreparedForeground(k, old.item, c.refreshEpoch.Load(), fresh) {
+		t.Fatal("healthy foreground response lost to probe-stale derivative")
+	}
+	current, _, present := c.backend.Get(k)
+	if !present || current != fresh.item || current.isStale {
+		t.Fatalf("current = %#v, want fresh foreground item", current)
+	}
+}
+
 func TestL2PromotionCannotRestoreStaleL1(t *testing.T) {
-	c := NewCache(&Args{Size: 16}, Opts{})
+	c := newCacheForTest(t, &Args{Size: 16}, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("promotion-race.example.", dns.TypeA, dns.ClassINET, true)
@@ -568,7 +719,7 @@ func TestL2PromotionCannotRestoreStaleL1(t *testing.T) {
 }
 
 func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
-	c := NewCache(&Args{Size: 16}, Opts{})
+	c := newCacheForTest(t, &Args{Size: 16}, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("lazy-marker.example.", dns.TypeA, dns.ClassINET, true)
@@ -582,15 +733,19 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 	currentCtx := qCtx.CopyWithoutResponse()
 	c.runLazyUpdateTask(&lazyTask{
 		k: k, qCtx: currentCtx, expected: seeded.item, epoch: epoch,
-		flight: refreshFlightKey{k: k, epoch: epoch},
+		flight: refreshFlightKey{k: k, generation: seeded.item.generation},
 	})
 	if !currentCtx.IsCacheRefresh() {
 		t.Fatal("lazy refresh replay was not marked as internal")
 	}
 	activeCtx := qCtx.CopyWithoutResponse()
-	c.runActiveRefreshTask(&activeRefreshTask{
-		k: k, qCtx: activeCtx, expected: seeded.item, epoch: epoch,
-		flight: refreshFlightKey{k: k, epoch: epoch},
+	c.runActiveRefreshTask(&activeRefreshWork{
+		task: &refreshTask{
+			key: k, expireAt: seeded.item.expirationTime,
+			refreshWindow: 20 * time.Second, generation: seeded.item.generation,
+		},
+		qCtx: activeCtx, expected: seeded.item, epoch: epoch,
+		flight: refreshFlightKey{k: k, generation: seeded.item.generation},
 	})
 	if !activeCtx.IsCacheRefresh() {
 		t.Fatal("active refresh replay was not marked as internal")
@@ -600,7 +755,7 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 	c.refreshEpoch.Add(1)
 	c.runLazyUpdateTask(&lazyTask{
 		k: k, qCtx: staleCtx, expected: seeded.item, epoch: epoch,
-		flight: refreshFlightKey{k: k, epoch: epoch},
+		flight: refreshFlightKey{k: k, generation: seeded.item.generation},
 	})
 	if staleCtx.IsCacheRefresh() {
 		t.Fatal("stale-epoch lazy task reached sequence execution")
@@ -609,9 +764,9 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 
 func TestReadDumpInvalidatesDerivedViewsAndRefreshEpoch(t *testing.T) {
 	targetArgs := &Args{Size: 16}
-	target := NewCache(targetArgs, Opts{})
+	target := newCacheForTest(t, targetArgs, Opts{})
 	defer target.Close()
-	source := NewCache(&Args{Size: 16}, Opts{})
+	source := newCacheForTest(t, &Args{Size: 16}, Opts{})
 	defer source.Close()
 
 	qCtx := newTestQuery("load-dump.example.", dns.TypeA, dns.ClassINET, true)
@@ -625,7 +780,6 @@ func TestReadDumpInvalidatesDerivedViewsAndRefreshEpoch(t *testing.T) {
 	// Enable tracking only after construction so no active scheduler can race
 	// this protocol-level test.
 	targetArgs.ActiveRefresh.Enabled = true
-	target.activeTaskChan = make(chan *activeRefreshTask, 1)
 	target.trackActiveRefresh(k, old.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, time.Now(), old.msg)
 	if len(target.activeMeta) != 1 {
 		t.Fatal("failed to seed active-refresh metadata")
@@ -651,10 +805,10 @@ func TestReadDumpInvalidatesDerivedViewsAndRefreshEpoch(t *testing.T) {
 		t.Fatal("dump load left stale L1 data in place")
 	}
 	target.activeMu.RLock()
-	metaCount, heapCount := len(target.activeMeta), len(target.activeHeap)
+	metaCount, scheduledCount, pendingCount := len(target.activeMeta), len(target.activeSchedule), len(target.activePending)
 	target.activeMu.RUnlock()
-	if metaCount != 0 || heapCount != 0 {
-		t.Fatalf("dump load left active state: meta=%d heap=%d", metaCount, heapCount)
+	if metaCount != 0 || scheduledCount != 0 || pendingCount != 0 {
+		t.Fatalf("dump load left active state: meta=%d scheduled=%d pending=%d", metaCount, scheduledCount, pendingCount)
 	}
 
 	loaded, _, ok := target.backend.Get(k)
@@ -683,7 +837,7 @@ func TestReadDumpInvalidatesDerivedViewsAndRefreshEpoch(t *testing.T) {
 }
 
 func TestNegativeSOATTLKeepsCachedMessageAndL1ExpirationAligned(t *testing.T) {
-	c := NewCache(&Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
+	c := newCacheForTest(t, &Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
 	defer c.Close()
 
 	for _, tc := range []struct {
@@ -741,7 +895,7 @@ func TestNegativeSOATTLKeepsCachedMessageAndL1ExpirationAligned(t *testing.T) {
 }
 
 func TestZeroTTLResponsesAreNotCached(t *testing.T) {
-	c := NewCache(&Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
+	c := newCacheForTest(t, &Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
 	defer c.Close()
 
 	for _, tc := range []struct {
@@ -784,7 +938,7 @@ func TestZeroTTLResponsesAreNotCached(t *testing.T) {
 }
 
 func TestFallbackRetentionAndStaleEntryAreBounded(t *testing.T) {
-	c := NewCache(&Args{
+	c := newCacheForTest(t, &Args{
 		Size:         16,
 		LazyCacheTTL: 15,
 		ActiveRefresh: ActiveRefreshArgs{
@@ -817,20 +971,20 @@ func TestFallbackRetentionAndStaleEntryAreBounded(t *testing.T) {
 
 	// Private fallback retention must not make an answer lazy-servable after
 	// its separately configured lazy window has elapsed.
-	retained := *prepared.item
+	retained := cloneItemForTest(prepared.item)
 	retained.expirationTime = time.Now().Add(-2 * time.Second)
 	retained.lazyDeadline = time.Now().Add(-time.Second)
 	k := testCacheKey(t, qCtx)
-	c.backend.Store(k, &retained, time.Now().Add(time.Minute))
+	c.backend.Store(k, retained, time.Now().Add(time.Minute))
 	if msg, lazy, _ := getRespFromCache(string(k), c.backend, true, expiredMsgTtl); msg != nil || lazy {
 		t.Fatal("private fallback retention leaked into lazy serving")
 	}
 
 	now := time.Now()
-	old := *prepared.item
+	old := cloneItemForTest(prepared.item)
 	old.expirationTime = now.Add(-time.Second)
 	old.staleDeadline = now.Add(20 * time.Second)
-	stale, ok := c.prepareStaleEntry(&old, prepared.msg, now)
+	stale, ok := c.prepareStaleEntry(old, prepared.msg, now)
 	if !ok {
 		t.Fatal("expired healthy entry did not produce a bounded stale entry")
 	}
@@ -855,10 +1009,14 @@ func TestFallbackRetentionAndStaleEntryAreBounded(t *testing.T) {
 }
 
 func TestPrepareCacheEntryPreservesUpstreamECSSourceScope(t *testing.T) {
-	c := NewCache(&Args{Size: 16}, Opts{})
+	c := newCacheForTest(t, &Args{Size: 16}, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("upstream-ecs.example.", dns.TypeA, dns.ClassINET, true)
+	qCtx.QOpt().Option = append(qCtx.QOpt().Option, &dns.EDNS0_SUBNET{
+		Code: dns.EDNS0SUBNET, Family: 1, SourceNetmask: 24,
+		Address: net.ParseIP("198.51.100.0").To4(),
+	})
 	r := testAResponse(t, qCtx.Q(), "192.0.2.1", 60)
 	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
 	opt.SetUDPSize(1232)
@@ -1019,7 +1177,7 @@ func TestEnableECSFallsBackToFullClientIdentity(t *testing.T) {
 
 func TestActiveRefreshMetadataIsBoundedByCacheSize(t *testing.T) {
 	const cacheSize = 3
-	c := NewCache(&Args{
+	c := newCacheForTest(t, &Args{
 		Size: cacheSize,
 		ActiveRefresh: ActiveRefreshArgs{
 			Enabled: true,
@@ -1039,7 +1197,7 @@ func TestActiveRefreshMetadataIsBoundedByCacheSize(t *testing.T) {
 
 		c.activeMu.RLock()
 		metaLen := len(c.activeMeta)
-		heapLen := len(c.activeHeap)
+		heapLen := len(c.activeSchedule)
 		c.activeMu.RUnlock()
 		if metaLen > cacheSize || heapLen > cacheSize {
 			t.Fatalf("after entry %d metadata=%d heap=%d, cache size=%d", i, metaLen, heapLen, cacheSize)
@@ -1048,11 +1206,19 @@ func TestActiveRefreshMetadataIsBoundedByCacheSize(t *testing.T) {
 
 	c.activeMu.RLock()
 	metaLen := len(c.activeMeta)
-	heapLen := len(c.activeHeap)
-	c.activeMu.RUnlock()
+	heapLen := len(c.activeSchedule)
 	if metaLen != cacheSize || heapLen != cacheSize {
+		c.activeMu.RUnlock()
 		t.Fatalf("metadata=%d heap=%d, want both capped at %d", metaLen, heapLen, cacheSize)
 	}
+	for k, meta := range c.activeMeta {
+		current, _, present := c.backend.Get(k)
+		if !present || current != meta.expected {
+			c.activeMu.RUnlock()
+			t.Fatalf("metadata retained an evicted/stale entry for %q", keyToString(k))
+		}
+	}
+	c.activeMu.RUnlock()
 }
 
 func TestActiveRefresh_ParseIPNetSupportsIPAndCIDR(t *testing.T) {

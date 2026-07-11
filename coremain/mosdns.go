@@ -465,6 +465,7 @@ func (m *Mosdns) loadPluginsFromCfg(cfg *Config, includeDepth int) error {
 	}
 
 	for i, pc := range cfg.Plugins {
+		pc.baseDir = cfg.baseDir
 		// <<< MODIFIED: Pass tag and apply overrides
 		if m.globalOverrides != nil {
 			ApplyOverrides(pc.Tag, &pc, m.globalOverrides)

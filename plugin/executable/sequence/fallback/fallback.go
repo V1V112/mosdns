@@ -156,8 +156,12 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 
 	resultChan := make(chan fallbackResult, 2)
 
+	// Context is intentionally not safe for concurrent use. Take each branch
+	// snapshot on the coordinator goroutine before handing it to a worker. In
+	// particular, a fast primary must not CopyTo(qCtx) while the secondary is
+	// still executing qCtx.Copy() in another goroutine.
+	qCtxP := qCtx.Copy()
 	go func() {
-		qCtxP := qCtx.Copy()
 		execCtx, cancel := makeDdlCtx(runCtx, defaultParallelTimeout)
 		defer cancel()
 
@@ -182,9 +186,9 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			return
 		}
 		secondaryStarted = true
+		qCtxS := qCtx.Copy()
 
 		go func() {
-			qCtxS := qCtx.Copy()
 			execCtx, cancel := makeDdlCtx(runCtx, defaultParallelTimeout)
 			defer cancel()
 

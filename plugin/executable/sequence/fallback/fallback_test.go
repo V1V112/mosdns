@@ -1,10 +1,10 @@
 package fallback
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
@@ -35,6 +35,24 @@ func (f executableFunc) Exec(ctx context.Context, qCtx *query_context.Context) e
 	return f(ctx, qCtx)
 }
 
+func assertDNSMsgEqual(t *testing.T, got, want *dns.Msg) {
+	t.Helper()
+	if got == nil || want == nil {
+		if got != want {
+			t.Fatalf("DNS response mismatch: got %v, want %v", got, want)
+		}
+		return
+	}
+	gotWire, gotErr := got.Pack()
+	wantWire, wantErr := want.Pack()
+	if gotErr != nil || wantErr != nil {
+		t.Fatalf("pack DNS response: got error %v, want error %v", gotErr, wantErr)
+	}
+	if !bytes.Equal(gotWire, wantWire) {
+		t.Fatalf("DNS response mismatch:\n got: %v\nwant: %v", got, want)
+	}
+}
+
 func TestExecTreatsExitWithResponseAsPrimarySuccess(t *testing.T) {
 	primaryResp := new(dns.Msg)
 	primaryResp.Rcode = dns.RcodeSuccess
@@ -49,9 +67,7 @@ func TestExecTreatsExitWithResponseAsPrimarySuccess(t *testing.T) {
 	if err := f.Exec(context.Background(), qCtx); err != nil {
 		t.Fatalf("Exec() error = %v", err)
 	}
-	if !reflect.DeepEqual(qCtx.R(), primaryResp) {
-		t.Fatalf("expected primary response to be preserved, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), primaryResp)
 }
 
 func TestExecTreatsWrappedExitWithResponseAsPrimarySuccess(t *testing.T) {
@@ -71,9 +87,7 @@ func TestExecTreatsWrappedExitWithResponseAsPrimarySuccess(t *testing.T) {
 	if err := f.Exec(context.Background(), qCtx); err != nil {
 		t.Fatalf("Exec() error = %v", err)
 	}
-	if !reflect.DeepEqual(qCtx.R(), primaryResp) {
-		t.Fatalf("expected wrapped ErrExit response to be preserved, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), primaryResp)
 }
 
 func TestPrimaryExitWithoutResponseFallsBackToSecondary(t *testing.T) {
@@ -91,9 +105,7 @@ func TestPrimaryExitWithoutResponseFallsBackToSecondary(t *testing.T) {
 	if err := f.Exec(context.Background(), qCtx); err != nil {
 		t.Fatalf("Exec() error = %v", err)
 	}
-	if !reflect.DeepEqual(qCtx.R(), secondaryResp) {
-		t.Fatalf("expected secondary response after response-less ErrExit, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
 }
 
 func TestSecondaryExitWithResponseIsSuccessful(t *testing.T) {
@@ -114,9 +126,7 @@ func TestSecondaryExitWithResponseIsSuccessful(t *testing.T) {
 			if err := f.Exec(context.Background(), qCtx); err != nil {
 				t.Fatalf("Exec() error = %v", err)
 			}
-			if !reflect.DeepEqual(qCtx.R(), secondaryResp) {
-				t.Fatalf("expected secondary ErrExit response, got %v", qCtx.R())
-			}
+			assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
 		})
 	}
 }
@@ -137,9 +147,7 @@ func TestOrdinaryPrimaryErrorStillFallsBackToSecondary(t *testing.T) {
 	if err := f.Exec(context.Background(), qCtx); err != nil {
 		t.Fatalf("Exec() error = %v", err)
 	}
-	if !reflect.DeepEqual(qCtx.R(), secondaryResp) {
-		t.Fatalf("expected secondary response after ordinary primary error, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
 }
 
 func TestPrimaryFailureOnlyDoesNotStartSecondaryOnThreshold(t *testing.T) {
@@ -194,9 +202,7 @@ func TestPrimaryFailureOnlyDoesNotStartSecondaryOnThreshold(t *testing.T) {
 		t.Fatal("Exec() did not return")
 	}
 
-	if !reflect.DeepEqual(qCtx.R(), secondaryResp) {
-		t.Fatalf("expected secondary response, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
 }
 
 func TestAlwaysStandbyPrimaryFailureOnlyStartsSecondaryImmediately(t *testing.T) {
@@ -252,9 +258,7 @@ func TestAlwaysStandbyPrimaryFailureOnlyStartsSecondaryImmediately(t *testing.T)
 		t.Fatal("Exec() did not return after primary failed")
 	}
 
-	if !reflect.DeepEqual(qCtx.R(), secondaryResp) {
-		t.Fatalf("expected secondary response, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
 }
 
 func TestFastFallbackLazyStartsSecondaryAfterThreshold(t *testing.T) {
@@ -307,9 +311,7 @@ func TestFastFallbackLazyStartsSecondaryAfterThreshold(t *testing.T) {
 	}
 
 	close(allowPrimaryReturn)
-	if !reflect.DeepEqual(qCtx.R(), secondaryResp) {
-		t.Fatalf("expected secondary response, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
 }
 
 func TestAlwaysStandbyFastFallbackReturnsSecondaryAfterThreshold(t *testing.T) {
@@ -368,9 +370,7 @@ func TestAlwaysStandbyFastFallbackReturnsSecondaryAfterThreshold(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < threshold {
 		t.Fatalf("Exec() returned before threshold: elapsed = %v, threshold = %v", elapsed, threshold)
 	}
-	if !reflect.DeepEqual(qCtx.R(), secondaryResp) {
-		t.Fatalf("expected secondary response, got %v", qCtx.R())
-	}
+	assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
 }
 
 func TestAlwaysStandbyPrimaryFailureOnlyKeepsSecondaryResultUntilPrimaryFails(t *testing.T) {

@@ -111,7 +111,7 @@ func (m *Mosdns) newPlugin(c PluginConfig) error {
 	}
 
 	m.logger.Info("loading plugin", zap.String("tag", c.Tag), zap.String("type", c.Type))
-	p, err := typeInfo.NewPlugin(NewBP(c.Tag, m), args)
+	p, err := typeInfo.NewPlugin(newBP(c.Tag, m, c.baseDir), args)
 	if err != nil {
 		return fmt.Errorf("failed to init plugin: %w", err)
 	}
@@ -163,17 +163,23 @@ func LoadNewPersetPluginFuncs() map[string]NewPersetPluginFunc {
 }
 
 type BP struct {
-	tag string
-	m   *Mosdns
-	l   *zap.Logger
+	tag           string
+	m             *Mosdns
+	l             *zap.Logger
+	configBaseDir string
 }
 
 // NewBP creates a new BP. m MUST NOT nil.
 func NewBP(tag string, m *Mosdns) *BP {
+	return newBP(tag, m, "")
+}
+
+func newBP(tag string, m *Mosdns, configBaseDir string) *BP {
 	return &BP{
-		tag: tag,
-		l:   m.Logger().Named(tag),
-		m:   m,
+		tag:           tag,
+		l:             m.Logger().Named(tag),
+		m:             m,
+		configBaseDir: configBaseDir,
 	}
 }
 
@@ -192,6 +198,13 @@ func (p *BP) M() *Mosdns {
 // a test environment.
 func (p *BP) Tag() string {
 	return p.tag
+}
+
+// ConfigBaseDir returns the directory of the config file that declared this
+// plugin. It is empty for preset plugins and callers that construct a BP with
+// NewBP directly.
+func (p *BP) ConfigBaseDir() string {
+	return p.configBaseDir
 }
 
 // RegAPI mounts mux to mosdns api. Note: Plugins MUST NOT call RegAPI twice.

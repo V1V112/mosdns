@@ -27,6 +27,12 @@ import (
 	"golang.org/x/exp/constraints"
 )
 
+// RawConfigValidator can reject deprecated or presence-sensitive fields
+// before mapstructure converts a loosely typed plugin configuration.
+type RawConfigValidator interface {
+	ValidateRawConfig(any) error
+}
+
 func SetDefaultNum[K constraints.Integer | constraints.Float](p *K, d K) {
 	if *p == 0 {
 		*p = d
@@ -54,6 +60,11 @@ func CheckNumRange[K constraints.Integer | constraints.Float](v, min, max K) boo
 
 // WeakDecode decodes args from config to output.
 func WeakDecode(in any, output any) error {
+	if validator, ok := output.(RawConfigValidator); ok {
+		if err := validator.ValidateRawConfig(in); err != nil {
+			return err
+		}
+	}
 	config := &mapstructure.DecoderConfig{
 		ErrorUnused:      true,
 		Result:           output,
