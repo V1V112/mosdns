@@ -18,7 +18,7 @@ var removedActiveRefreshFields = map[string]string{
 
 // ValidateRawConfig runs before mapstructure decoding. It provides explicit
 // migration errors for removed fields and preserves whether zero-valued fields
-// such as max_retry_times were intentionally configured.
+// such as max_retry_times and max_idle_time were intentionally configured.
 func (a *Args) ValidateRawConfig(raw any) error {
 	root, ok := rawStringMap(raw)
 	if !ok {
@@ -39,6 +39,9 @@ func (a *Args) ValidateRawConfig(raw any) error {
 	}
 	if _, exists := active["max_retry_times"]; exists {
 		a.ActiveRefresh.maxRetryTimesConfigured = true
+	}
+	if _, exists := active["max_idle_time"]; exists {
+		a.ActiveRefresh.maxIdleTimeConfigured = true
 	}
 	for _, field := range []string{
 		"threshold", "requery_timeout_ms", "workers", "max_refresh_qps",
@@ -131,10 +134,10 @@ func rawNumber(v any) (float64, error) {
 }
 
 // validateActiveRefreshBeforeDefaults rejects explicit negative/non-finite
-// programmatic values before SetDefaultUnsignNum can turn them into defaults.
-// Zero remains the historical programmatic sentinel for "not specified";
-// production WeakDecode and direct YAML paths reject an explicitly supplied
-// zero using their presence-aware validators.
+// programmatic values before defaults are applied. Zero remains the historical
+// programmatic sentinel for "not specified". Presence-aware WeakDecode and
+// direct YAML paths can preserve zero for non-negative controls such as
+// max_retry_times, max_refresh_times and max_idle_time.
 func validateActiveRefreshBeforeDefaults(a *ActiveRefreshArgs) error {
 	if a == nil {
 		return fmt.Errorf("active_refresh configuration is nil")
@@ -194,17 +197,20 @@ func validateActiveRefreshArgs(a *ActiveRefreshArgs) error {
 	return nil
 }
 
-func validateActiveRefreshYAMLNode(node *yaml.Node) (maxRetryConfigured bool, err error) {
+func validateActiveRefreshYAMLNode(node *yaml.Node) (maxRetryConfigured, maxIdleConfigured bool, err error) {
 	if node == nil || node.Kind != yaml.MappingNode {
-		return false, nil
+		return false, false, nil
 	}
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		field := strings.ToLower(node.Content[i].Value)
 		if message, removed := removedActiveRefreshFields[field]; removed {
-			return false, fmt.Errorf("%s", message)
+			return false, false, fmt.Errorf("%s", message)
 		}
 		if field == "max_retry_times" {
 			maxRetryConfigured = true
+		}
+		if field == "max_idle_time" {
+			maxIdleConfigured = true
 		}
 		valueNode := node.Content[i+1]
 		strictlyPositive := field == "threshold" || field == "requery_timeout_ms" ||
@@ -214,19 +220,19 @@ func validateActiveRefreshYAMLNode(node *yaml.Node) (maxRetryConfigured bool, er
 		if strictlyPositive || nonNegative {
 			var raw any
 			if decodeErr := valueNode.Decode(&raw); decodeErr != nil {
-				return false, fmt.Errorf("active_refresh.%s must be a number: %w", field, decodeErr)
+				return false, false, fmt.Errorf("active_refresh.%s must be a number: %w", field, decodeErr)
 			}
 			n, numberErr := rawNumber(raw)
 			if numberErr != nil {
-				return false, fmt.Errorf("active_refresh.%s must be a finite number", field)
+				return false, false, fmt.Errorf("active_refresh.%s must be a finite number", field)
 			}
 			if strictlyPositive && n <= 0 {
-				return false, fmt.Errorf("active_refresh.%s must be greater than 0", field)
+				return false, false, fmt.Errorf("active_refresh.%s must be greater than 0", field)
 			}
 			if nonNegative && n < 0 {
-				return false, fmt.Errorf("active_refresh.%s must be greater than or equal to 0", field)
+				return false, false, fmt.Errorf("active_refresh.%s must be greater than or equal to 0", field)
 			}
 		}
 	}
-	return maxRetryConfigured, nil
+	return maxRetryConfigured, maxIdleConfigured, nil
 }

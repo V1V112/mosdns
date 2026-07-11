@@ -291,6 +291,43 @@ func TestActiveRefreshArgsRejectNonPositiveLimits(t *testing.T) {
 	}
 }
 
+func TestActiveRefreshMaxIdleTimeExplicitZeroMeansUnlimited(t *testing.T) {
+	t.Run("weak_decode", func(t *testing.T) {
+		var args Args
+		if err := utils.WeakDecode(map[string]any{
+			"active_refresh": map[string]any{"max_idle_time": 0},
+		}, &args); err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		if args.ActiveRefresh.MaxIdleTime != 0 {
+			t.Fatalf("max idle time = %d, want unlimited (0)", args.ActiveRefresh.MaxIdleTime)
+		}
+	})
+
+	t.Run("direct_yaml", func(t *testing.T) {
+		var args Args
+		if err := yaml.Unmarshal([]byte("active_refresh:\n  max_idle_time: 0\n"), &args); err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		if args.ActiveRefresh.MaxIdleTime != 0 {
+			t.Fatalf("max idle time = %d, want unlimited (0)", args.ActiveRefresh.MaxIdleTime)
+		}
+	})
+
+	t.Run("omitted_uses_default", func(t *testing.T) {
+		var args Args
+		if err := yaml.Unmarshal([]byte("active_refresh:\n  enabled: true\n"), &args); err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		if args.ActiveRefresh.MaxIdleTime != defaultActiveRefreshMaxIdleTime {
+			t.Fatalf("max idle time = %d, want default %d", args.ActiveRefresh.MaxIdleTime, defaultActiveRefreshMaxIdleTime)
+		}
+	})
+}
+
 func TestActiveRefreshArgsRejectInvalidValuesAcrossDecodePaths(t *testing.T) {
 	t.Run("weak_decode_non_finite_qps", func(t *testing.T) {
 		var args Args

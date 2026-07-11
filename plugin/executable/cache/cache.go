@@ -222,6 +222,7 @@ type ActiveRefreshArgs struct {
 	FallbackProbe    FallbackProbeArgs       `yaml:"fallback_probe"`
 
 	maxRetryTimesConfigured bool
+	maxIdleTimeConfigured   bool
 }
 
 type activeRefreshArgsRaw struct {
@@ -251,7 +252,7 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 		a.Enabled = enabled
 		return nil
 	}
-	maxRetryConfigured, err := validateActiveRefreshYAMLNode(node)
+	maxRetryConfigured, maxIdleConfigured, err := validateActiveRefreshYAMLNode(node)
 	if err != nil {
 		return err
 	}
@@ -273,6 +274,7 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 	a.maxRetryTimesConfigured = maxRetryConfigured
 	a.MaxRefreshTimes = raw.MaxRefreshTimes
 	a.MaxIdleTime = raw.MaxIdleTime
+	a.maxIdleTimeConfigured = maxIdleConfigured
 	a.ExcludeIP = raw.ExcludeIP
 	a.ExcludeDomain = raw.ExcludeDomain
 	a.FallbackProbe = raw.FallbackProbe
@@ -339,7 +341,9 @@ func (a *ActiveRefreshArgs) init() {
 	utils.SetDefaultUnsignNum(&a.Threshold, defaultActiveRefreshThreshold)
 	utils.SetDefaultUnsignNum(&a.RequeryTimeoutMS, defaultActiveRefreshRequeryTimeout)
 	utils.SetDefaultUnsignNum(&a.Workers, defaultActiveRefreshWorkers)
-	utils.SetDefaultUnsignNum(&a.MaxIdleTime, defaultActiveRefreshMaxIdleTime)
+	if !a.maxIdleTimeConfigured && a.MaxIdleTime == 0 {
+		a.MaxIdleTime = defaultActiveRefreshMaxIdleTime
+	}
 	utils.SetDefaultUnsignNum(&a.MaxRefreshQPS, defaultActiveRefreshMaxQPS)
 	utils.SetDefaultUnsignNum(&a.RefreshBurst, defaultActiveRefreshBurst)
 	utils.SetDefaultUnsignNum(&a.MaxTasksPerBatch, defaultActiveRefreshMaxBatch)
