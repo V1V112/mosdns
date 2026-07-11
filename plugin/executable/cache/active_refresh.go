@@ -1127,6 +1127,7 @@ func (c *Cache) runActiveRefreshTask(work *activeRefreshWork) {
 		}
 		return
 	}
+	work.qCtx.RenewTrace()
 	work.qCtx.MarkCacheRefresh()
 	ctx, cancel := context.WithTimeout(c.lifecycleCtx, timeout)
 	defer cancel()

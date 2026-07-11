@@ -150,6 +150,20 @@ func fallbackExecSucceeded(err error, qCtx *query_context.Context) bool {
 	return err == nil || errors.Is(err, sequence.ErrExit)
 }
 
+// shouldLogBranchError filters cancellation caused by the fallback
+// coordinator itself. Once one branch wins (or the parent request ends),
+// cancelAll cancels the other branch. That cancellation is expected control
+// flow, not an upstream failure.
+func shouldLogBranchError(runCtx context.Context, err error) bool {
+	if err == nil || errors.Is(err, sequence.ErrExit) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) && runCtx.Err() != nil {
+		return false
+	}
+	return true
+}
+
 func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) error {
 	runCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
@@ -167,7 +181,7 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 
 		err := f.primary.Exec(execCtx, qCtxP)
 		primarySucceeded := fallbackExecSucceeded(err, qCtxP)
-		if err != nil && !errors.Is(err, sequence.ErrExit) {
+		if shouldLogBranchError(runCtx, err) {
 			if f.logger != nil {
 				f.logger.Warn("primary error", qCtxP.InfoField(), zap.Error(err))
 			}
@@ -194,7 +208,7 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 
 			err := f.secondary.Exec(execCtx, qCtxS)
 			secondarySucceeded := fallbackExecSucceeded(err, qCtxS)
-			if err != nil && !errors.Is(err, sequence.ErrExit) {
+			if shouldLogBranchError(runCtx, err) {
 				if f.logger != nil {
 					f.logger.Warn("secondary error", qCtxS.InfoField(), zap.Error(err))
 				}

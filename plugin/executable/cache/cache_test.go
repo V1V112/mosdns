@@ -731,6 +731,7 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 
 	epoch := c.refreshEpoch.Load()
 	currentCtx := qCtx.CopyWithoutResponse()
+	currentTrace, currentID, currentStart := currentCtx.TraceID, currentCtx.Id(), currentCtx.StartTime()
 	c.runLazyUpdateTask(&lazyTask{
 		k: k, qCtx: currentCtx, expected: seeded.item, epoch: epoch,
 		flight: refreshFlightKey{k: k, generation: seeded.item.generation},
@@ -738,7 +739,11 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 	if !currentCtx.IsCacheRefresh() {
 		t.Fatal("lazy refresh replay was not marked as internal")
 	}
+	if currentCtx.TraceID == currentTrace || currentCtx.Id() == currentID || !currentCtx.StartTime().After(currentStart) {
+		t.Fatal("lazy refresh replay retained the client query identity")
+	}
 	activeCtx := qCtx.CopyWithoutResponse()
+	activeTrace, activeID, activeStart := activeCtx.TraceID, activeCtx.Id(), activeCtx.StartTime()
 	c.runActiveRefreshTask(&activeRefreshWork{
 		task: &refreshTask{
 			key: k, expireAt: seeded.item.expirationTime,
@@ -749,6 +754,9 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 	})
 	if !activeCtx.IsCacheRefresh() {
 		t.Fatal("active refresh replay was not marked as internal")
+	}
+	if activeCtx.TraceID == activeTrace || activeCtx.Id() == activeID || !activeCtx.StartTime().After(activeStart) {
+		t.Fatal("active refresh replay retained the client query identity")
 	}
 
 	staleCtx := qCtx.CopyWithoutResponse()

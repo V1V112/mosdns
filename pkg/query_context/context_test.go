@@ -3,9 +3,32 @@ package query_context
 import (
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 )
+
+func TestRenewTrace(t *testing.T) {
+	q := new(dns.Msg)
+	q.SetQuestion("example.org.", dns.TypeA)
+	ctx := NewContext(q)
+	oldID, oldTrace, oldStart := ctx.Id(), ctx.TraceID, ctx.StartTime()
+
+	time.Sleep(time.Millisecond)
+	before := time.Now()
+	ctx.RenewTrace()
+	after := time.Now()
+
+	if ctx.Id() == oldID || ctx.TraceID == oldTrace {
+		t.Fatal("RenewTrace did not assign a new identity")
+	}
+	if !ctx.StartTime().After(oldStart) {
+		t.Fatal("RenewTrace did not restart elapsed-time accounting")
+	}
+	if ctx.StartTime().Before(before) || ctx.StartTime().After(after) {
+		t.Fatalf("renewed start time %s is outside call interval [%s, %s]", ctx.StartTime(), before, after)
+	}
+}
 
 func TestCopyWithoutResponse(t *testing.T) {
 	q := new(dns.Msg)

@@ -12,6 +12,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type stubExecutable struct {
@@ -50,6 +51,60 @@ func assertDNSMsgEqual(t *testing.T, got, want *dns.Msg) {
 	}
 	if !bytes.Equal(gotWire, wantWire) {
 		t.Fatalf("DNS response mismatch:\n got: %v\nwant: %v", got, want)
+	}
+}
+
+func TestExpectedLosingBranchCancellationIsNotWarned(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	secondaryDone := make(chan struct{})
+	primaryResp := new(dns.Msg)
+	primaryResp.Rcode = dns.RcodeSuccess
+
+	f := &fallback{
+		logger: zap.New(core),
+		primary: executableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			qCtx.SetResponse(primaryResp)
+			return nil
+		}),
+		secondary: executableFunc(func(ctx context.Context, _ *query_context.Context) error {
+			defer close(secondaryDone)
+			<-ctx.Done()
+			return context.Cause(ctx)
+		}),
+		fastFallbackDuration: defaultFallbackThreshold,
+		alwaysStandby:        true,
+	}
+
+	q := new(dns.Msg)
+	q.SetQuestion("example.org.", dns.TypeA)
+	if err := f.Exec(context.Background(), query_context.NewContext(q)); err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	select {
+	case <-secondaryDone:
+	case <-time.After(time.Second):
+		t.Fatal("secondary branch did not observe coordinator cancellation")
+	}
+	if got := logs.FilterMessage("secondary error").Len(); got != 0 {
+		t.Fatalf("expected cancellation produced %d secondary warnings", got)
+	}
+}
+
+func TestShouldLogBranchError(t *testing.T) {
+	runCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if shouldLogBranchError(runCtx, context.Canceled) {
+		t.Fatal("coordinator cancellation should not be logged")
+	}
+	if !shouldLogBranchError(runCtx, context.DeadlineExceeded) {
+		t.Fatal("deadline exceeded should remain visible")
+	}
+	if !shouldLogBranchError(context.Background(), context.Canceled) {
+		t.Fatal("independent branch cancellation should remain visible")
+	}
+	if shouldLogBranchError(context.Background(), sequence.ErrExit) {
+		t.Fatal("sequence exit should not be logged")
 	}
 }
 

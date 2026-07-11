@@ -996,6 +996,7 @@ func (c *Cache) runLazyUpdateTask(task *lazyTask) {
 	if current, _, ok := c.backend.Get(task.k); !ok || current != task.expected {
 		return
 	}
+	task.qCtx.RenewTrace()
 	task.qCtx.MarkCacheRefresh()
 	ctx, cancel := context.WithTimeout(c.lifecycleCtx, defaultLazyUpdateTimeout)
 	defer cancel()

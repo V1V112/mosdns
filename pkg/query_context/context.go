@@ -85,12 +85,7 @@ var (
 
 const hexTable = "0123456789abcdef"
 
-type ServerMeta = server.QueryMeta
-
-// NewContext creates a new query Context.
-// q must have one question.
-// NewContext takes the ownership of q.
-func NewContext(q *dns.Msg) *Context {
+func newTraceIdentity() (uint32, string) {
 	id := contextUid.Add(1)
 	val := traceSeed ^ id
 
@@ -105,9 +100,19 @@ func NewContext(q *dns.Msg) *Context {
 	b[5] = hexTable[(val>>8)&0x0f]
 	b[6] = hexTable[(val>>4)&0x0f]
 	b[7] = hexTable[val&0x0f]
+	return id, string(b[:])
+}
+
+type ServerMeta = server.QueryMeta
+
+// NewContext creates a new query Context.
+// q must have one question.
+// NewContext takes the ownership of q.
+func NewContext(q *dns.Msg) *Context {
+	id, traceID := newTraceIdentity()
 
 	ctx := &Context{
-		TraceID:   string(b[:]),
+		TraceID:   traceID,
 		id:        id,
 		startTime: time.Now(),
 		query:     q,
@@ -142,6 +147,15 @@ func (ctx *Context) Id() uint32 {
 // StartTime returns the time when the Context was created.
 func (ctx *Context) StartTime() time.Time {
 	return ctx.startTime
+}
+
+// RenewTrace assigns a new identity and restarts elapsed-time accounting.
+// Background replays should call this immediately before execution so their
+// logs are not attributed to the client request that originally populated the
+// cache.
+func (ctx *Context) RenewTrace() {
+	ctx.id, ctx.TraceID = newTraceIdentity()
+	ctx.startTime = time.Now()
 }
 
 // Q returns the query msg that will be forward to upstream.
