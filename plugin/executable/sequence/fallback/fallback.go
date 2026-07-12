@@ -158,10 +158,21 @@ func shouldLogBranchError(runCtx context.Context, err error) bool {
 	if err == nil || errors.Is(err, sequence.ErrExit) {
 		return false
 	}
-	if errors.Is(err, context.Canceled) && runCtx.Err() != nil {
+	if runCtx.Err() != nil &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return false
 	}
 	return true
+}
+
+func parentContextCause(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
 }
 
 func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) error {
@@ -262,11 +273,21 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			return false
 		}
 
+		// The cached secondary result is only a fallback for a live request. In
+		// particular, do not let it win when parent cancellation races with the
+		// primary result that would otherwise mark primaryFailed.
+		if parentContextCause(ctx) != nil {
+			return false
+		}
 		secondarySuccessCtx.CopyTo(qCtx)
 		return true
 	}
 
 	for {
+		if cause := parentContextCause(ctx); cause != nil {
+			return cause
+		}
+
 		if useSecondaryIfAllowed() {
 			return nil
 		}
@@ -276,6 +297,9 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 				startSecondary()
 			}
 			if secondaryStarted && secondaryDone && secondarySuccessCtx == nil {
+				if cause := parentContextCause(ctx); cause != nil {
+					return cause
+				}
 				return ErrFailed
 			}
 		}
@@ -293,10 +317,19 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			secondaryAcceptReached = true
 			secondaryAcceptTimerC = nil
 		case result := <-resultChan:
+			// A branch result and parent cancellation can become ready together.
+			// Re-check after select so cancellation takes precedence regardless of
+			// which ready case select chose.
+			if cause := parentContextCause(ctx); cause != nil {
+				return cause
+			}
 			switch result.source {
 			case fallbackResultPrimary:
 				primaryDone = true
 				if result.success {
+					if cause := parentContextCause(ctx); cause != nil {
+						return cause
+					}
 					result.qCtx.CopyTo(qCtx)
 					return nil
 				}

@@ -98,8 +98,11 @@ func TestShouldLogBranchError(t *testing.T) {
 	if shouldLogBranchError(runCtx, context.Canceled) {
 		t.Fatal("coordinator cancellation should not be logged")
 	}
-	if !shouldLogBranchError(runCtx, context.DeadlineExceeded) {
-		t.Fatal("deadline exceeded should remain visible")
+	if shouldLogBranchError(runCtx, context.DeadlineExceeded) {
+		t.Fatal("parent cancellation reported as deadline exceeded should not be logged")
+	}
+	if !shouldLogBranchError(context.Background(), context.DeadlineExceeded) {
+		t.Fatal("independent branch deadline should remain visible")
 	}
 	if !shouldLogBranchError(context.Background(), context.Canceled) {
 		t.Fatal("independent branch cancellation should remain visible")
@@ -279,6 +282,178 @@ func TestOrdinaryPrimaryErrorStillFallsBackToSecondary(t *testing.T) {
 		t.Fatalf("Exec() error = %v", err)
 	}
 	assertDNSMsgEqual(t, qCtx.R(), secondaryResp)
+}
+
+func TestPrimaryFailureOnlyParentCancellationRejectsCompletedSecondary(t *testing.T) {
+	secondaryResp := new(dns.Msg)
+	secondaryResp.Id = 5005
+	secondaryDone := make(chan struct{})
+	primaryDone := make(chan struct{})
+
+	f := &fallback{
+		primary: executableFunc(func(ctx context.Context, _ *query_context.Context) error {
+			defer close(primaryDone)
+			<-ctx.Done()
+			return context.Cause(ctx)
+		}),
+		secondary: executableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			qCtx.SetResponse(secondaryResp)
+			close(secondaryDone)
+			return nil
+		}),
+		fastFallbackDuration: defaultFallbackThreshold,
+		alwaysStandby:        true,
+		primaryFailureOnly:   true,
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	qCtx := query_context.NewContext(new(dns.Msg))
+	done := make(chan error, 1)
+	go func() {
+		done <- f.Exec(ctx, qCtx)
+	}()
+
+	select {
+	case <-secondaryDone:
+	case <-time.After(time.Second):
+		t.Fatal("secondary did not complete before parent cancellation")
+	}
+
+	clientCanceled := errors.New("client request canceled")
+	cancel(clientCanceled)
+	select {
+	case err := <-done:
+		if !errors.Is(err, clientCanceled) {
+			t.Fatalf("Exec() error = %v, want parent cause %v", err, clientCanceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Exec() did not return after parent cancellation")
+	}
+
+	if qCtx.R() != nil {
+		t.Fatalf("secondary response was adopted after parent cancellation: %v", qCtx.R())
+	}
+	select {
+	case <-primaryDone:
+	case <-time.After(time.Second):
+		t.Fatal("primary goroutine did not stop after parent cancellation")
+	}
+}
+
+func TestPrimaryFailureOnlyParentCancellationWinsPrimaryResultRace(t *testing.T) {
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		primaryRelease := make(chan struct{})
+		secondaryDone := make(chan struct{})
+		secondaryResp := new(dns.Msg)
+		secondaryResp.Id = uint16(6000 + i)
+
+		f := &fallback{
+			primary: executableFunc(func(_ context.Context, _ *query_context.Context) error {
+				<-primaryRelease
+				return errors.New("primary failed")
+			}),
+			secondary: executableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+				qCtx.SetResponse(secondaryResp)
+				close(secondaryDone)
+				return nil
+			}),
+			fastFallbackDuration: defaultFallbackThreshold,
+			alwaysStandby:        true,
+			primaryFailureOnly:   true,
+		}
+
+		ctx, cancel := context.WithCancelCause(context.Background())
+		qCtx := query_context.NewContext(new(dns.Msg))
+		done := make(chan error, 1)
+		go func() {
+			done <- f.Exec(ctx, qCtx)
+		}()
+
+		select {
+		case <-secondaryDone:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: secondary did not complete", i)
+		}
+
+		clientCanceled := fmt.Errorf("client request canceled %d", i)
+		cancel(clientCanceled)
+		close(primaryRelease)
+
+		select {
+		case err := <-done:
+			if !errors.Is(err, clientCanceled) {
+				t.Fatalf("iteration %d: Exec() error = %v, want parent cause %v", i, err, clientCanceled)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: Exec() did not return", i)
+		}
+		if qCtx.R() != nil {
+			t.Fatalf("iteration %d: secondary response won cancellation race: %v", i, qCtx.R())
+		}
+	}
+}
+
+func TestPrimaryFailureOnlyCancellationStopsAllBranchGoroutines(t *testing.T) {
+	primaryStarted := make(chan struct{})
+	secondaryStarted := make(chan struct{})
+	primaryDone := make(chan struct{})
+	secondaryDone := make(chan struct{})
+
+	waitForCancellation := func(started, done chan struct{}) sequence.Executable {
+		return executableFunc(func(ctx context.Context, _ *query_context.Context) error {
+			close(started)
+			defer close(done)
+			<-ctx.Done()
+			return context.Cause(ctx)
+		})
+	}
+
+	f := &fallback{
+		primary:              waitForCancellation(primaryStarted, primaryDone),
+		secondary:            waitForCancellation(secondaryStarted, secondaryDone),
+		fastFallbackDuration: defaultFallbackThreshold,
+		alwaysStandby:        true,
+		primaryFailureOnly:   true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- f.Exec(ctx, query_context.NewContext(new(dns.Msg)))
+	}()
+
+	for name, started := range map[string]<-chan struct{}{
+		"primary":   primaryStarted,
+		"secondary": secondaryStarted,
+	} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not start", name)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Exec() error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Exec() did not return after cancellation")
+	}
+
+	for name, branchDone := range map[string]<-chan struct{}{
+		"primary":   primaryDone,
+		"secondary": secondaryDone,
+	} {
+		select {
+		case <-branchDone:
+		case <-time.After(time.Second):
+			t.Fatalf("%s goroutine was left running", name)
+		}
+	}
 }
 
 func TestPrimaryFailureOnlyDoesNotStartSecondaryOnThreshold(t *testing.T) {
