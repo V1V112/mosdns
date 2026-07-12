@@ -282,23 +282,25 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type Args struct {
-	Size          int               `yaml:"size"`
-	LazyCacheTTL  int               `yaml:"lazy_cache_ttl"`
-	EnableECS     bool              `yaml:"enable_ecs"`
-	ExcludeIPs    []string          `yaml:"exclude_ip"`
-	DumpFile      string            `yaml:"dump_file"`
-	DumpInterval  int               `yaml:"dump_interval"`
-	ActiveRefresh ActiveRefreshArgs `yaml:"active_refresh"`
+	Size          int                     `yaml:"size"`
+	LazyCacheTTL  int                     `yaml:"lazy_cache_ttl"`
+	EnableECS     bool                    `yaml:"enable_ecs"`
+	ExcludeIPs    []string                `yaml:"exclude_ip"`
+	ExcludeDomain ActiveRefreshDomainArgs `yaml:"exclude_domain"`
+	DumpFile      string                  `yaml:"dump_file"`
+	DumpInterval  int                     `yaml:"dump_interval"`
+	ActiveRefresh ActiveRefreshArgs       `yaml:"active_refresh"`
 }
 
 type argsRaw struct {
-	Size          int               `yaml:"size"`
-	LazyCacheTTL  int               `yaml:"lazy_cache_ttl"`
-	EnableECS     bool              `yaml:"enable_ecs"`
-	ExcludeIP     interface{}       `yaml:"exclude_ip"`
-	DumpFile      string            `yaml:"dump_file"`
-	DumpInterval  int               `yaml:"dump_interval"`
-	ActiveRefresh ActiveRefreshArgs `yaml:"active_refresh"`
+	Size          int                     `yaml:"size"`
+	LazyCacheTTL  int                     `yaml:"lazy_cache_ttl"`
+	EnableECS     bool                    `yaml:"enable_ecs"`
+	ExcludeIP     interface{}             `yaml:"exclude_ip"`
+	ExcludeDomain ActiveRefreshDomainArgs `yaml:"exclude_domain"`
+	DumpFile      string                  `yaml:"dump_file"`
+	DumpInterval  int                     `yaml:"dump_interval"`
+	ActiveRefresh ActiveRefreshArgs       `yaml:"active_refresh"`
 }
 
 func (a *Args) UnmarshalYAML(node *yaml.Node) error {
@@ -311,6 +313,7 @@ func (a *Args) UnmarshalYAML(node *yaml.Node) error {
 	a.DumpFile = raw.DumpFile
 	a.DumpInterval = raw.DumpInterval
 	a.EnableECS = raw.EnableECS
+	a.ExcludeDomain = raw.ExcludeDomain
 	a.ActiveRefresh = raw.ActiveRefresh
 
 	switch v := raw.ExcludeIP.(type) {
@@ -428,6 +431,7 @@ type Cache struct {
 	activeRefreshMetaSize       prometheus.GaugeFunc
 
 	excludeNets                []*net.IPNet
+	excludeDomainMatcher       domain.Matcher[struct{}]
 	activeExcludeIPMatcher     netlist.Matcher
 	activeExcludeDomainMatcher domain.Matcher[struct{}]
 	activeExcludeDomainValid   bool
@@ -458,6 +462,7 @@ type Opts struct {
 	BQ                         sequence.BQ
 	ConfigBaseDir              string
 	ActiveExcludeDomainMatcher domain.Matcher[struct{}]
+	ExcludeDomainMatcher       domain.Matcher[struct{}]
 	ActiveExcludeIPMatcher     netlist.Matcher
 	ActiveRefreshExec          sequence.Executable
 }
@@ -555,6 +560,14 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 	}
 
 	activeExcludeDomainMatcher := opts.ActiveExcludeDomainMatcher
+	excludeDomainMatcher := opts.ExcludeDomainMatcher
+	if excludeDomainMatcher == nil {
+		matcher, err := buildExcludeDomainMatcher(opts.BQ, args.ExcludeDomain)
+		if err != nil {
+			return nil, fmt.Errorf("exclude_domain: %w", err)
+		}
+		excludeDomainMatcher = matcher
+	}
 	activeExcludeIPMatcher := opts.ActiveExcludeIPMatcher
 	activeRefreshExec := opts.ActiveRefreshExec
 	if args.ActiveRefresh.Enabled {
@@ -603,6 +616,7 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 		lifecycleCtx:               lifecycleCtx,
 		cancel:                     cancel,
 		excludeNets:                excludeNets,
+		excludeDomainMatcher:       excludeDomainMatcher,
 		activeExcludeIPMatcher:     activeExcludeIPMatcher,
 		activeExcludeDomainMatcher: activeExcludeDomainMatcher,
 		activeExcludeDomainValid:   true,
@@ -1899,6 +1913,10 @@ func parseIPNet(s string) (*net.IPNet, error) {
 }
 
 func buildActiveExcludeDomainMatcher(bq sequence.BQ, args ActiveRefreshDomainArgs) (domain.Matcher[struct{}], error) {
+	return buildExcludeDomainMatcher(bq, args)
+}
+
+func buildExcludeDomainMatcher(bq sequence.BQ, args ActiveRefreshDomainArgs) (domain.Matcher[struct{}], error) {
 	var matchers []domain.Matcher[struct{}]
 	if len(args.Exps)+len(args.Files) > 0 {
 		anonymousSet := domain.NewDomainMixMatcher()
@@ -2083,6 +2101,14 @@ func (c *Cache) prepareCacheEntry(qCtx *query_context.Context, allowTransientFai
 	r := qCtx.R()
 	if r == nil || r.Truncated {
 		return nil, false
+	}
+	if matcher := c.excludeDomainMatcher; matcher != nil {
+		q := qCtx.Q()
+		if q != nil && len(q.Question) == 1 {
+			if _, excluded := matcher.Match(q.Question[0].Name); excluded {
+				return nil, false
+			}
+		}
 	}
 	msgTTL, ok := cacheableResponseTTL(r, allowTransientFailure)
 	if !ok || msgTTL <= 0 {

@@ -275,6 +275,42 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 	}
 }
 
+func TestTopLevelExcludeDomainSkipsCacheWrite(t *testing.T) {
+	c, err := NewCacheWithError(&Args{
+		ExcludeDomain: ActiveRefreshDomainArgs{
+			Exps: []string{"domain:fakeip.example"},
+		},
+	}, Opts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	excluded := newTestQuery("www.fakeip.example.", dns.TypeA, dns.ClassINET, true)
+	excludedResponse := new(dns.Msg)
+	excludedResponse.SetReply(excluded.Q())
+	excludedResponse.Answer = []dns.RR{&dns.A{
+		Hdr: dns.RR_Header{Name: "www.fakeip.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP("203.0.113.10").To4(),
+	}}
+	excluded.SetResponse(excludedResponse)
+	if prepared, ok := c.prepareCacheEntry(excluded, false); ok || prepared != nil {
+		t.Fatal("domain excluded response was prepared for cache")
+	}
+
+	allowed := newTestQuery("allowed.example.", dns.TypeA, dns.ClassINET, true)
+	allowedResponse := new(dns.Msg)
+	allowedResponse.SetReply(allowed.Q())
+	allowedResponse.Answer = []dns.RR{&dns.A{
+		Hdr: dns.RR_Header{Name: "allowed.example.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP("203.0.113.11").To4(),
+	}}
+	allowed.SetResponse(allowedResponse)
+	if prepared, ok := c.prepareCacheEntry(allowed, false); !ok || prepared == nil {
+		t.Fatal("non-excluded response was not prepared for cache")
+	}
+}
+
 func TestActiveRefreshArgsRejectNonPositiveLimits(t *testing.T) {
 	for _, field := range []string{
 		"workers", "max_refresh_qps", "refresh_burst", "max_tasks_per_batch", "max_pending_tasks",
