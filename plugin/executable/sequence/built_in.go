@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/miekg/dns"
@@ -108,55 +107,6 @@ func setupTry(bq BQ, s string) (any, error) {
 	}
 
 	return &ActionTry{Target: exec}, nil
-}
-
-// ActionUseOrig promotes a legacy deferred original-domain response. If no
-// deferred response exists, it optionally executes a configured fallback
-// plugin. prefer_domain no longer creates deferred responses, but the action is
-// retained so older sequences continue to load and use their fallback target.
-type ActionUseOrig struct {
-	Fallback Executable
-}
-
-var _ Executable = (*ActionUseOrig)(nil)
-
-func (a *ActionUseOrig) Exec(ctx context.Context, qCtx *query_context.Context) error {
-	if v, ok := qCtx.GetValue(query_context.KeyPreferOriginalResponse); ok {
-		qCtx.DeleteValue(query_context.KeyPreferOriginalResponse)
-		if r, ok := v.(*dns.Msg); ok && r != nil {
-			qCtx.SetResponse(r.Copy())
-			return nil
-		}
-	}
-	if a.Fallback != nil {
-		return a.Fallback.Exec(ctx, qCtx)
-	}
-	return nil
-}
-
-// setupUseOrig accepts an optional fallback executable tag:
-//
-//	use_orig
-//	use_orig $smartdns_direct
-func setupUseOrig(bq BQ, s string) (any, error) {
-	tag := strings.TrimSpace(s)
-	if tag == "" {
-		return &ActionUseOrig{}, nil
-	}
-	tag = strings.TrimSpace(strings.TrimPrefix(tag, "$"))
-	if tag == "" {
-		return nil, fmt.Errorf("use_orig fallback tag must not be empty")
-	}
-
-	p := bq.M().GetPlugin(tag)
-	if p == nil {
-		return nil, fmt.Errorf("can not find use_orig fallback %s", tag)
-	}
-	fallback := ToExecutable(p)
-	if fallback == nil {
-		return nil, fmt.Errorf("use_orig fallback %s is not executable", tag)
-	}
-	return &ActionUseOrig{Fallback: fallback}, nil
 }
 
 var _ RecursiveExecutable = (*ActionReject)(nil)

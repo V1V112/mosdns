@@ -42,7 +42,6 @@ func init() {
 	MustRegExecQuickSetup("jump", setupJump)
 	MustRegExecQuickSetup("exit", setupExit)
 	MustRegExecQuickSetup("try", setupTry)
-	MustRegExecQuickSetup("use_orig", setupUseOrig)
 	MustRegMatchQuickSetup("_true", setupTrue)
 	MustRegMatchQuickSetup("_false", setupFalse)
 }

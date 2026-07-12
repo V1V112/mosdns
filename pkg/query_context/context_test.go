@@ -66,8 +66,6 @@ func TestCopyWithoutResponse(t *testing.T) {
 	}
 	ctx.SetResponse(resp)
 
-	deferred := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
-	ctx.StoreValue(KeyPreferOriginalResponse, deferred)
 	valueKey := RegKey()
 	ctx.StoreValue(valueKey, "original")
 	ctx.SetMark(42)
@@ -126,14 +124,6 @@ func TestCopyWithoutResponse(t *testing.T) {
 		t.Fatal("mutating the copied response OPT changed the source response OPT")
 	}
 
-	gotDeferred, ok := copied.GetValue(KeyPreferOriginalResponse)
-	if !ok || gotDeferred != deferred {
-		t.Fatal("deferred original response was not preserved")
-	}
-	copied.DeleteValue(KeyPreferOriginalResponse)
-	if _, ok := ctx.GetValue(KeyPreferOriginalResponse); !ok {
-		t.Fatal("values map is shared with the source Context")
-	}
 	copied.StoreValue(valueKey, "copied")
 	if got, _ := ctx.GetValue(valueKey); got != "original" {
 		t.Fatal("updating a copied value changed the source value")

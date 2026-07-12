@@ -33,10 +33,6 @@ const (
 	// KeyDomainSet is the key for storing the matched domain_set name in the context.
 	KeyDomainSet uint32 = iota + 100 // Use a number unlikely to conflict with internal keys.
 
-	// KeyPreferOriginalResponse is retained for compatibility with the legacy
-	// use_orig sequence action. prefer_domain no longer stores deferred responses.
-	KeyPreferOriginalResponse
-
 	// KeyCacheRefresh marks an internal cache refresh replay. Its value is the
 	// boolean true. Plugins with client-visible side effects should use
 	// IsCacheRefresh instead of reading the raw value.
@@ -191,8 +187,6 @@ func (ctx *Context) ClientOpt() *dns.OPT {
 // SetResponse sets m as response. It takes the ownership of m.
 // If m is nil. It removes existing response.
 func (ctx *Context) SetResponse(m *dns.Msg) {
-	// Any explicit response update supersedes a legacy deferred response.
-	ctx.DeleteValue(KeyPreferOriginalResponse)
 	ctx.resp = m
 	if m == nil {
 		ctx.upstreamOpt = nil
@@ -267,8 +261,7 @@ func (ctx *Context) Copy() *Context {
 // values, marks, fast flags, and server metadata needed to replay the query.
 //
 // As with CopyTo, values stored by StoreValue are not deep-copied, but the
-// values map itself is copied. In particular, deferred values such as
-// KeyPreferOriginalResponse are preserved.
+// values map itself is copied.
 func (ctx *Context) CopyWithoutResponse() *Context {
 	d := &Context{
 		TraceID:   ctx.TraceID,
