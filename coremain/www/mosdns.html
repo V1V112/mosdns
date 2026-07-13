@@ -797,14 +797,55 @@
             'solarized_dark': { name: 'Solarized Dark', icon: 'fas fa-adjust', cssVars: { '--bg-color': '#002b36', '--text-color': '#93a1a1', '--card-bg': 'rgba(7, 54, 66, 0.8)', '--card-shadow': '0 6px 18px rgba(0, 0, 0, 0.4)', '--border-color': '#073642', '--accent-color': '#2aa198', '--label-color': '#657b83', '--value-color': '#eee8d5', '--control-bg': '#073642', '--control-border': '#586e75', '--control-text': '#93a1a1', '--control-hover-bg': 'rgba(88, 110, 117, 0.5)', '--control-active-bg': '#2aa198', '--control-active-text': '#002b36', '--status-green': '#859900', '--gradient-start': '#268bd2', '--gradient-mid': '#2aa198', '--gradient-end': '#b58900', '--font-family-main': baseFontStack }, chartColors: { hit: 'rgba(42, 161, 152, 0.8)', miss: 'rgba(181, 137, 0, 0.6)', text: '#93a1a1' } },
         };
         
-        const cacheConfig = {
+        const legacyCacheConfig = {
             'cache_all': { default: 'cache_all', modeB: 'cache_all_noleak', title: '全部缓存', titleModeB: '全部缓存 (安全模式)' },
             'cache_cn': { default: 'cache_cn', modeB: 'cache_cn', title: '国内缓存' },
             'cache_google': { default: 'cache_google', modeB: 'cache_google_node', title: '国外缓存', titleModeB: '国外缓存 (安全模式)', tooltip: '兼容模式无数据属正常现象，此缓存仅在列表外域名（解析过1次即自动生成规则成为列表内域名）国内dns无ipv4解析结果时才会生效或命中。' },
             'cache_node': { default: 'cache_node', modeB: 'cache_node', title: '节点缓存' }
         };
-        const cacheOrder = ['cache_all', 'cache_cn', 'cache_google', 'cache_node']; 
+        let cacheConfig = { ...legacyCacheConfig };
+        let cacheOrder = ['cache_all', 'cache_cn', 'cache_google', 'cache_node'];
+        let usingDiscoveredCaches = false;
         let visibleCards = JSON.parse(localStorage.getItem('visibleMosdnsCards')) || cacheOrder;
+
+        function decodePrometheusLabel(value) {
+            try { return JSON.parse(`"${value}"`); } catch (_) { return value; }
+        }
+
+        function cacheTitleFromTag(tag) {
+            const knownTitles = {
+                dns_cache_direct: 'Direct 缓存',
+                dns_cache_overseas: 'Overseas 缓存'
+            };
+            if (knownTitles[tag]) return knownTitles[tag];
+            const readable = tag.replace(/^dns_cache_/, '').replace(/^cache_/, '').replace(/[_-]+/g, ' ').trim();
+            return readable ? `${readable} 缓存` : `缓存 (${tag})`;
+        }
+
+        function syncDiscoveredCacheConfig(metricsText) {
+            const discovered = new Set();
+            const metricPattern = /^mosdns_cache_(?:query_total|size_current)\{[^}]*tag="((?:\\.|[^"])*)"[^}]*\}/gm;
+            let match;
+            while ((match = metricPattern.exec(metricsText)) !== null) discovered.add(decodePrometheusLabel(match[1]));
+            if (discovered.size === 0) return;
+
+            const legacyTags = new Set(Object.values(legacyCacheConfig).flatMap(config => [config.default, config.modeB]));
+            if ([...discovered].some(tag => legacyTags.has(tag))) return;
+
+            const nextOrder = [...discovered].sort((a, b) => a.localeCompare(b));
+            if (usingDiscoveredCaches && nextOrder.join('\n') === cacheOrder.join('\n')) return;
+
+            usingDiscoveredCaches = true;
+            cacheOrder = nextOrder;
+            cacheConfig = Object.fromEntries(nextOrder.map(tag => [tag, { default: tag, modeB: tag, title: cacheTitleFromTag(tag) }]));
+
+            const savedVisible = JSON.parse(localStorage.getItem('visibleMosdnsCards') || '[]');
+            visibleCards = Array.isArray(savedVisible) ? savedVisible.filter(tag => nextOrder.includes(tag)) : [];
+            if (visibleCards.length === 0) visibleCards = [...nextOrder];
+            localStorage.setItem('visibleMosdnsCards', JSON.stringify(visibleCards));
+            setupCardToggles();
+            setupDataViewButtons();
+        }
 
         /**
          * 迁移: 设置基础分辨率缩放
@@ -905,6 +946,7 @@
                 const response = await fetch('/metrics');
                 if (!response.ok) throw new Error(`网络响应错误: ${response.statusText} (${response.status})`);
                 const text = await response.text();
+                syncDiscoveredCacheConfig(text);
                 const data = { caches: {}, system: {} };
                 const systemMetrics = parseSystemMetrics(text);
                 
@@ -1020,6 +1062,38 @@
                 label.append(input, createElement('span', 'toggle-label-text', cacheConfig[tag].title)); 
                 container.appendChild(label); 
             }); 
+        }
+
+        function setupDataViewButtons() {
+            const dvContainer = getById('data-view-buttons');
+            if (!dvContainer) return;
+            dvContainer.innerHTML = '';
+
+            const regularEndpoints = [
+                ['请求排行', 'top_domains'], ['fakeip 域名', 'my_fakeiplist'],
+                ['realip 域名', 'my_realiplist'], ['无 V4 域名', 'my_nov4list'],
+                ['无 V6 域名', 'my_nov6list']
+            ];
+            regularEndpoints.forEach(([name, path]) => {
+                const btn = createElement('button', 'btn');
+                btn.textContent = name;
+                btn.onclick = () => displayDataInModal(`/plugins/${encodeURIComponent(path)}/show`, name);
+                dvContainer.appendChild(btn);
+            });
+
+            const cacheEndpoints = usingDiscoveredCaches
+                ? cacheOrder.map(key => [cacheConfig[key].title, cacheConfig[key].default])
+                : [
+                    ['全部缓存（兼容）', 'cache_all'], ['全部缓存（安全）', 'cache_all_noleak'],
+                    ['国内缓存', 'cache_cn'], ['国外缓存（兼容）', 'cache_google'],
+                    ['国外缓存（安全）', 'cache_google_node'], ['节点缓存', 'cache_node']
+                ];
+            cacheEndpoints.forEach(([name, path]) => {
+                const btn = createElement('button', 'btn');
+                btn.textContent = name;
+                btn.onclick = () => displayCacheDataInModal(`/plugins/${encodeURIComponent(path)}/show`, name);
+                dvContainer.appendChild(btn);
+            });
         }
         
         function updateThemeButtons(activeMode) {
@@ -1589,7 +1663,27 @@
             };
             getById('save-rules-btn').addEventListener('click', () => { if (confirm('确定保存所有分流规则吗?')) { saveAllRulesAndNotify(); } });
             createApiAction('flush-rules-btn', ruleListPaths, '【危险操作】确定清空所有分流规则吗?', '分流规则已清空。');
-            getById('flush-cache-btn').addEventListener('click', async () => { if (!confirm('确定清空全部缓存吗? 此操作将根据当前核心运行模式清空对应的缓存。')) { return; } const cacheToFlush = coreMode === 'B' ? 'cache_all_noleak' : 'cache_all'; const path = `/plugins/${cacheToFlush}/flush`; try { const response = await fetch(path); if (!response.ok) { const errorText = await response.text(); throw new Error(`清空缓存失败于 ${path}: ${errorText || response.statusText}`); } showToast('全部缓存已清空，正在刷新数据...', 'success'); await refreshData(false, true); } catch (e) { showToast('清空缓存操作失败！', 'error'); showErrorModal(e.message); } });
+            getById('flush-cache-btn').addEventListener('click', async () => {
+                if (!confirm('确定清空全部缓存吗?')) return;
+                const cacheTags = usingDiscoveredCaches
+                    ? [...new Set(cacheOrder.map(key => cacheConfig[key].default))]
+                    : [coreMode === 'B' ? 'cache_all_noleak' : 'cache_all'];
+                try {
+                    for (const cacheTag of cacheTags) {
+                        const path = `/plugins/${encodeURIComponent(cacheTag)}/flush`;
+                        const response = await fetch(path);
+                        if (!response.ok) {
+                            const errorText = await response.text();
+                            throw new Error(`清空缓存失败于 ${path}: ${errorText || response.statusText}`);
+                        }
+                    }
+                    showToast('全部缓存已清空，正在刷新数据...', 'success');
+                    await refreshData(false, true);
+                } catch (e) {
+                    showToast('清空缓存操作失败！', 'error');
+                    showErrorModal(e.message);
+                }
+            });
             getById('restart-mosdns-btn').onclick = async () => { if (confirm('【危险操作】此操作将首先保存所有分流规则，然后重启 MosDNS。确定要继续吗?')) { const saveSuccess = await saveAllRulesAndNotify(); if (saveSuccess) { showToast('规则已保存，正在发送重启命令...', 'success'); try { const response = await fetch('/plugins/my_fakeiplist/restartall'); if (!response.ok) { const errorText = await response.text(); throw new Error(errorText || `重启命令请求失败，状态码: ${response.status}`); } showToast('MosDNS 正在重启，页面即将刷新...'); setTimeout(() => location.reload(), 2000); } catch (e) { showToast('重启命令发送失败', 'error'); showErrorModal(e.message); } } else { showToast('由于规则保存失败，重启操作已取消。', 'error'); } } };
             
             // === MODIFIED START ===
@@ -1600,9 +1694,7 @@
             };
             // === MODIFIED END ===
             
-            const showEndpoints = { '请求排行': 'top_domains','fakeip 域名': 'my_fakeiplist', 'realip 域名': 'my_realiplist', '无 V4 域名': 'my_nov4list', '无 V6 域名': 'my_nov6list', '全部缓存（兼容）': 'cache_all', '全部缓存（安全）': 'cache_all_noleak','国内缓存': 'cache_cn', '国外缓存（兼容）': 'cache_google', '国外缓存（安全）': 'cache_google_node','节点缓存': 'cache_node' };
-            const dvContainer = getById('data-view-buttons'); dvContainer.innerHTML = ''; 
-            Object.entries(showEndpoints).forEach(([name, path]) => { const btn = createElement('button', 'btn'); btn.textContent = name; btn.onclick = () => { if (path.startsWith('cache_')) { displayCacheDataInModal(`/plugins/${path}/show`, name); } else { displayDataInModal(`/plugins/${path}/show`, name); } }; dvContainer.appendChild(btn); });
+            setupDataViewButtons();
             
             const tabButtons = D.querySelectorAll('.tab-button');
             const tabContents = D.querySelectorAll('.control-section-body .tab-content');
