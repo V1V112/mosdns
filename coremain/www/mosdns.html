@@ -731,6 +731,7 @@
         let chartInstances = {}; 
         let autoRefreshTimer = null; 
         let isRefreshing = false; 
+        let upstreamPreviousSamples = new Map();
         let currentTheme = 'light';
         let coreMode = 'A';
         let isMgmtTabInitialized = { config: false, list: false };
@@ -748,7 +749,9 @@
             '启动时间': 'fa-power-off', 'CPU 时间': 'fa-microchip', '常驻内存 (RSS)': 'fa-memory', 
             '系统累计接收流量': 'fa-download', '系统累计发送流量': 'fa-upload', 'GC 次数': 'fa-recycle',
             'GC 累计耗时': 'fa-stopwatch', '上次 GC 时间': 'fa-clock', 'Go 版本': 'fa-code-branch', '线程数': 'fa-sitemap',
-            '打开文件描述符': 'fa-folder-open'
+            '打开文件描述符': 'fa-folder-open', '实时 QPS': 'fa-gauge-high', '错误 QPS': 'fa-triangle-exclamation',
+            '累计上游请求': 'fa-arrow-up-right-dots', '累计上游错误': 'fa-circle-exclamation', '上游错误率': 'fa-percent',
+            '当前并发': 'fa-code-fork', '平均响应延迟': 'fa-stopwatch', '上游标识': 'fa-network-wired'
         };
 
         const switchProfiles = [
@@ -869,7 +872,7 @@
             });
 
             const heading = D.querySelector('.header h1');
-            if (heading) heading.textContent = 'MosDNS 监控面板 · 当前配置';
+            if (heading) heading.textContent = 'MosDNS 监控面板';
             const logButton = getById('dns-log-page-btn');
             if (logButton) logButton.innerHTML = '<i class="fas fa-sliders-h"></i> 规则与系统管理';
         }
@@ -981,6 +984,55 @@
             return systemMetrics;
         }
         
+        function parsePrometheusLabels(rawLabels) {
+            const labels = {};
+            const pattern = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"])*)"/g;
+            let match;
+            while ((match = pattern.exec(rawLabels)) !== null) labels[match[1]] = decodePrometheusLabel(match[2]);
+            return labels;
+        }
+
+        function parseUpstreamMetrics(metricsText, now = Date.now()) {
+            const upstreams = new Map();
+            const pattern = /^mosdns_forward_(query_total|err_total|thread|response_latency_millisecond_(?:sum|count))\{([^}]*)\}\s+([^\s]+)/gm;
+            let match;
+            while ((match = pattern.exec(metricsText)) !== null) {
+                const labels = parsePrometheusLabels(match[2]);
+                if (!labels.tag || !labels.upstream) continue;
+                const key = `${labels.tag}\n${labels.upstream}`;
+                const item = upstreams.get(key) || { key, tag: labels.tag, upstream: labels.upstream, query_total: 0, err_total: 0, thread: 0, latency_sum: 0, latency_count: 0 };
+                const value = Number.parseFloat(match[3]);
+                if (!Number.isFinite(value)) continue;
+                if (match[1] === 'query_total') item.query_total = value;
+                else if (match[1] === 'err_total') item.err_total = value;
+                else if (match[1] === 'thread') item.thread = value;
+                else if (match[1].endsWith('_sum')) item.latency_sum = value;
+                else if (match[1].endsWith('_count')) item.latency_count = value;
+                upstreams.set(key, item);
+            }
+
+            const currentKeys = new Set(upstreams.keys());
+            for (const key of upstreamPreviousSamples.keys()) {
+                if (!currentKeys.has(key)) upstreamPreviousSamples.delete(key);
+            }
+            return [...upstreams.values()].sort((a, b) => a.key.localeCompare(b.key)).map(item => {
+                const previous = upstreamPreviousSamples.get(item.key);
+                const elapsedSeconds = previous ? (now - previous.time) / 1000 : 0;
+                const sampled = elapsedSeconds > 0;
+                const qps = sampled ? Math.max(0, item.query_total - previous.query_total) / elapsedSeconds : 0;
+                const errorQps = sampled ? Math.max(0, item.err_total - previous.err_total) / elapsedSeconds : 0;
+                upstreamPreviousSamples.set(item.key, { time: now, query_total: item.query_total, err_total: item.err_total });
+                return {
+                    ...item,
+                    sampled,
+                    qps,
+                    error_qps: errorQps,
+                    error_rate: item.query_total > 0 ? `${(item.err_total / item.query_total * 100).toFixed(2)}%` : '0.00%',
+                    avg_latency: item.latency_count > 0 ? `${(item.latency_sum / item.latency_count).toFixed(2)} ms` : '0.00 ms'
+                };
+            });
+        }
+
         async function fetchData() {
             if (isRefreshing) return null;
             isRefreshing = true;
@@ -990,7 +1042,7 @@
                 if (!response.ok) throw new Error(`网络响应错误: ${response.statusText} (${response.status})`);
                 const text = await response.text();
                 syncDiscoveredCacheConfig(text);
-                const data = { caches: {}, system: {} };
+                const data = { caches: {}, system: {}, upstreams: parseUpstreamMetrics(text) };
                 const systemMetrics = parseSystemMetrics(text);
                 
                 cacheOrder.forEach(key => {
@@ -1036,6 +1088,55 @@
             });
         }
         
+        function renderUpstreamCards(upstreams) {
+            const mainContent = getById('main-content');
+            const activeKeys = new Set(upstreams.map(item => item.key));
+            mainContent.querySelectorAll('.card[data-upstream-key]').forEach(card => {
+                if (!activeKeys.has(card.dataset.upstreamKey)) card.remove();
+            });
+
+            upstreams.forEach(item => {
+                let card = [...mainContent.querySelectorAll('.card[data-upstream-key]')].find(element => element.dataset.upstreamKey === item.key);
+                if (!card) {
+                    card = createElement('div', 'card visible');
+                    card.dataset.upstreamKey = item.key;
+                    const heading = createElement('h2');
+                    const icon = createElement('i', 'fas fa-route');
+                    const title = createElement('span', 'title-text');
+                    const status = createElement('span', 'status-dot');
+                    heading.append(icon, title, status);
+                    card.append(heading, createElement('div', 'card-title-gradient-bar'), createElement('div', 'metrics-container'));
+                    mainContent.appendChild(card);
+                }
+
+                card.querySelector('.title-text').innerText = `上游 · ${item.tag} / ${item.upstream}`;
+                const status = card.querySelector('.status-dot');
+                status.classList.toggle('status-green', item.query_total > 0);
+                status.classList.toggle('status-yellow', item.query_total === 0);
+                const metrics = [
+                    { label: '实时 QPS', value: item.sampled ? item.qps.toFixed(2) : '采样中', accent: true },
+                    { label: '错误 QPS', value: item.sampled ? item.error_qps.toFixed(2) : '采样中' },
+                    { label: '累计上游请求', numericValue: item.query_total },
+                    { label: '累计上游错误', numericValue: item.err_total },
+                    { label: '上游错误率', value: item.error_rate },
+                    { label: '当前并发', numericValue: item.thread },
+                    { label: '平均响应延迟', value: item.avg_latency },
+                    { label: '上游标识', value: item.upstream }
+                ];
+                const container = card.querySelector('.metrics-container');
+                container.innerHTML = '';
+                metrics.forEach(metric => {
+                    const wrapper = createElement('div', 'metric-item');
+                    const label = createElement('div', 'metric-label');
+                    label.innerHTML = `<i class="fas ${iconMap[metric.label] || 'fa-question-circle'}"></i> <span>${metric.label}</span>`;
+                    const value = createElement('div', `metric-value${metric.accent ? ' accent' : ''}`);
+                    value.innerText = metric.numericValue !== undefined ? formatNumber(metric.numericValue) : metric.value;
+                    wrapper.append(label, value);
+                    container.appendChild(wrapper);
+                });
+            });
+        }
+
         async function refreshData(forceRebuild = false, updateCharts = false) {
             await updateCoreModeStatus();
             const data = await fetchData();
@@ -1094,6 +1195,7 @@
                     if ((forceRebuild || updateCharts) && cardData.query_total > 0) { createOrUpdatePieChart(`chart-hit-${key}`, '命中', cardData.hit_total, cardData.query_total); createOrUpdatePieChart(`chart-lazy-${key}`, '过期命中', cardData.lazy_hit_total, cardData.query_total); }
                 }
             });
+            renderUpstreamCards(data.upstreams || []);
             updateMetrics('metrics-system', [{ label: '启动时间', value: data.system.start_time }, { label: 'CPU 时间', value: data.system.cpu_time }, { label: '常驻内存 (RSS)', value: data.system.resident_memory }, { label: '系统累计接收流量', value: data.system.net_recv }, { label: '系统累计发送流量', value: data.system.net_send }, { label: 'GC 次数', value: data.system.gc_count }, { label: 'GC 累计耗时', value: data.system.gc_sum }, { label: '上次 GC 时间', value: data.system.last_gc_time }, { label: 'Go 版本', value: data.system.go_version, accent: true }, { label: '线程数', numericValue: data.system.threads }, { label: '打开文件描述符', numericValue: data.system.open_fds }, ]);
             const lastUpdatedEl = getById('last_updated');
             if(lastUpdatedEl) lastUpdatedEl.innerHTML = `<i class="fas fa-clock"></i> 最后更新: ${new Date().toLocaleTimeString()}`;
