@@ -55,7 +55,11 @@ func (uw *upstreamWrapper) OnEvent(typ upstream.Event) {
 // newWrapper inits all metrics.
 // Note: upstreamWrapper.u still needs to be set.
 func newWrapper(idx int, cfg UpstreamConfig, pluginTag string) *upstreamWrapper {
-	lb := map[string]string{"upstream": cfg.Tag, "tag": pluginTag}
+	upstreamName := cfg.Tag
+	if len(upstreamName) == 0 {
+		upstreamName = cfg.Addr
+	}
+	lb := map[string]string{"upstream": upstreamName, "tag": pluginTag}
 	return &upstreamWrapper{
 		cfg: cfg,
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{

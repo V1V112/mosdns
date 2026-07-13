@@ -183,10 +183,6 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 
 func (f *Forward) RegisterMetricsTo(r prometheus.Registerer) error {
 	for _, wu := range f.us {
-		// Only register metrics for upstream that has a tag.
-		if len(wu.cfg.Tag) == 0 {
-			continue
-		}
 		if err := wu.registerMetricsTo(r); err != nil {
 			return err
 		}
