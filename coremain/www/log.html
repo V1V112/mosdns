@@ -550,12 +550,20 @@
                         <label for="rule-type">类型</label>
                         <select id="rule-type" name="type" required>
                             <option value="" disabled selected>请选择类型</option>
-                            <option value="geositecn">中国域名</option>
-                            <option value="geositenocn">非中国域名</option>
-                            <option value="geoipcn">中国ip</option>
-                            <option value="cuscn">cn@!cn</option>
-                            <option value="cusnocn">!cn@cn</option>
-                            <option value="nft_add">添加到nft中的代理的ip</option>
+                            <option value="geolocation-!cn@cn">直连：geolocation-!cn@cn</option>
+                            <option value="geosite:cn">直连：geosite:cn</option>
+                            <option value="geolocation-!cn">海外：geolocation-!cn</option>
+                            <option value="geolocation-cn@!cn">海外：geolocation-cn@!cn</option>
+                            <option value="geosite:gfw">GFW 域名</option>
+                            <option value="geosite:ai">AI 域名</option>
+                            <option value="geosite:github">GitHub 域名</option>
+                            <option value="geosite:onedrive">OneDrive 域名</option>
+                            <option value="geosite:pikpak">PikPak 域名</option>
+                            <option value="geosite:pinterest">Pinterest 域名</option>
+                            <option value="geosite:cloudflare">Cloudflare 域名</option>
+                            <option value="geoip:cn">中国 IP</option>
+                            <option value="geoip:cloudflare">Cloudflare IP</option>
+                            <option value="nft_add">NFT 代理 IP</option>
                         </select>
                     </div>
                     <div class="form-field">
@@ -1579,7 +1587,7 @@
         </section>
     </main>
 
-    <script src="assets/js/log.min.js" defer></script>
+    <script src="assets/js/log.js" defer></script>
 </body>
 
 </html>

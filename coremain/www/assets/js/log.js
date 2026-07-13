@@ -33,7 +33,7 @@ function closeAndUnlock(dialogElement) {
 
 document.addEventListener('DOMContentLoaded', () => {
     const CONSTANTS = { API_BASE_URL: '', LOGS_PER_PAGE: 50, HISTORY_LENGTH: 60, DEFAULT_AUTO_REFRESH_INTERVAL: 15, ANIMATION_DURATION: 1000, MOBILE_BREAKPOINT: 1024, TOAST_DURATION: 3000, SKELETON_ROWS: 10, TOOLTIP_SHOW_DELAY: 200, TOOLTIP_HIDE_DELAY: 250, UPDATE_AUTO_MINUTES_DEFAULT: 1440 };
-    let state = { isUpdating: false, isCapturing: false, isMobile: false, isTouchDevice: false, currentLogPage: 1, isLogLoading: false, logPaginationInfo: null, displayedLogs: [], currentLogSearchTerm: '', clientAliases: {}, topDomains: [], topClients: [], slowestQueries: [], domainSetRank: [], shuntColors: {}, logSort: { key: 'query_time', order: 'desc' }, autoRefresh: { enabled: false, intervalId: null, intervalSeconds: CONSTANTS.DEFAULT_AUTO_REFRESH_INTERVAL }, data: { totalQueries: { current: null, previous: null }, avgDuration: { current: null, previous: null } }, history: { totalQueries: [], avgDuration: [], timestamps: [] }, lastUpdateTime: null, adguardRules: [], diversionRules: [], requery: { status: null, config: null, pollId: null }, dataView: { rawEntries: [], filteredEntries: [], viewType: 'domain', currentOffset: 0, currentLimit: 100, currentQuery: '', currentConfig: null, hasMore: true, totalCount: 0 }, coreMode: 'A', cacheStats: {}, listManagerInitialized: false, featureSwitches: {}, systemInfo: {}, update: { status: null, loading: false, auto: { enabled: true, intervalMinutes: CONSTANTS.UPDATE_AUTO_MINUTES_DEFAULT, timerId: null } } };
+    let state = { isUpdating: false, isCapturing: false, isMobile: false, isTouchDevice: false, isCustomConfigProfile: false, currentLogPage: 1, isLogLoading: false, logPaginationInfo: null, displayedLogs: [], currentLogSearchTerm: '', clientAliases: {}, topDomains: [], topClients: [], slowestQueries: [], domainSetRank: [], shuntColors: {}, logSort: { key: 'query_time', order: 'desc' }, autoRefresh: { enabled: false, intervalId: null, intervalSeconds: CONSTANTS.DEFAULT_AUTO_REFRESH_INTERVAL }, data: { totalQueries: { current: null, previous: null }, avgDuration: { current: null, previous: null } }, history: { totalQueries: [], avgDuration: [], timestamps: [] }, lastUpdateTime: null, adguardRules: [], diversionRules: [], requery: { status: null, config: null, pollId: null }, dataView: { rawEntries: [], filteredEntries: [], viewType: 'domain', currentOffset: 0, currentLimit: 100, currentQuery: '', currentConfig: null, hasMore: true, totalCount: 0 }, coreMode: 'A', cacheStats: {}, listManagerInitialized: false, featureSwitches: {}, systemInfo: {}, update: { status: null, loading: false, auto: { enabled: true, intervalMinutes: CONSTANTS.UPDATE_AUTO_MINUTES_DEFAULT, timerId: null } } };
     const elements = {
         html: document.documentElement, body: document.body, container: document.querySelector('.container'), initialLoader: document.getElementById('initial-loader'),
         colorSwatches: document.querySelectorAll('.color-swatch'),
@@ -2197,7 +2197,36 @@ function renderRuleTable(tbody, rules, mode) {
     async function handleRuleTableClick(event, mode) { const target = event.target.closest('button, input.rule-enabled-toggle'); if (!target) return; const itemElement = target.closest('[data-rule-id]'); if (!itemElement) return; const id = itemElement.dataset.ruleId; const rules = mode === 'adguard' ? state.adguardRules : state.diversionRules; const rule = rules.find(r => (mode === 'adguard' ? r.id : r.name) === id); if (!rule) return; if (target.matches('.rule-edit-btn')) ui.openRuleModal(mode, rule); else if (target.matches('.rule-delete-btn')) { if (confirm(`确定要删除规则 "${rule.name}" 吗？此操作不可恢复。`)) { ui.setLoading(target, true); try { if (mode === 'adguard') await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'DELETE' }); else await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[rule.type]}/config/${id}`, { method: 'DELETE' }); ui.showToast(`规则 "${rule.name}" 已删除`); await (mode === 'adguard' ? adguardManager.load() : diversionManager.load()); } catch (e) { console.error(`Failed to delete rule ${id}:`, e); } finally { ui.setLoading(target, false); } } } else if (target.matches('.rule-update-btn')) { ui.setLoading(target, true); ui.showToast(`正在后台更新规则 "${rule.name}"...`); try { await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[rule.type]}/update/${id}`, { method: 'POST' }); ui.showToast('更新请求已发送, 5秒后自动刷新', 'success'); setTimeout(() => diversionManager.load(), 5000); } catch (e) { } finally { ui.setLoading(target, false); } } else if (target.matches('.rule-enabled-toggle')) { const updatedRule = { ...rule, enabled: target.checked }; target.disabled = true; try { if (mode === 'adguard') await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedRule) }); else await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[rule.type]}/config/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedRule) }); rule.enabled = target.checked; ui.showToast(`规则 "${rule.name}" 已${target.checked ? '启用' : '禁用'}`); } catch (error) { target.checked = !target.checked; } finally { target.disabled = false; } } }
     async function handleRuleFormSubmit(event) { event.preventDefault(); ui.setLoading(elements.saveRuleBtn, true); const form = elements.ruleForm; const mode = form.elements['mode'].value; const id = form.elements['id'].value; try { if (mode === 'adguard') { const data = { name: form.elements['name'].value, url: form.elements['url'].value, auto_update: form.elements['auto_update'].checked, update_interval_hours: parseInt(form.elements['update_interval_hours'].value, 10) || 24 }; if (id) { const originalRule = state.adguardRules.find(r => r.id === id); await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) }); } else { await api.fetch('/plugins/adguard/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) }); } ui.showToast(`广告拦截规则${id ? '更新' : '添加'}成功`); await adguardManager.load(); } else { const data = { name: form.elements['name'].value, url: form.elements['url'].value, type: form.elements['type'].value, files: form.elements['files'].value, auto_update: form.elements['auto_update'].checked, enable_regexp: form.elements['enable_regexp'] ? form.elements['enable_regexp'].checked : false, update_interval_hours: parseInt(form.elements['update_interval_hours'].value, 10) || 24 }; const pluginTag = diversionManager.sdSetInstanceMap[data.type]; if (!pluginTag) throw new Error('无效的分流规则类型'); if (id) { const originalRule = state.diversionRules.find(r => r.name === id); if (data.name !== id) { if (!confirm(`规则名称已从 "${id}" 更改为 "${data.name}"。\n\n这将删除旧规则并创建一个新规则，确定要继续吗？`)) throw new Error('User cancelled name change.'); await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[originalRule.type]}/config/${id}`, { method: 'DELETE' }); await api.fetch(`/plugins/${pluginTag}/config/${data.name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: originalRule.enabled }) }); } else { await api.fetch(`/plugins/${pluginTag}/config/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) }); } } else { await api.fetch(`/plugins/${pluginTag}/config/${data.name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) }); } ui.showToast(`分流规则${id ? '更新' : '添加'}成功`); await diversionManager.load(); if (!id || (id && data.name !== id)) { ui.showToast('正在后台获取规则详情...'); setTimeout(() => diversionManager.load(), 5000); } } ui.closeRuleModal(); } catch (err) { console.error(`${mode} form submission failed:`, err); } finally { ui.setLoading(elements.saveRuleBtn, false); } }
     const adguardManager = { async load() { try { state.adguardRules = await api.fetch('/plugins/adguard/rules') || []; } catch (error) { state.adguardRules = []; } this.render(); }, render() { renderRuleTable(elements.adguardRulesTbody, state.adguardRules, 'adguard'); }, };
-    const diversionManager = { sdSetInstanceMap: { 'geositecn': 'geosite_cn', 'geositenocn': 'geosite_no_cn', 'geoipcn': 'geoip_cn', 'cuscn': 'cuscn', 'cusnocn': 'cusnocn', 'nft_add': 'nft_add'  }, async load() { try { const promises = Object.values(this.sdSetInstanceMap).map(tag => api.fetch(`/plugins/${tag}/config`)); const results = await Promise.allSettled(promises); state.diversionRules = results.filter(r => r.status === 'fulfilled' && Array.isArray(r.value)).flatMap(r => r.value); } catch (e) { state.diversionRules = []; } this.render(); }, render() { renderRuleTable(elements.diversionRulesTbody, state.diversionRules, 'diversion'); }, };
+    const diversionManager = {
+        sdSetInstanceMap: {
+            'geolocation-!cn@cn': 'geosite:direct',
+            'geosite:cn': 'geosite:direct',
+            'geolocation-!cn': 'geosite:overseas',
+            'geolocation-cn@!cn': 'geosite:overseas',
+            'geosite:gfw': 'geosite:gfw',
+            'geosite:ai': 'geosite:category-ai-!cn',
+            'geosite:github': 'geosite:github',
+            'geosite:onedrive': 'geosite:onedrive',
+            'geosite:pikpak': 'geosite:pikpak',
+            'geosite:pinterest': 'geosite:pinterest',
+            'geosite:cloudflare': 'geosite:cloudflare',
+            'geoip:cn': 'geoip:cn',
+            'geoip:cloudflare': 'geoip:cloudflare',
+            'nft_add': 'nft_add'
+        },
+        async load() {
+            try {
+                const pluginTags = [...new Set(Object.values(this.sdSetInstanceMap))];
+                const promises = pluginTags.map(tag => api.fetch(`/plugins/${tag}/config`));
+                const results = await Promise.allSettled(promises);
+                state.diversionRules = results.filter(r => r.status === 'fulfilled' && Array.isArray(r.value)).flatMap(r => r.value);
+            } catch (e) {
+                state.diversionRules = [];
+            }
+            this.render();
+        },
+        render() { renderRuleTable(elements.diversionRulesTbody, state.diversionRules, 'diversion'); },
+    };
 
     // 流式计数工具：避免一次性创建超大字符串数组导致主线程卡顿
     async function countLinesStreaming(url, signal) {
@@ -2527,7 +2556,7 @@ function renderRuleTable(tbody, rules, mode) {
     }
 
 const cacheManager = {
-        config: [
+        legacyConfig: [
             { key: 'cache_all', name: '全部缓存 (兼容)', tag: 'cache_all' },
             { key: 'cache_cn', name: '国内缓存', tag: 'cache_cn' },
             { key: 'cache_node', name: '节点缓存', tag: 'cache_node' },
@@ -2536,6 +2565,49 @@ const cacheManager = {
             { key: 'cache_google_node', name: '国外缓存 (安全)', tag: 'cache_google_node' },
             { key: 'cache_cnmihomo', name: '国内域名fakeip', tag: 'cache_cnmihomo' }
         ],
+        config: [],
+
+        discoverConfig(metricsText) {
+            const discovered = new Set();
+            const pattern = /^mosdns_cache_(?:query_total|size_current)\{[^}]*tag="((?:\\.|[^"])*)"[^}]*\}/gm;
+            let match;
+            while ((match = pattern.exec(metricsText)) !== null) {
+                try { discovered.add(JSON.parse(`"${match[1]}"`)); }
+                catch (_) { discovered.add(match[1]); }
+            }
+
+            if (discovered.size === 0) {
+                if (this.config.length === 0) this.config = [...this.legacyConfig];
+                return;
+            }
+
+            const legacyTags = new Set(this.legacyConfig.map(cache => cache.tag));
+            if ([...discovered].some(tag => legacyTags.has(tag))) {
+                this.config = [...this.legacyConfig];
+                return;
+            }
+
+            const names = {
+                dns_cache_direct: 'Direct 缓存',
+                dns_cache_overseas: 'Overseas 缓存'
+            };
+            this.config = [...discovered].sort((a, b) => a.localeCompare(b)).map(tag => ({
+                key: tag,
+                tag,
+                name: names[tag] || `${tag.replace(/^dns_cache_/, '').replace(/[_-]+/g, ' ')} 缓存`
+            }));
+            state.isCustomConfigProfile = true;
+            this.applyCurrentConfigProfile();
+        },
+
+        applyCurrentConfigProfile() {
+            [elements.featureSwitchesModule, elements.requeryModule].forEach(element => {
+                if (element) element.style.display = 'none';
+            });
+            [elements.saveShuntRulesBtn, elements.clearShuntRulesBtn].forEach(element => {
+                if (element) element.style.display = 'none';
+            });
+        },
 
         parseMetrics(metricsText, cacheTag) {
             const lines = metricsText.split('\n');
@@ -2557,6 +2629,7 @@ const cacheManager = {
             try {
                 const metricsRes = await api.getMetrics(signal);
                 if (metricsRes) {
+                    this.discoverConfig(metricsRes);
                     this.config.forEach(cache => {
                         state.cacheStats[cache.key] = this.parseMetrics(metricsRes, cache.tag);
                     });

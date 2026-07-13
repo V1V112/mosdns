@@ -847,8 +847,31 @@
             visibleCards = Array.isArray(savedVisible) ? savedVisible.filter(tag => nextOrder.includes(tag)) : [];
             if (visibleCards.length === 0) visibleCards = [...nextOrder];
             localStorage.setItem('visibleMosdnsCards', JSON.stringify(visibleCards));
+            applyDiscoveredConfigProfile();
             setupCardToggles();
             setupDataViewButtons();
+        }
+
+        function applyDiscoveredConfigProfile() {
+            if (!usingDiscoveredCaches) return;
+
+            // The current config does not register the dedicated switch/list
+            // plugins used by the original Core-Max profile.
+            ['save-rules-btn', 'flush-rules-btn'].forEach(id => {
+                const element = getById(id);
+                if (element) element.style.display = 'none';
+            });
+            ['config-mgmt', 'list-mgmt'].forEach(tab => {
+                const button = D.querySelector(`.tab-button[data-tab="${tab}"]`);
+                if (button) button.style.display = 'none';
+                const content = getById(`tab-${tab}`);
+                if (content) content.style.display = 'none';
+            });
+
+            const heading = D.querySelector('.header h1');
+            if (heading) heading.textContent = 'MosDNS 监控面板 · 当前配置';
+            const logButton = getById('dns-log-page-btn');
+            if (logButton) logButton.innerHTML = '<i class="fas fa-sliders-h"></i> 规则与系统管理';
         }
 
         /**
@@ -1117,12 +1140,14 @@
                 ['realip 域名', 'my_realiplist'], ['无 V4 域名', 'my_nov4list'],
                 ['无 V6 域名', 'my_nov6list']
             ];
-            regularEndpoints.forEach(([name, path]) => {
-                const btn = createElement('button', 'btn');
-                btn.textContent = name;
-                btn.onclick = () => displayDataInModal(`/plugins/${encodeURIComponent(path)}/show`, name);
-                dvContainer.appendChild(btn);
-            });
+            if (!usingDiscoveredCaches) {
+                regularEndpoints.forEach(([name, path]) => {
+                    const btn = createElement('button', 'btn');
+                    btn.textContent = name;
+                    btn.onclick = () => displayDataInModal(`/plugins/${encodeURIComponent(path)}/show`, name);
+                    dvContainer.appendChild(btn);
+                });
+            }
 
             const cacheEndpoints = usingDiscoveredCaches
                 ? cacheOrder.map(key => [cacheConfig[key].title, cacheConfig[key].default])
@@ -1157,6 +1182,10 @@
         }
         function hideErrorModal() { getById('error-modal').classList.remove('visible'); }
         async function updateCoreModeStatus() {
+            if (usingDiscoveredCaches) {
+                coreMode = 'A';
+                return;
+            }
             try {
                 const response = await fetch('/plugins/switch3/show');
                 if (response.ok) coreMode = (await response.text()).trim();
@@ -1727,12 +1756,53 @@
                     showErrorModal(e.message);
                 }
             });
-            getById('restart-mosdns-btn').onclick = async () => { if (confirm('【危险操作】此操作将首先保存所有分流规则，然后重启 MosDNS。确定要继续吗?')) { const saveSuccess = await saveAllRulesAndNotify(); if (saveSuccess) { showToast('规则已保存，正在发送重启命令...', 'success'); try { const response = await fetch('/plugins/my_fakeiplist/restartall'); if (!response.ok) { const errorText = await response.text(); throw new Error(errorText || `重启命令请求失败，状态码: ${response.status}`); } showToast('MosDNS 正在重启，页面即将刷新...'); setTimeout(() => location.reload(), 2000); } catch (e) { showToast('重启命令发送失败', 'error'); showErrorModal(e.message); } } else { showToast('由于规则保存失败，重启操作已取消。', 'error'); } } };
+            getById('restart-mosdns-btn').onclick = async () => {
+                if (usingDiscoveredCaches) {
+                    if (!confirm('确定重启 MosDNS 吗？重启前会保存缓存数据。')) return;
+                    try {
+                        const response = await fetch('/api/v1/system/restart', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ delay_ms: 500 })
+                        });
+                        if (!response.ok) {
+                            const errorText = await response.text();
+                            throw new Error(errorText || `重启命令请求失败，状态码: ${response.status}`);
+                        }
+                        showToast('MosDNS 正在保存缓存并重启，页面即将刷新...');
+                        setTimeout(() => location.reload(), 2500);
+                    } catch (e) {
+                        showToast('重启命令发送失败', 'error');
+                        showErrorModal(e.message);
+                    }
+                    return;
+                }
+
+                if (!confirm('【危险操作】此操作将首先保存所有分流规则，然后重启 MosDNS。确定要继续吗?')) return;
+                const saveSuccess = await saveAllRulesAndNotify();
+                if (!saveSuccess) {
+                    showToast('由于规则保存失败，重启操作已取消。', 'error');
+                    return;
+                }
+                showToast('规则已保存，正在发送重启命令...', 'success');
+                try {
+                    const response = await fetch('/plugins/my_fakeiplist/restartall');
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        throw new Error(errorText || `重启命令请求失败，状态码: ${response.status}`);
+                    }
+                    showToast('MosDNS 正在重启，页面即将刷新...');
+                    setTimeout(() => location.reload(), 2000);
+                } catch (e) {
+                    showToast('重启命令发送失败', 'error');
+                    showErrorModal(e.message);
+                }
+            };
             
             // === MODIFIED START ===
             getById('dns-log-page-btn').onclick = () => { 
                 // 直接使用相对于根的路径，并附加哈希
-                const url = '/log#overview';
+                const url = '/log#rules';
                 window.open(url, '_blank'); 
             };
             // === MODIFIED END ===
