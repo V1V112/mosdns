@@ -14,17 +14,16 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/go-chi/chi/v5"
 	"github.com/miekg/dns"
-	"github.com/robfig/cron/v3"
 )
 
 const (
-	PluginType = "requery"
+	PluginType           = "requery"
+	maxSchedulerDuration = time.Duration(1<<63 - 1)
 )
 
 // ----------------------------------------------------------------------------
@@ -52,13 +51,22 @@ func newRequery(bp *coremain.BP, args any) (any, error) {
 		return nil, fmt.Errorf("requery: failed to create directory %s: %w", dir, err)
 	}
 
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	p := &Requery{
-		filePath:   cfg.File,
-		scheduler:  cron.New(),
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		filePath:        cfg.File,
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+		scheduleChanged: make(chan struct{}, 1),
+		now:             time.Now,
+		newTimer: func(delay time.Duration) schedulerTimer {
+			return &realSchedulerTimer{Timer: time.NewTimer(delay)}
+		},
 	}
+	p.taskRunner = p.runTask
 
 	if err := p.loadConfig(); err != nil {
+		lifecycleCancel()
 		return nil, fmt.Errorf("requery: failed to load initial config from %s: %w", p.filePath, err)
 	}
 
@@ -72,18 +80,11 @@ func newRequery(bp *coremain.BP, args any) (any, error) {
 	}
 	p.mu.Unlock()
 
-
-	// Start the scheduler's goroutine once. It will run forever.
-	p.scheduler.Start()
+	p.startScheduler()
 	log.Println("[requery] Scheduler started.")
-	
-	// Now, add the initial job based on the loaded config.
-	if err := p.setupScheduler(); err != nil {
-		log.Printf("[requery] WARN: Failed to setup initial scheduler job, it will be disabled: %v", err)
-	}
-	
+
 	bp.RegAPI(p.api())
-	
+
 	log.Printf("[requery] plugin instance created for config file: %s", p.filePath)
 	return p, nil
 }
@@ -97,24 +98,62 @@ type Requery struct {
 	mu         sync.RWMutex
 	filePath   string
 	config     *Config
-	scheduler  *cron.Cron
-	taskCtx    context.Context
-	taskCancel context.CancelFunc
 	httpClient *http.Client
+	taskRunner func(context.Context, requeryTaskConfig)
+	now        func() time.Time
+	newTimer   func(time.Duration) schedulerTimer
+
+	lifecycleCtx       context.Context
+	lifecycleCancel    context.CancelFunc
+	scheduleChanged    chan struct{}
+	scheduleGeneration uint64
+	closed             bool
+	taskRunning        bool
+	taskCancel         context.CancelFunc
+
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
+
+type schedulerTimer interface {
+	Chan() <-chan time.Time
+	Stop() bool
+}
+
+type realSchedulerTimer struct {
+	*time.Timer
+}
+
+func (t *realSchedulerTimer) Chan() <-chan time.Time {
+	return t.C
+}
+
+type requeryTaskConfig struct {
+	domainProcessing  DomainProcessing
+	urlActions        URLActions
+	executionSettings ExecutionSettings
+}
+
+var (
+	errRequeryClosed   = errors.New("requery is closed")
+	errTaskRunning     = errors.New("a requery task is already running")
+	errScheduleChanged = errors.New("requery schedule changed")
+)
+
+var _ io.Closer = (*Requery)(nil)
 
 // Config maps directly to the requeryconfig.json file structure.
 type Config struct {
-	DomainProcessing  DomainProcessing   `json:"domain_processing"`
-	URLActions        URLActions         `json:"url_actions"`
-	Scheduler         SchedulerConfig    `json:"scheduler"`
-	ExecutionSettings ExecutionSettings  `json:"execution_settings"`
-	Status            Status             `json:"status"`
+	DomainProcessing  DomainProcessing  `json:"domain_processing"`
+	URLActions        URLActions        `json:"url_actions"`
+	Scheduler         SchedulerConfig   `json:"scheduler"`
+	ExecutionSettings ExecutionSettings `json:"execution_settings"`
+	Status            Status            `json:"status"`
 }
 
 type DomainProcessing struct {
 	SourceFiles []SourceFile `json:"source_files"`
-    // OutputFile 已删除
+	// OutputFile 已删除
 }
 
 type SourceFile struct {
@@ -141,11 +180,11 @@ type ExecutionSettings struct {
 }
 
 type Status struct {
-	TaskState           string    `json:"task_state"` // "idle", "running", "failed", "cancelled"
-	LastRunStartTime    time.Time `json:"last_run_start_time,omitempty"`
-	LastRunEndTime      time.Time `json:"last_run_end_time,omitempty"`
-	LastRunDomainCount  int       `json:"last_run_domain_count"`
-	Progress            Progress  `json:"progress"`
+	TaskState          string    `json:"task_state"` // "idle", "running", "failed", "cancelled"
+	LastRunStartTime   time.Time `json:"last_run_start_time,omitempty"`
+	LastRunEndTime     time.Time `json:"last_run_end_time,omitempty"`
+	LastRunDomainCount int       `json:"last_run_domain_count"`
+	Progress           Progress  `json:"progress"`
 }
 
 type Progress struct {
@@ -153,77 +192,152 @@ type Progress struct {
 	Total     int64 `json:"total"`
 }
 
+func (p *Requery) taskConfigSnapshotLocked() requeryTaskConfig {
+	return requeryTaskConfig{
+		domainProcessing: DomainProcessing{
+			SourceFiles: append([]SourceFile(nil), p.config.DomainProcessing.SourceFiles...),
+		},
+		urlActions: URLActions{
+			SaveRules:  append([]string(nil), p.config.URLActions.SaveRules...),
+			FlushRules: append([]string(nil), p.config.URLActions.FlushRules...),
+		},
+		executionSettings: p.config.ExecutionSettings,
+	}
+}
+
+// startTask atomically claims the single task slot before launching a
+// goroutine. expectedScheduleGeneration is nil for manual triggers.
+func (p *Requery) startTask(expectedScheduleGeneration *uint64) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errRequeryClosed
+	}
+	if expectedScheduleGeneration != nil {
+		if *expectedScheduleGeneration != p.scheduleGeneration || !p.config.Scheduler.Enabled {
+			p.mu.Unlock()
+			return errScheduleChanged
+		}
+	}
+	if p.taskRunning {
+		p.mu.Unlock()
+		return errTaskRunning
+	}
+
+	taskCtx, taskCancel := context.WithCancel(p.lifecycleCtx)
+	taskCfg := p.taskConfigSnapshotLocked()
+	runner := p.taskRunner
+	if runner == nil {
+		runner = p.runTask
+	}
+
+	p.taskRunning = true
+	p.taskCancel = taskCancel
+	p.config.Status.TaskState = "running"
+	p.config.Status.LastRunStartTime = time.Now().UTC()
+	p.config.Status.LastRunEndTime = time.Time{}
+	p.config.Status.Progress.Processed = 0
+	p.config.Status.Progress.Total = 0
+	if err := p.saveConfigUnlocked(); err != nil {
+		log.Printf("[requery] WARN: Failed to persist task start state: %v", err)
+	}
+
+	p.wg.Add(1)
+	p.mu.Unlock()
+
+	go func() {
+		defer p.wg.Done()
+		defer taskCancel()
+		runner(taskCtx, taskCfg)
+	}()
+	return nil
+}
+
+// Close stops scheduling, cancels the active task, and waits until every
+// requery-owned goroutine has exited. It is safe to call more than once.
+func (p *Requery) Close() error {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.scheduleGeneration++
+		taskCancel := p.taskCancel
+		p.mu.Unlock()
+
+		if p.lifecycleCancel != nil {
+			p.lifecycleCancel()
+		}
+		if taskCancel != nil {
+			taskCancel()
+		}
+		p.notifyScheduleChanged()
+		p.wg.Wait()
+		if p.httpClient != nil {
+			p.httpClient.CloseIdleConnections()
+		}
+	})
+	return nil
+}
 
 // ----------------------------------------------------------------------------
 // 3. Core Task Workflow
 // ----------------------------------------------------------------------------
 
-// runTask executes the entire requery workflow. It's designed to be run in a goroutine.
-func (p *Requery) runTask(ctx context.Context) {
-	p.mu.Lock()
-	if p.config.Status.TaskState == "running" {
-		log.Println("[requery] Task trigger ignored: a task is already running.")
-		p.mu.Unlock()
-		return
-	}
-	
-	p.config.Status.TaskState = "running"
-	p.config.Status.LastRunStartTime = time.Now().UTC()
-	p.config.Status.LastRunEndTime = time.Time{} // Clear end time
-	p.config.Status.Progress.Processed = 0
-	p.config.Status.Progress.Total = 0
-	_ = p.saveConfigUnlocked()
-	p.mu.Unlock()
-
-	// Defer block to ensure state is cleaned up on any exit path (success, failure, cancellation).
+// runTask executes the entire requery workflow. startTask owns the runtime
+// lifecycle and guarantees that only one invocation can run at a time.
+func (p *Requery) runTask(ctx context.Context, cfg requeryTaskConfig) {
 	defer func() {
+		recovered := recover()
 		p.mu.Lock()
 
 		if p.config.Status.TaskState == "running" {
-			p.config.Status.TaskState = "idle" // Assume success unless overridden
+			if ctx.Err() != nil {
+				p.config.Status.TaskState = "cancelled"
+			} else {
+				p.config.Status.TaskState = "idle"
+			}
 		}
 
-		if r := recover(); r != nil {
-			log.Printf("[requery] FATAL: Task panicked: %v", r)
+		if recovered != nil {
+			log.Printf("[requery] FATAL: Task panicked: %v", recovered)
 			p.config.Status.TaskState = "failed"
 		}
-		
+
 		p.config.Status.LastRunEndTime = time.Now().UTC()
 		_ = p.saveConfigUnlocked()
 
 		p.taskCancel = nil
-                p.mu.Unlock()
-		// [修改点] 调用核心包的通用内存清理函数
-		// 因为 ManualGC 内部是异步(go func)的，所以这里调用不会阻塞锁，非常安全
+		p.taskRunning = false
+		p.mu.Unlock()
+
 		log.Println("[requery] Task finished, triggering background memory release...")
 		coremain.ManualGC()
-	} ()
+	}()
 
 	log.Println("[requery] Starting a new task.")
 
 	// Step 1: Save current rules
 	log.Println("[requery] Step 1: Saving rules...")
-	if err := p.callURLs(ctx, p.config.URLActions.SaveRules); err != nil {
-		p.setFailedState("failed during save_rules step: %v", err)
+	if err := p.callURLs(ctx, cfg.urlActions.SaveRules, cfg.executionSettings.URLCallDelayMS); err != nil {
+		p.setTaskError(ctx, "failed during save_rules step", err)
 		return
 	}
 
 	// Step 2 & 3: Consolidate domains (Merge only, no backup read/write)
 	log.Println("[requery] Step 2 & 3: Merging domains from source files...")
-	domains, err := p.mergeAndFilterDomains(ctx)
+	domains, err := p.mergeAndFilterDomains(ctx, cfg.domainProcessing.SourceFiles, cfg.executionSettings.DateRangeDays)
 	if err != nil {
-		p.setFailedState("failed during domain merge: %v", err)
+		p.setTaskError(ctx, "failed during domain merge", err)
 		return
 	}
 	if len(domains) == 0 {
 		log.Println("[requery] No domains found to process. Task finished.")
 		return
 	}
-	
+
 	// Step 4: Flush old rules
 	log.Println("[requery] Step 4: Flushing old rules...")
-	if err := p.callURLs(ctx, p.config.URLActions.FlushRules); err != nil {
-		p.setFailedState("failed during flush_rules step: %v", err)
+	if err := p.callURLs(ctx, cfg.urlActions.FlushRules, cfg.executionSettings.URLCallDelayMS); err != nil {
+		p.setTaskError(ctx, "failed during flush_rules step", err)
 		return
 	}
 
@@ -235,7 +349,7 @@ func (p *Requery) runTask(ctx context.Context) {
 
 	// Step 6: Re-query domains
 	log.Printf("[requery] Step 6: Re-querying %d domains...", len(domains))
-	err = p.resendDNSQueries(ctx, domains)
+	err = p.resendDNSQueries(ctx, domains, cfg.executionSettings)
 	if err != nil {
 		// The error (e.g., cancellation) is handled inside resendDNSQueries by setting the state.
 		log.Printf("[requery] Task stopped during DNS query phase: %v", err)
@@ -244,8 +358,8 @@ func (p *Requery) runTask(ctx context.Context) {
 
 	// Step 7 (Final): Save rules again after requery
 	log.Println("[requery] Step 7: Performing final save of rules...")
-	if err := p.callURLs(ctx, p.config.URLActions.SaveRules); err != nil {
-		p.setFailedState("failed during final save_rules step: %v", err)
+	if err := p.callURLs(ctx, cfg.urlActions.SaveRules, cfg.executionSettings.URLCallDelayMS); err != nil {
+		p.setTaskError(ctx, "failed during final save_rules step", err)
 		return
 	}
 
@@ -254,28 +368,27 @@ func (p *Requery) runTask(ctx context.Context) {
 
 // mergeAndFilterDomains handles reading source files, parsing formats, and filtering by date.
 // It no longer reads or writes the backup file.
-func (p *Requery) mergeAndFilterDomains(ctx context.Context) ([]string, error) {
+func (p *Requery) mergeAndFilterDomains(ctx context.Context, sourceFiles []SourceFile, limitDays int) ([]string, error) {
 	// 初始化域名集合，用于去重
 	domainSet := make(map[string]struct{})
-	
+
 	// 准备正则：匹配 full: 开头
 	domainPattern := regexp.MustCompile(`^full:(.+)`)
 
 	// 获取日期过滤配置，默认为 30 天
-	limitDays := p.config.ExecutionSettings.DateRangeDays
 	if limitDays <= 0 {
 		limitDays = 30
 	}
 
 	processedCount := 0
 
-	for _, sourceFile := range p.config.DomainProcessing.SourceFiles {
+	for _, sourceFile := range sourceFiles {
 		select {
-		case <- ctx.Done():
+		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
-		
+
 		file, err := os.Open(sourceFile.Path)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -288,6 +401,12 @@ func (p *Requery) mergeAndFilterDomains(ctx context.Context) ([]string, error) {
 
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
 				continue
@@ -332,7 +451,7 @@ func (p *Requery) mergeAndFilterDomains(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("error reading source file %s: %w", sourceFile.Path, err)
 		}
 	}
-	
+
 	log.Printf("[requery] Processed source files. Total unique domains loaded (within %d days): %d.", limitDays, len(domainSet))
 
 	if len(domainSet) == 0 {
@@ -343,30 +462,30 @@ func (p *Requery) mergeAndFilterDomains(ctx context.Context) ([]string, error) {
 	for domain := range domainSet {
 		domains = append(domains, domain)
 	}
-        domainSet = nil 
+	domainSet = nil
 	// 此时不再写入 output_file (requery_backup.txt)
-	
+
 	return domains, nil
 }
 
 // resendDNSQueries handles step 6 of the workflow.
-func (p *Requery) resendDNSQueries(ctx context.Context, domains []string) error {
+func (p *Requery) resendDNSQueries(ctx context.Context, domains []string, settings ExecutionSettings) error {
 	var wg sync.WaitGroup
 	// 确保 QueriesPerSecond 大于 0，防止除以零 panic
-	qps := p.config.ExecutionSettings.QueriesPerSecond
+	qps := settings.QueriesPerSecond
 	if qps <= 0 {
 		qps = 100
 	}
 	ticker := time.NewTicker(time.Second / time.Duration(qps))
 	defer ticker.Stop()
-	
+
 	dnsClient := new(dns.Client)
 	// 设置超时，防止请求挂起
-	dnsClient.Timeout = 2 * time.Second 
+	dnsClient.Timeout = 2 * time.Second
 
 	for i := 0; i < len(domains); i++ {
 		rawDomainStr := domains[i] // 这里的字符串可能带后缀，也可能不带
-		
+
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
@@ -379,7 +498,7 @@ func (p *Requery) resendDNSQueries(ctx context.Context, domains []string) error 
 		// 1. 分割字符串
 		parts := strings.Split(rawDomainStr, "|")
 		realDomain := parts[0] // 始终是域名部分
-		
+
 		// 2. 解析 Flags
 		var useAD, useCD, useDO bool
 		if len(parts) > 1 {
@@ -399,42 +518,43 @@ func (p *Requery) resendDNSQueries(ctx context.Context, domains []string) error 
 		createMsg := func(qtype uint16) *dns.Msg {
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn(realDomain), qtype)
-			
+
 			// 还原原始请求的 Flags
 			m.AuthenticatedData = useAD
 			m.CheckingDisabled = useCD
 			if useDO {
-				m.SetEdns0(4096, true) 
+				m.SetEdns0(4096, true)
 			}
 			// 建议开启递归查询，模拟普通客户端行为
-			m.RecursionDesired = true 
+			m.RecursionDesired = true
 			return m
 		}
 		// ----------------------------------
 
 		wg.Add(2)
-		
+
 		// 发送 A 记录
 		go func() {
 			defer wg.Done()
 			msg := createMsg(dns.TypeA)
-			_, _, _ = dnsClient.ExchangeContext(ctx, msg, p.config.ExecutionSettings.ResolverAddress)
+			_, _, _ = dnsClient.ExchangeContext(ctx, msg, settings.ResolverAddress)
 		}()
-		
+
 		// 发送 AAAA 记录
 		go func() {
 			defer wg.Done()
 			msg := createMsg(dns.TypeAAAA)
-			_, _, _ = dnsClient.ExchangeContext(ctx, msg, p.config.ExecutionSettings.ResolverAddress)
+			_, _, _ = dnsClient.ExchangeContext(ctx, msg, settings.ResolverAddress)
 		}()
 
-		newProcessed := atomic.AddInt64(&p.config.Status.Progress.Processed, 1)
+		newProcessed := int64(i + 1)
+		p.mu.Lock()
+		p.config.Status.Progress.Processed = newProcessed
 		// 减少保存频率，优化 IO
 		if newProcessed%100 == 0 || int(newProcessed) == len(domains) {
-			p.mu.Lock()
 			_ = p.saveConfigUnlocked()
-			p.mu.Unlock()
 		}
+		p.mu.Unlock()
 	}
 
 	wg.Wait()
@@ -470,40 +590,43 @@ func (p *Requery) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Requery) handleTriggerTask(w http.ResponseWriter, r *http.Request) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	if p.config.Status.TaskState == "running" {
+	err := p.startTask(nil)
+	switch {
+	case errors.Is(err, errTaskRunning):
 		p.jsonError(w, "A task is already running.", http.StatusConflict)
 		return
+	case errors.Is(err, errRequeryClosed):
+		p.jsonError(w, "The requery plugin is shutting down.", http.StatusServiceUnavailable)
+		return
+	case err != nil:
+		p.jsonError(w, "Failed to start task: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
-
-	p.taskCtx, p.taskCancel = context.WithCancel(context.Background())
-	go p.runTask(p.taskCtx)
 
 	p.jsonResponse(w, map[string]string{"status": "success", "message": "A new task has been started."}, http.StatusOK)
 }
 
 func (p *Requery) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.config.Status.TaskState != "running" || p.taskCancel == nil {
+	if !p.taskRunning || p.taskCancel == nil {
+		p.mu.Unlock()
 		p.jsonError(w, "No running task to cancel.", http.StatusNotFound)
 		return
 	}
-	
-	p.taskCancel()
+	taskCancel := p.taskCancel
+	p.mu.Unlock()
+
+	taskCancel()
 	log.Println("[requery] Task cancellation requested via API.")
-	
+
 	p.jsonResponse(w, map[string]string{"status": "success", "message": "Task cancellation initiated."}, http.StatusOK)
 }
 
 func (p *Requery) handleUpdateScheduler(w http.ResponseWriter, r *http.Request) {
 	// [修改] 定义一个扩展的结构体来接收包含 date_range_days 的 JSON
 	type SchedulerUpdatePayload struct {
-		SchedulerConfig       // 嵌入原有的 SchedulerConfig 字段 (Enabled, StartDatetime, IntervalMinutes)
-		DateRangeDays   int   `json:"date_range_days"` // 新增字段
+		SchedulerConfig     // 嵌入原有的 SchedulerConfig 字段 (Enabled, StartDatetime, IntervalMinutes)
+		DateRangeDays   int `json:"date_range_days"` // 新增字段
 	}
 
 	var payload SchedulerUpdatePayload
@@ -513,21 +636,32 @@ func (p *Requery) handleUpdateScheduler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.closed {
+		p.mu.Unlock()
+		p.jsonError(w, "The requery plugin is shutting down.", http.StatusServiceUnavailable)
+		return
+	}
 
 	// [修改] 分别更新 Scheduler 和 ExecutionSettings
+	oldScheduler := p.config.Scheduler
+	oldDateRangeDays := p.config.ExecutionSettings.DateRangeDays
 	p.config.Scheduler = payload.SchedulerConfig
-	
+
 	// 只有当传入了有效天数时才更新 (防止意外归零)
 	if payload.DateRangeDays > 0 {
 		p.config.ExecutionSettings.DateRangeDays = payload.DateRangeDays
 	}
 
 	if err := p.saveConfigUnlocked(); err != nil {
+		p.config.Scheduler = oldScheduler
+		p.config.ExecutionSettings.DateRangeDays = oldDateRangeDays
+		p.mu.Unlock()
 		p.jsonError(w, "Failed to save updated config", http.StatusInternalServerError)
 		return
 	}
-	p.rescheduleTasks()
+	p.scheduleGeneration++
+	p.mu.Unlock()
+	p.notifyScheduleChanged()
 	p.jsonResponse(w, map[string]string{"status": "success", "message": "Scheduler configuration updated successfully."}, http.StatusOK)
 }
 
@@ -536,7 +670,13 @@ func (p *Requery) handleUpdateScheduler(w http.ResponseWriter, r *http.Request) 
 
 func (p *Requery) handleGetSourceFileCounts(w http.ResponseWriter, r *http.Request) {
 	log.Println("[requery] API: Getting source file counts...")
-	if err := p.callURLs(r.Context(), p.config.URLActions.SaveRules); err != nil {
+	p.mu.RLock()
+	saveRules := append([]string(nil), p.config.URLActions.SaveRules...)
+	sourceFiles := append([]SourceFile(nil), p.config.DomainProcessing.SourceFiles...)
+	urlCallDelayMS := p.config.ExecutionSettings.URLCallDelayMS
+	p.mu.RUnlock()
+
+	if err := p.callURLs(r.Context(), saveRules, urlCallDelayMS); err != nil {
 		p.jsonError(w, "Failed to save rules before counting: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -546,10 +686,10 @@ func (p *Requery) handleGetSourceFileCounts(w http.ResponseWriter, r *http.Reque
 		Count int    `json:"count"`
 	}
 
-	counts := make([]fileCount, 0, len(p.config.DomainProcessing.SourceFiles))
+	counts := make([]fileCount, 0, len(sourceFiles))
 	domainPattern := regexp.MustCompile(`^full:(.+)`)
 
-	for _, sourceFile := range p.config.DomainProcessing.SourceFiles {
+	for _, sourceFile := range sourceFiles {
 		count := 0
 		file, err := os.Open(sourceFile.Path)
 		if err != nil {
@@ -574,7 +714,7 @@ func (p *Requery) handleGetSourceFileCounts(w http.ResponseWriter, r *http.Reque
 		}
 		counts = append(counts, fileCount{Alias: sourceFile.Alias, Count: count})
 	}
-	
+
 	p.jsonResponse(w, map[string]any{"status": "success", "data": counts}, http.StatusOK)
 }
 
@@ -597,7 +737,7 @@ func (p *Requery) loadConfig() error {
 		}
 		return err
 	}
-	
+
 	var cfg Config
 	if err := json.Unmarshal(dataBytes, &cfg); err != nil {
 		return fmt.Errorf("failed to parse json from config file %s: %w", p.filePath, err)
@@ -652,103 +792,135 @@ func (p *Requery) saveConfigUnlocked() error {
 	return nil
 }
 
-// [FIX] Corrected rescheduleTasks logic
-func (p *Requery) rescheduleTasks() {
-	if err := p.setupScheduler(); err != nil {
-		log.Printf("[requery] WARN: Failed to reschedule tasks: %v", err)
+func (p *Requery) startScheduler() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.wg.Add(1)
+	p.mu.Unlock()
+
+	go func() {
+		defer p.wg.Done()
+		p.schedulerLoop()
+	}()
+}
+
+func (p *Requery) notifyScheduleChanged() {
+	select {
+	case p.scheduleChanged <- struct{}{}:
+	default:
 	}
 }
 
-// [Modified] Rewrite setupScheduler to implement precise periodic scheduling based on the start time
-func (p *Requery) setupScheduler() error {
-	// 1. Remove all old scheduled jobs. This logic remains unchanged.
-	for _, entry := range p.scheduler.Entries() {
-		p.scheduler.Remove(entry.ID)
+func (p *Requery) schedulerSnapshot() (SchedulerConfig, uint64, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.config.Scheduler, p.scheduleGeneration, p.closed
+}
+
+func nextScheduledRun(now time.Time, cfg SchedulerConfig) (time.Time, bool, error) {
+	if !cfg.Enabled || cfg.IntervalMinutes <= 0 {
+		return time.Time{}, false, nil
+	}
+	if cfg.StartDatetime == "" {
+		return time.Time{}, false, errors.New("start_datetime is required when scheduler is enabled")
 	}
 
-	// 2. Check if the scheduler is enabled in the config. This logic remains unchanged.
-	if !p.config.Scheduler.Enabled || p.config.Scheduler.IntervalMinutes <= 0 {
-		log.Println("[requery] Scheduler is disabled or interval is invalid in config.")
-		return nil
-	}
-
-	// 3. Check and parse the start time (start_datetime).
-	// If it's not set, precise scheduling is not possible, so we return directly.
-	if p.config.Scheduler.StartDatetime == "" {
-		log.Println("[requery] Scheduler is enabled but 'start_datetime' is not set. No task scheduled.")
-		return nil
-	}
-	startTime, err := time.Parse(time.RFC3339, p.config.Scheduler.StartDatetime)
+	startTime, err := time.Parse(time.RFC3339, cfg.StartDatetime)
 	if err != nil {
-		log.Printf("[requery] WARN: Invalid 'start_datetime' format ('%s'), scheduler disabled: %v", p.config.Scheduler.StartDatetime, err)
-		return nil // Return nil to avoid mosdns startup failure, but the scheduler will not work.
+		return time.Time{}, false, fmt.Errorf("invalid start_datetime %q: %w", cfg.StartDatetime, err)
+	}
+	if int64(cfg.IntervalMinutes) > int64(maxSchedulerDuration/time.Minute) {
+		return time.Time{}, false, errors.New("interval_minutes is too large")
+	}
+	if startTime.After(now) {
+		return startTime, true, nil
+	}
+	if startTime.Before(now.Add(-maxSchedulerDuration)) {
+		return time.Time{}, false, errors.New("start_datetime is too far in the past")
 	}
 
-	// 4. Define the job to be executed. This logic remains unchanged and already includes the check to prevent task overlap.
-	jobFunc := func() {
-		log.Println("[requery] Scheduler is triggering a task.")
-		p.mu.Lock()
-		defer p.mu.Unlock()
+	interval := time.Duration(cfg.IntervalMinutes) * time.Minute
+	elapsed := now.Sub(startTime)
+	remainder := elapsed % interval
+	return now.Add(interval - remainder), true, nil
+}
 
-		if p.config.Status.TaskState == "running" {
-			log.Println("[requery] Scheduler skipped: previous task is still running.")
+func stopAndDrainTimer(timer schedulerTimer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.Chan():
+	default:
+	}
+}
+
+// schedulerLoop is the sole owner of the scheduling timer. Configuration
+// changes wake this loop, stop the old timer, and build exactly one new timer.
+func (p *Requery) schedulerLoop() {
+	for {
+		cfg, generation, closed := p.schedulerSnapshot()
+		if closed {
 			return
 		}
 
-		p.taskCtx, p.taskCancel = context.WithCancel(context.Background())
-		go p.runTask(p.taskCtx)
+		now := p.now()
+		nextRun, enabled, err := nextScheduledRun(now, cfg)
+		if err != nil {
+			log.Printf("[requery] WARN: Scheduler is not active: %v", err)
+		}
+		if err != nil || !enabled {
+			select {
+			case <-p.lifecycleCtx.Done():
+				return
+			case <-p.scheduleChanged:
+				continue
+			}
+		}
+
+		delay := nextRun.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+		log.Printf("[requery] Next scheduled run will be at %v (in %v).", nextRun.Local(), delay.Round(time.Second))
+		timer := p.newTimer(delay)
+
+		select {
+		case <-p.lifecycleCtx.Done():
+			stopAndDrainTimer(timer)
+			return
+		case <-p.scheduleChanged:
+			stopAndDrainTimer(timer)
+			continue
+		case <-timer.Chan():
+			err := p.startTask(&generation)
+			switch {
+			case err == nil:
+				log.Println("[requery] Scheduler triggered a task.")
+			case errors.Is(err, errTaskRunning):
+				log.Println("[requery] Scheduler skipped: previous task is still running.")
+			case errors.Is(err, errScheduleChanged):
+				log.Println("[requery] Scheduler ignored an obsolete timer.")
+			case errors.Is(err, errRequeryClosed):
+				return
+			default:
+				log.Printf("[requery] WARN: Scheduler failed to start task: %v", err)
+			}
+		}
 	}
-
-	// 5. [Core Modification] Calculate the next precise execution time point.
-	now := time.Now().UTC()
-	interval := time.Duration(p.config.Scheduler.IntervalMinutes) * time.Minute
-	var nextRunTime time.Time
-
-	if startTime.After(now) {
-		// If the start time is in the future, the next run time is the start time itself.
-		nextRunTime = startTime
-	} else {
-		// If the start time has passed, calculate the next period from that point.
-		// a. Calculate the duration that has elapsed since the start time.
-		elapsed := now.Sub(startTime)
-		// b. Calculate how many full intervals have passed.
-		cyclesPassed := elapsed / interval
-		// c. The next run time = start time + (number of cycles passed + 1) * interval.
-		nextRunTime = startTime.Add(time.Duration(cyclesPassed+1) * interval)
-	}
-
-	// 6. Use time.AfterFunc to create a one-off timer to schedule the next job.
-	delay := nextRunTime.Sub(now)
-
-	if delay > 0 {
-		log.Printf("[requery] Next scheduled run will be at %v (in %v).", nextRunTime.Local(), delay.Round(time.Second))
-		
-		// When the timer fires, it will execute the job and then immediately call rescheduleTasks 
-		// to schedule the subsequent job, creating a chain.
-		time.AfterFunc(delay, func() {
-			jobFunc()
-			// Immediately reschedule to calculate and arrange the next execution cycle.
-			p.rescheduleTasks()
-		})
-	} else {
-		// This is an edge case, which should rarely happen. If the calculated run time is in the past
-		// (possibly due to system clock issues or a long-running task),
-		// reschedule immediately to find the next valid time point.
-		log.Printf("[requery] Calculated next run time (%v) is in the past. Attempting to reschedule immediately.", nextRunTime.Local())
-		go p.rescheduleTasks()
-	}
-
-	return nil
 }
 
-func (p *Requery) callURLs(ctx context.Context, urls []string) error {
-	delay := time.Duration(p.config.ExecutionSettings.URLCallDelayMS) * time.Millisecond
+func (p *Requery) callURLs(ctx context.Context, urls []string, delayMS int) error {
+	delay := time.Duration(delayMS) * time.Millisecond
 	for i, url := range urls {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create request for %s: %w", url, err)
 		}
-		
+
 		resp, err := p.httpClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("failed to call URL %s: %w", url, err)
@@ -759,7 +931,7 @@ func (p *Requery) callURLs(ctx context.Context, urls []string) error {
 			body, _ := io.ReadAll(resp.Body)
 			return fmt.Errorf("bad response from URL %s: status %d, body: %s", url, resp.StatusCode, string(body))
 		}
-		
+
 		_, _ = io.Copy(io.Discard, resp.Body)
 
 		if i < len(urls)-1 {
@@ -778,6 +950,14 @@ func (p *Requery) setFailedState(format string, args ...any) {
 	defer p.mu.Unlock()
 	p.config.Status.TaskState = "failed"
 	log.Printf("[requery] ERROR: Task failed: "+format, args...)
+}
+
+func (p *Requery) setTaskError(ctx context.Context, step string, err error) {
+	if ctx.Err() != nil {
+		p.setCancelledState(step + ": " + ctx.Err().Error())
+		return
+	}
+	p.setFailedState("%s: %v", step, err)
 }
 
 func (p *Requery) setCancelledState(reason string) {
