@@ -740,7 +740,11 @@
         
         const iconMap = { 
             '请求总数': 'fa-globe', '缓存命中': 'fa-check-circle', '过期缓存命中': 'fa-history', 
-            '缓存命中率': 'fa-bullseye', '过期缓存命中率': 'fa-bullseye', '缓存条目数': 'fa-database', 
+            '缓存命中率': 'fa-bullseye', '过期缓存命中率': 'fa-bullseye', '缓存条目数': 'fa-database',
+            '主动刷新次数': 'fa-rotate', '刷新成功': 'fa-circle-check', '刷新失败': 'fa-circle-xmark',
+            '刷新成功率': 'fa-bullseye', '平均刷新耗时': 'fa-stopwatch', '等待刷新任务': 'fa-list-check',
+            '跟踪刷新条目': 'fa-binoculars', '刷新任务丢弃': 'fa-trash-can',
+            '备用探测次数': 'fa-satellite-dish', '探测保活次数': 'fa-heart-pulse',
             '启动时间': 'fa-power-off', 'CPU 时间': 'fa-microchip', '常驻内存 (RSS)': 'fa-memory', 
             '系统累计接收流量': 'fa-download', '系统累计发送流量': 'fa-upload', 'GC 次数': 'fa-recycle',
             'GC 累计耗时': 'fa-stopwatch', '上次 GC 时间': 'fa-clock', 'Go 版本': 'fa-code-branch', '线程数': 'fa-sitemap',
@@ -907,14 +911,30 @@
         
         function parseMetrics(metricsText, cacheTag) {
             const lines = metricsText.split('\n');
-            const metrics = { query_total: 0, hit_total: 0, lazy_hit_total: 0, size_current: 0 };
-            const query_str = `mosdns_cache_query_total{tag="${cacheTag}"}`; const hit_str = `mosdns_cache_hit_total{tag="${cacheTag}"}`;
-            const lazy_str = `mosdns_cache_lazy_hit_total{tag="${cacheTag}"}`; const size_str = `mosdns_cache_size_current{tag="${cacheTag}"}`;
+            const metricFields = {
+                query_total: 'query_total',
+                hit_total: 'hit_total',
+                lazy_hit_total: 'lazy_hit_total',
+                size_current: 'size_current',
+                active_refresh_total: 'refresh_total',
+                active_refresh_success_total: 'refresh_success_total',
+                active_refresh_failed_total: 'refresh_failed_total',
+                active_refresh_duration_seconds_sum: 'refresh_duration_sum',
+                active_refresh_duration_seconds_count: 'refresh_duration_count',
+                active_refresh_queue_size: 'refresh_queue_size',
+                active_refresh_meta_size: 'refresh_meta_size',
+                active_refresh_drop_total: 'refresh_drop_total',
+                active_refresh_probe_total: 'refresh_probe_total',
+                active_refresh_probe_keepalive_total: 'refresh_probe_keepalive_total'
+            };
+            const metrics = Object.fromEntries(Object.values(metricFields).map(field => [field, 0]));
             lines.forEach(line => {
-                if (line.startsWith(query_str)) { metrics.query_total = parseFloat(line.split(' ')[1]) || 0; } 
-                else if (line.startsWith(hit_str)) { metrics.hit_total = parseFloat(line.split(' ')[1]) || 0; } 
-                else if (line.startsWith(lazy_str)) { metrics.lazy_hit_total = parseFloat(line.split(' ')[1]) || 0; } 
-                else if (line.startsWith(size_str)) { metrics.size_current = parseFloat(line.split(' ')[1]) || 0; }
+                for (const [metricName, field] of Object.entries(metricFields)) {
+                    if (line.startsWith(`mosdns_cache_${metricName}{tag="${cacheTag}"}`)) {
+                        metrics[field] = parseFloat(line.split(' ')[1]) || 0;
+                        break;
+                    }
+                }
             });
             return metrics;
         }
@@ -954,7 +974,13 @@
                     const config = cacheConfig[key];
                     const effectiveTag = coreMode === 'B' ? config.modeB : config.default;
                     const metrics = parseMetrics(text, effectiveTag);
-                    data.caches[key] = { ...metrics, hit_rate: metrics.query_total > 0 ? ((metrics.hit_total / metrics.query_total) * 100).toFixed(2) + '%' : '0.00%', lazy_hit_rate: metrics.query_total > 0 ? ((metrics.lazy_hit_total / metrics.query_total) * 100).toFixed(2) + '%' : '0.00%' };
+                    data.caches[key] = {
+                        ...metrics,
+                        hit_rate: metrics.query_total > 0 ? ((metrics.hit_total / metrics.query_total) * 100).toFixed(2) + '%' : '0.00%',
+                        lazy_hit_rate: metrics.query_total > 0 ? ((metrics.lazy_hit_total / metrics.query_total) * 100).toFixed(2) + '%' : '0.00%',
+                        refresh_success_rate: metrics.refresh_total > 0 ? ((metrics.refresh_success_total / metrics.refresh_total) * 100).toFixed(2) + '%' : '0.00%',
+                        refresh_avg_duration: metrics.refresh_duration_count > 0 ? ((metrics.refresh_duration_sum / metrics.refresh_duration_count) * 1000).toFixed(2) + ' ms' : '0.00 ms'
+                    };
                 });
                 
                 data.system = { start_time: systemMetrics.startTime ? new Date(systemMetrics.startTime * 1000).toLocaleString() : 'N/A', cpu_time: `${systemMetrics.cpuTime.toFixed(2)} 秒`, resident_memory: `${(systemMetrics.residentMemory / 1024 / 1024).toFixed(2)} MB`, net_recv: `${(systemMetrics.netRecv / 1024 / 1024 / 1024).toFixed(2)} GB`, net_send: `${(systemMetrics.netSend / 1024 / 1024 / 1024).toFixed(2)} GB`, gc_count: systemMetrics.gcCount.toLocaleString(), gc_sum: `${systemMetrics.gcSum.toFixed(3)} 秒`, last_gc_time: systemMetrics.lastGcTime ? new Date(systemMetrics.lastGcTime * 1000).toLocaleString() : 'N/A', go_version: systemMetrics.goVersion, threads: systemMetrics.threads, open_fds: systemMetrics.openFds };
@@ -1015,7 +1041,24 @@
                     card.classList.add('visible');
                     const metricsContainer = getById(`metrics-${key}`);
                     metricsContainer.innerHTML = ''; 
-                    [{ label: '请求总数', numericValue: cardData.query_total }, { label: '缓存命中', numericValue: cardData.hit_total }, { label: '过期缓存命中', numericValue: cardData.lazy_hit_total }, { label: '缓存命中率', value: cardData.hit_rate, accent: true }, { label: '过期缓存命中率', value: cardData.lazy_hit_rate, accent: true }, { label: '缓存条目数', numericValue: cardData.size_current }, ].forEach(m => {
+                    [
+                        { label: '请求总数', numericValue: cardData.query_total },
+                        { label: '缓存命中', numericValue: cardData.hit_total },
+                        { label: '过期缓存命中', numericValue: cardData.lazy_hit_total },
+                        { label: '缓存命中率', value: cardData.hit_rate, accent: true },
+                        { label: '过期缓存命中率', value: cardData.lazy_hit_rate, accent: true },
+                        { label: '缓存条目数', numericValue: cardData.size_current },
+                        { label: '主动刷新次数', numericValue: cardData.refresh_total },
+                        { label: '刷新成功', numericValue: cardData.refresh_success_total },
+                        { label: '刷新失败', numericValue: cardData.refresh_failed_total },
+                        { label: '刷新成功率', value: cardData.refresh_success_rate, accent: true },
+                        { label: '平均刷新耗时', value: cardData.refresh_avg_duration },
+                        { label: '等待刷新任务', numericValue: cardData.refresh_queue_size },
+                        { label: '跟踪刷新条目', numericValue: cardData.refresh_meta_size },
+                        { label: '刷新任务丢弃', numericValue: cardData.refresh_drop_total },
+                        { label: '备用探测次数', numericValue: cardData.refresh_probe_total },
+                        { label: '探测保活次数', numericValue: cardData.refresh_probe_keepalive_total }
+                    ].forEach(m => {
                         const p = createElement('div', 'metric-label');
                         p.innerHTML = `<i class="fas ${iconMap[m.label] || 'fa-question-circle'}"></i> <span>${m.label}:</span>`;
                         const v = createElement('div', `metric-value${m.accent ? ' accent' : ''}`);
