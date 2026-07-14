@@ -21,9 +21,24 @@ type listPluginInfo struct {
 	Writable bool   `json:"writable"`
 }
 
+type loadedPluginInfo struct {
+	Tag  string `json:"tag"`
+	Type string `json:"type"`
+}
+
 // RegisterListPluginsAPI exposes the list capabilities of loaded plugins so
 // the dashboard does not need to guess or hard-code plugin tags.
 func RegisterListPluginsAPI(router *chi.Mux, m *Mosdns) {
+	router.Get("/api/v1/plugins", func(w http.ResponseWriter, r *http.Request) {
+		plugins := make([]loadedPluginInfo, 0, len(m.pluginTypes))
+		for tag, pluginType := range m.pluginTypes {
+			plugins = append(plugins, loadedPluginInfo{Tag: tag, Type: pluginType})
+		}
+		sort.Slice(plugins, func(i, j int) bool { return plugins[i].Tag < plugins[j].Tag })
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(plugins)
+	})
+
 	router.Get("/api/v1/list-plugins", func(w http.ResponseWriter, r *http.Request) {
 		plugins := make([]listPluginInfo, 0)
 		for tag, plugin := range m.plugins {

@@ -32,7 +32,7 @@ function closeAndUnlock(dialogElement) {
 
 
 document.addEventListener('DOMContentLoaded', () => {
-    const CONSTANTS = { API_BASE_URL: '', ADGUARD_PLUGIN_TAG: 'adguard', LOGS_PER_PAGE: 50, HISTORY_LENGTH: 60, DEFAULT_AUTO_REFRESH_INTERVAL: 15, ANIMATION_DURATION: 1000, MOBILE_BREAKPOINT: 1024, TOAST_DURATION: 3000, SKELETON_ROWS: 10, TOOLTIP_SHOW_DELAY: 200, TOOLTIP_HIDE_DELAY: 250, UPDATE_AUTO_MINUTES_DEFAULT: 1440 };
+    const CONSTANTS = { API_BASE_URL: '', LOGS_PER_PAGE: 50, HISTORY_LENGTH: 60, DEFAULT_AUTO_REFRESH_INTERVAL: 15, ANIMATION_DURATION: 1000, MOBILE_BREAKPOINT: 1024, TOAST_DURATION: 3000, SKELETON_ROWS: 10, TOOLTIP_SHOW_DELAY: 200, TOOLTIP_HIDE_DELAY: 250, UPDATE_AUTO_MINUTES_DEFAULT: 1440 };
     let state = { isUpdating: false, isCapturing: false, isMobile: false, isTouchDevice: false, isCustomConfigProfile: false, currentLogPage: 1, isLogLoading: false, logPaginationInfo: null, displayedLogs: [], currentLogSearchTerm: '', clientAliases: {}, topDomains: [], topClients: [], slowestQueries: [], domainSetRank: [], shuntColors: {}, logSort: { key: 'query_time', order: 'desc' }, autoRefresh: { enabled: false, intervalId: null, intervalSeconds: CONSTANTS.DEFAULT_AUTO_REFRESH_INTERVAL }, data: { totalQueries: { current: null, previous: null }, avgDuration: { current: null, previous: null } }, history: { totalQueries: [], avgDuration: [], timestamps: [] }, lastUpdateTime: null, adguardRules: [], diversionRules: [], requery: { status: null, config: null, pollId: null }, dataView: { rawEntries: [], filteredEntries: [], viewType: 'domain', currentOffset: 0, currentLimit: 100, currentQuery: '', currentConfig: null, hasMore: true, totalCount: 0 }, coreMode: 'A', cacheStats: {}, listManagerInitialized: false, featureSwitches: {}, systemInfo: {}, update: { status: null, loading: false, auto: { enabled: true, intervalMinutes: CONSTANTS.UPDATE_AUTO_MINUTES_DEFAULT, timerId: null } } };
     const elements = {
         html: document.documentElement, body: document.body, container: document.querySelector('.container'), initialLoader: document.getElementById('initial-loader'),
@@ -2141,6 +2141,7 @@ function renderRuleTable(tbody, rules, mode) {
                             <div class="card-header">
                                 <div style="display:flex; flex-direction:column; max-width:70%;">
                                     <span class="card-title">${rule.name}</span>
+                                    ${mode === 'adguard' && rule._pluginTag ? `<small style="color:var(--color-text-secondary); margin-top:2px;">插件：${rule._pluginTag}</small>` : ''}
                                     <small style="color:var(--color-text-secondary); margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${rule.url}</small>
                                 </div>
                                 <label class="switch">
@@ -2183,7 +2184,7 @@ function renderRuleTable(tbody, rules, mode) {
         }, mode);
     }
 
-    function renderRuleTableRow(rule, mode) { const tr = document.createElement('tr'); const lastUpdated = rule.last_updated && !rule.last_updated.startsWith('0001-01-01') ? new Date(rule.last_updated).toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-') : '—'; let html = `<td class="text-center"><label class="switch"><input type="checkbox" class="rule-enabled-toggle" ${rule.enabled ? 'checked' : ''}><span class="slider"></span></label></td><td>${rule.name}</td>`; if (mode === 'diversion') { html += `<td><span class="response-tag other">${rule.type}</span></td>`; } html += `<td><span class="truncate-text" title="${rule.url}">${rule.url}</span></td><td class="text-right">${(rule.rule_count || 0).toLocaleString()}</td><td>${lastUpdated}</td><td class="text-center"><div style="display: inline-flex; gap: 0.5rem; white-space: nowrap;">`; if (mode === 'diversion' && rule.url) { html += `<button class="button secondary rule-update-btn" style="padding: 0.4rem 0.8rem;" title="更新此规则"><span>更新</span></button>`; } html += `<button class="button secondary rule-edit-btn" style="padding: 0.4rem 0.8rem;"><span>编辑</span></button><button class="button danger rule-delete-btn" style="padding: 0.4rem 0.8rem;"><span>删除</span></button></div></td>`; tr.innerHTML = html; return tr; }
+    function renderRuleTableRow(rule, mode) { const tr = document.createElement('tr'); const lastUpdated = rule.last_updated && !rule.last_updated.startsWith('0001-01-01') ? new Date(rule.last_updated).toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-') : '—'; const source = mode === 'adguard' && rule._pluginTag ? `<small style="display:block;color:var(--color-text-secondary);margin-top:2px;">插件：${rule._pluginTag}</small>` : ''; let html = `<td class="text-center"><label class="switch"><input type="checkbox" class="rule-enabled-toggle" ${rule.enabled ? 'checked' : ''}><span class="slider"></span></label></td><td>${rule.name}${source}</td>`; if (mode === 'diversion') { html += `<td><span class="response-tag other">${rule.type}</span></td>`; } html += `<td><span class="truncate-text" title="${rule.url}">${rule.url}</span></td><td class="text-right">${(rule.rule_count || 0).toLocaleString()}</td><td>${lastUpdated}</td><td class="text-center"><div style="display: inline-flex; gap: 0.5rem; white-space: nowrap;">`; if (mode === 'diversion' && rule.url) { html += `<button class="button secondary rule-update-btn" style="padding: 0.4rem 0.8rem;" title="更新此规则"><span>更新</span></button>`; } html += `<button class="button secondary rule-edit-btn" style="padding: 0.4rem 0.8rem;"><span>编辑</span></button><button class="button danger rule-delete-btn" style="padding: 0.4rem 0.8rem;"><span>删除</span></button></div></td>`; tr.innerHTML = html; return tr; }
 
     function renderRuleMobileCard(rule, mode) {
         const card = document.createElement('div'); card.className = 'rule-card';
@@ -2198,8 +2199,21 @@ function renderRuleTable(tbody, rules, mode) {
         return card;
     }
 
-    const adguardPluginPath = (suffix = '') => `/plugins/${CONSTANTS.ADGUARD_PLUGIN_TAG}${suffix}`;
-    async function handleAdguardUpdateCheck() { ui.setLoading(elements.checkAdguardUpdatesBtn, true); ui.showToast('已开始在后台更新所有启用的拦截规则...'); try { await api.fetch(adguardPluginPath('/update'), { method: 'POST' }); ui.showToast('更新请求已发送，5秒后自动刷新列表...', 'success'); await new Promise(resolve => setTimeout(resolve, 5000)); await adguardManager.load(); ui.showToast('拦截规则列表已刷新！', 'success'); } catch (e) { } finally { ui.setLoading(elements.checkAdguardUpdatesBtn, false); } }
+    async function handleAdguardUpdateCheck() {
+        ui.setLoading(elements.checkAdguardUpdatesBtn, true);
+        try {
+            await adguardManager.discover();
+            if (adguardManager.tags.length === 0) throw new Error('未发现 adguard_rule 插件');
+            await Promise.all(adguardManager.tags.map(tag => api.fetch(adguardManager.path(tag, '/update'), { method: 'POST' })));
+            ui.showToast('已向所有 AdGuard 插件发送更新请求，5 秒后自动刷新', 'success');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            await adguardManager.load();
+        } catch (error) {
+            ui.showToast(error.message || 'AdGuard 更新失败', 'error');
+        } finally {
+            ui.setLoading(elements.checkAdguardUpdatesBtn, false);
+        }
+    }
     async function handleRuleTableClick(event, mode) {
         const target = event.target.closest('button, input.rule-enabled-toggle');
         if (!target) return;
@@ -2208,14 +2222,14 @@ function renderRuleTable(tbody, rules, mode) {
         const id = itemElement.dataset.ruleId;
         const sourceTag = itemElement.dataset.rulePluginTag;
         const rules = mode === 'adguard' ? state.adguardRules : state.diversionRules;
-        const rule = rules.find(item => mode === 'adguard' ? item.id === id : item.name === id && (!sourceTag || item._pluginTag === sourceTag));
+        const rule = rules.find(item => mode === 'adguard' ? item.id === id && (!sourceTag || item._pluginTag === sourceTag) : item.name === id && (!sourceTag || item._pluginTag === sourceTag));
         if (!rule) return;
         if (target.matches('.rule-edit-btn')) {
             ui.openRuleModal(mode, rule);
             return;
         }
 
-        const pluginTag = mode === 'adguard' ? CONSTANTS.ADGUARD_PLUGIN_TAG : diversionManager.resolvePluginTag(rule);
+        const pluginTag = mode === 'adguard' ? (rule._pluginTag || adguardManager.primaryTag()) : diversionManager.resolvePluginTag(rule);
         if (!pluginTag) {
             ui.showToast(`无法确定规则“${rule.name}”所属插件`, 'error');
             return;
@@ -2224,7 +2238,7 @@ function renderRuleTable(tbody, rules, mode) {
             if (!confirm(`确定要删除规则 "${rule.name}" 吗？此操作不可恢复。`)) return;
             ui.setLoading(target, true);
             try {
-                const url = mode === 'adguard' ? adguardPluginPath(`/rules/${id}`) : `/plugins/${pluginTag}/config/${id}`;
+                const url = mode === 'adguard' ? adguardManager.path(pluginTag, `/rules/${id}`) : `/plugins/${pluginTag}/config/${id}`;
                 await api.fetch(url, { method: 'DELETE' });
                 ui.showToast(`规则 "${rule.name}" 已删除`);
                 await (mode === 'adguard' ? adguardManager.load() : diversionManager.load());
@@ -2246,7 +2260,7 @@ function renderRuleTable(tbody, rules, mode) {
             delete updatedRule._pluginTag;
             target.disabled = true;
             try {
-                const url = mode === 'adguard' ? adguardPluginPath(`/rules/${id}`) : `/plugins/${pluginTag}/config/${id}`;
+                const url = mode === 'adguard' ? adguardManager.path(pluginTag, `/rules/${id}`) : `/plugins/${pluginTag}/config/${id}`;
                 await api.fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedRule) });
                 rule.enabled = target.checked;
                 ui.showToast(`规则 "${rule.name}" 已${target.checked ? '启用' : '禁用'}`);
@@ -2272,10 +2286,17 @@ function renderRuleTable(tbody, rules, mode) {
                     update_interval_hours: parseInt(form.elements.update_interval_hours.value, 10) || 24
                 };
                 if (id) {
-                    const originalRule = state.adguardRules.find(rule => rule.id === id);
-                    await api.fetch(adguardPluginPath(`/rules/${id}`), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) });
+                    const sourcePluginTag = form.dataset.sourcePluginTag;
+                    const originalRule = state.adguardRules.find(rule => rule.id === id && (!sourcePluginTag || rule._pluginTag === sourcePluginTag));
+                    if (!originalRule) throw new Error('找不到要修改的 AdGuard 规则');
+                    const payload = { ...originalRule, ...data };
+                    delete payload._pluginTag;
+                    await api.fetch(adguardManager.path(originalRule._pluginTag, `/rules/${id}`), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
                 } else {
-                    await api.fetch(adguardPluginPath('/rules'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) });
+                    await adguardManager.discover();
+                    const targetTag = adguardManager.primaryTag();
+                    if (!targetTag) throw new Error('未发现 adguard_rule 插件');
+                    await api.fetch(adguardManager.path(targetTag, '/rules'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) });
                 }
                 ui.showToast(`广告拦截规则${id ? '更新' : '添加'}成功`);
                 await adguardManager.load();
@@ -2323,7 +2344,33 @@ function renderRuleTable(tbody, rules, mode) {
             ui.setLoading(elements.saveRuleBtn, false);
         }
     }
-    const adguardManager = { tag: CONSTANTS.ADGUARD_PLUGIN_TAG, async load() { try { state.adguardRules = await api.fetch(adguardPluginPath('/rules')) || []; } catch (error) { state.adguardRules = []; } this.render(); }, render() { renderRuleTable(elements.adguardRulesTbody, state.adguardRules, 'adguard'); }, };
+    const adguardManager = {
+        tags: [],
+        path(tag, suffix = '') { return `/plugins/${tag}${suffix}`; },
+        primaryTag() { return this.tags[0] || ''; },
+        async discover() {
+            const plugins = await api.fetch('/api/v1/plugins');
+            this.tags = (Array.isArray(plugins) ? plugins : [])
+                .filter(plugin => plugin.type === 'adguard_rule')
+                .map(plugin => plugin.tag)
+                .sort((a, b) => a.localeCompare(b));
+            return this.tags;
+        },
+        async load() {
+            try {
+                await this.discover();
+                const results = await Promise.allSettled(this.tags.map(tag => api.fetch(this.path(tag, '/rules'))));
+                state.adguardRules = results.flatMap((result, index) => result.status === 'fulfilled' && Array.isArray(result.value)
+                    ? result.value.map(rule => ({ ...rule, _pluginTag: this.tags[index] }))
+                    : []);
+            } catch (error) {
+                this.tags = [];
+                state.adguardRules = [];
+            }
+            this.render();
+        },
+        render() { renderRuleTable(elements.adguardRulesTbody, state.adguardRules, 'adguard'); },
+    };
     const diversionManager = {
         availablePluginTags: new Set(),
         sdSetInstanceMap: {

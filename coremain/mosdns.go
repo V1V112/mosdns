@@ -49,7 +49,8 @@ type Mosdns struct {
 	logger *zap.Logger // non-nil logger.
 
 	// Plugins
-	plugins map[string]any
+	plugins     map[string]any
+	pluginTypes map[string]string
 
 	httpMux         *chi.Mux
 	metricsReg      *prometheus.Registry
@@ -76,7 +77,8 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 
 	m := &Mosdns{
 		logger:     lg,
-		plugins:    make(map[string]any),
+		plugins:     make(map[string]any),
+		pluginTypes: make(map[string]string),
 		httpMux:    chi.NewRouter(),
 		metricsReg: newMetricsReg(),
 		sc:         safe_close.NewSafeClose(),
@@ -188,7 +190,8 @@ func NewTestMosdnsWithPlugins(p map[string]any) *Mosdns {
 	return &Mosdns{
 		logger:     mlog.Nop(),
 		httpMux:    chi.NewRouter(),
-		plugins:    p,
+		plugins:     p,
+		pluginTypes: make(map[string]string),
 		metricsReg: newMetricsReg(),
 		sc:         safe_close.NewSafeClose(),
 	}
@@ -437,6 +440,7 @@ func (m *Mosdns) loadPresetPlugins() error {
 			return fmt.Errorf("failed to init preset plugin %s, %w", tag, err)
 		}
 		m.plugins[tag] = p
+		m.pluginTypes[tag] = "preset"
 	}
 	return nil
 }
