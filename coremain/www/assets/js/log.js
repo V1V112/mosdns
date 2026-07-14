@@ -705,10 +705,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     .filter(plugin => plugin.type === profile.tag)
                     .map(plugin => ({ ...profile, type: profile.tag, tag: plugin.tag })));
                 if (this.activeProfiles.length === 0) {
-                    elements.featureSwitchesModule.style.display = 'none';
+                    elements.featureSwitchesModule.hidden = true;
                     return;
                 }
-                elements.featureSwitchesModule.style.display = '';
+                elements.featureSwitchesModule.hidden = false;
                 const fetchPromises = this.activeProfiles.map(p => api.fetch(`/plugins/${encodeURIComponent(p.tag)}/show`, { signal }));
                 const results = await Promise.allSettled(fetchPromises);
 
@@ -732,7 +732,7 @@ document.addEventListener('DOMContentLoaded', () => {
         render() {
             const coreProfile = (this.activeProfiles || []).find(profile => profile.type === 'switch3');
             const coreStatus = coreProfile ? state.featureSwitches[coreProfile.tag] : 'error';
-            if (elements.coreModeControl) elements.coreModeControl.style.display = coreProfile ? '' : 'none';
+            if (elements.coreModeControl) elements.coreModeControl.hidden = !coreProfile;
             const coreModeLabel = document.getElementById('core-mode-label');
             if (coreModeLabel && coreProfile) coreModeLabel.textContent = `${coreProfile.tag} 模式`;
             elements.coreModeSwitchGroup.querySelectorAll('button').forEach(btn => {
@@ -4607,6 +4607,7 @@ document.addEventListener('DOMContentLoaded', function () {
             // 获取最新模块列表并过滤
             var allModules = grid.querySelectorAll('.control-module');
             allModules.forEach(function (mod) {
+                if (mod.hidden) return;
                 var modCat = mod.dataset.category;
                 if (category === 'all' || modCat === category) {
                     mod.style.display = '';
