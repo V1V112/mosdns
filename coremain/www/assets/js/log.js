@@ -121,12 +121,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateIntervalInput: document.getElementById('update-interval-input'),
         updateHintText: document.getElementById('update-hint-text'),
 
-        fakeipDomainCount: document.getElementById('fakeip-domain-count'),
-        realipDomainCount: document.getElementById('realip-domain-count'),
-        nov4DomainCount: document.getElementById('nov4-domain-count'),
-        nov6DomainCount: document.getElementById('nov6-domain-count'),
-        totalDomainCount: document.getElementById('total-domain-count'), 
-        backupDomainCount: document.getElementById('backup-domain-count'),
+        domainStatsTbody: document.getElementById('domain-stats-tbody'),
 
         saveShuntRulesBtn: document.getElementById('save-shunt-rules-btn'),
         clearShuntRulesBtn: document.getElementById('clear-shunt-rules-btn'),
@@ -2461,41 +2456,31 @@ function renderRuleTable(tbody, rules, mode) {
     }
 
     async function updateDomainListStats(signal) {
-        const listMap = {
-            fakeip: { element: elements.fakeipDomainCount, endpoint: '/plugins/my_fakeiplist/show' },
-            realip: { element: elements.realipDomainCount, endpoint: '/plugins/my_realiplist/show' },
-            nov4: { element: elements.nov4DomainCount, endpoint: '/plugins/my_nov4list/show' },
-            nov6: { element: elements.nov6DomainCount, endpoint: '/plugins/my_nov6list/show' },
-            total: { element: elements.totalDomainCount, endpoint: '/plugins/top_domains/show' },
-        };
-
-        for (const key of Object.keys(listMap)) {
-            const { element, endpoint } = listMap[key];
-            try {
-                // 使用 api.fetch 获取带 Header 的结果，并加上 limit=1 极大地减少网络开销
-                const res = await api.fetch(endpoint + '?limit=1', { signal });
-                if (res && typeof res === 'object' && res.totalCount !== undefined) {
-                    element.textContent = res.totalCount.toLocaleString();
-                } else {
-                    // 兜底逻辑：如果 Header 获取失败，尝试原来的流式计数（由于后端限制，此时可能仍显示 100）
-                    const count = await countLinesStreaming(endpoint, signal);
-                    element.textContent = count.toLocaleString();
-                }
-            } catch (e) {
-                if (e.name !== 'AbortError') element.textContent = '获取失败';
-            }
-        }
-
+        const tbody = elements.domainStatsTbody;
+        if (!tbody) return;
         try {
-            const status = state.requery.status;
-            if (status && typeof status.last_run_domain_count === 'number') {
-                elements.backupDomainCount.textContent = `${status.last_run_domain_count.toLocaleString()} 条`;
-                elements.backupDomainCount.style.color = 'var(--color-accent-primary)';
-            } else {
-                elements.backupDomainCount.textContent = '--';
+            const tags = await pluginRegistry.tags('domain_output');
+            if (tags.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="2" class="text-center">当前配置未加载 domain_output 插件</td></tr>';
+                return;
             }
-        } catch (e) {
-            elements.backupDomainCount.textContent = '--';
+            const results = await Promise.allSettled(tags.map(async tag => {
+                const endpoint = `/plugins/${encodeURIComponent(tag)}/show`;
+                const result = await api.fetch(endpoint + '?limit=1', { signal });
+                const count = result && typeof result === 'object' && result.totalCount !== undefined
+                    ? result.totalCount : await countLinesStreaming(endpoint, signal);
+                return { tag, count };
+            }));
+            tbody.innerHTML = results.map((result, index) => {
+                const tag = tags[index];
+                if (result.status !== 'fulfilled') {
+                    return `<tr><td><strong>${escapeHTML(tag)}</strong><br><small>domain_output</small></td><td class="text-right">获取失败</td></tr>`;
+                }
+                return `<tr><td><strong>${escapeHTML(tag)}</strong><br><small>domain_output</small></td>
+                    <td class="text-right"><a href="#" class="control-item-link" data-output-tag="${escapeHTML(tag)}" data-list-title="${escapeHTML(tag)}">${result.value.count.toLocaleString()}</a></td></tr>`;
+            }).join('');
+        } catch (error) {
+            if (error.name !== 'AbortError') tbody.innerHTML = '<tr><td colspan="2" class="text-center">加载域名列表统计失败</td></tr>';
         }
     }
 
@@ -2612,7 +2597,7 @@ function renderRuleTable(tbody, rules, mode) {
     }
 
     async function openDataViewModal(config, isLoadMore = false) {
-        const { listType, cacheTag, title } = config;
+        const { outputTag, cacheTag, title } = config;
         if (!isLoadMore) {
             state.dataView.currentOffset = 0;
             state.dataView.rawEntries = [];
@@ -2634,9 +2619,8 @@ function renderRuleTable(tbody, rules, mode) {
             const limit = state.dataView.currentLimit;
             let result;
             let viewType = 'domain';
-            if (listType) {
-                const endpointMap = { fakeip: '/plugins/my_fakeiplist/show', realip: '/plugins/my_realiplist/show', nov4: '/plugins/my_nov4list/show', nov6: '/plugins/my_nov6list/show', total: '/plugins/top_domains/show' };
-                result = await api.fetch(`${endpointMap[listType]}?q=${q}&offset=${offset}&limit=${limit}`);
+            if (outputTag) {
+                result = await api.fetch(`/plugins/${encodeURIComponent(outputTag)}/show?q=${q}&offset=${offset}&limit=${limit}`);
                 viewType = 'domain';
             } else if (cacheTag) {
                 result = await api.fetch(`/plugins/${cacheTag}/show?q=${q}&offset=${offset}&limit=${limit}`);
@@ -4289,14 +4273,14 @@ const handleInteractiveClick = (e) => {
 
 
         document.body.addEventListener('click', (e) => {
-            const domainListLink = e.target.closest('a.control-item-link[data-list-type]');
+            const domainListLink = e.target.closest('a.control-item-link[data-output-tag]');
             const cacheListLink = e.target.closest('a.control-item-link[data-cache-tag]');
             const clearCacheBtn = e.target.closest('.clear-cache-btn[data-cache-tag]');
 
             if (domainListLink) {
                 e.preventDefault();
                 openDataViewModal({
-                    listType: domainListLink.dataset.listType,
+                    outputTag: domainListLink.dataset.outputTag,
                     title: domainListLink.dataset.listTitle
                 });
             } else if (cacheListLink) {
