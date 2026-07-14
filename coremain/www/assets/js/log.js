@@ -3637,26 +3637,31 @@ renderReplacementsTable() {
         },
 
         parseMetrics(rawText) {
-            const parse = (prefix) => {
-                const regex = new RegExp(`${prefix}\\{[^}]*metrics_tag="([^"]+)"[^}]*tag="([^"]+)"[^}]*\\} ([0-9.eE+-]+)`, 'g');
+            const parse = (prefix, groupLabel, upstreamLabel) => {
+                const regex = new RegExp(`^${prefix}\\{([^}]*)\\}\\s+([0-9.eE+-]+)$`, 'gm');
                 const map = {};
                 let match;
                 while ((match = regex.exec(rawText)) !== null) {
-                    const group = match[1];
-                    const name = match[2];
-                    const val = parseFloat(match[3]);
+                    const labels = {};
+                    match[1].replace(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"])*)"/g, (_, key, value) => { labels[key] = value; });
+                    const group = labels[groupLabel];
+                    const name = labels[upstreamLabel];
+                    if (!group || !name) continue;
+                    const val = parseFloat(match[2]);
                     const key = `${group}|${name}`;
                     map[key] = val;
                 }
                 return map;
             };
 
+            const merge = (...maps) => Object.assign({}, ...maps);
+
             this.state.metrics = { 
-                latSum: parse('mosdns_aliapi_response_latency_millisecond_sum'),
-                latCount: parse('mosdns_aliapi_response_latency_millisecond_count'),
-                queryTotal: parse('mosdns_aliapi_query_total'),
-                errorTotal: parse('mosdns_aliapi_error_total'),
-                winnerTotal: parse('mosdns_aliapi_upstream_winner_total')
+                latSum: merge(parse('mosdns_aliapi_response_latency_millisecond_sum', 'metrics_tag', 'tag'), parse('mosdns_forward_response_latency_millisecond_sum', 'tag', 'upstream')),
+                latCount: merge(parse('mosdns_aliapi_response_latency_millisecond_count', 'metrics_tag', 'tag'), parse('mosdns_forward_response_latency_millisecond_count', 'tag', 'upstream')),
+                queryTotal: merge(parse('mosdns_aliapi_query_total', 'metrics_tag', 'tag'), parse('mosdns_forward_query_total', 'tag', 'upstream')),
+                errorTotal: merge(parse('mosdns_aliapi_error_total', 'metrics_tag', 'tag'), parse('mosdns_forward_err_total', 'tag', 'upstream')),
+                winnerTotal: parse('mosdns_aliapi_upstream_winner_total', 'metrics_tag', 'tag')
             };
         },
 

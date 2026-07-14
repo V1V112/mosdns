@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/IrineSistiana/mosdns/v5/mlog"
@@ -52,7 +53,18 @@ type GlobalUpstreamOverrides map[string][]UpstreamOverrideConfig
 var (
 	upstreamOverridesLock sync.RWMutex
 	upstreamOverrides     GlobalUpstreamOverrides
+	upstreamDefaults      = make(GlobalUpstreamOverrides)
+	upstreamPluginTypes   = make(map[string]string)
 )
+
+// RegisterUpstreamDefaults publishes a loaded upstream plugin's effective
+// YAML defaults. Saved UI overrides remain authoritative on the next restart.
+func RegisterUpstreamDefaults(pluginTag, pluginType string, upstreams []UpstreamOverrideConfig) {
+	upstreamOverridesLock.Lock()
+	defer upstreamOverridesLock.Unlock()
+	upstreamPluginTypes[pluginTag] = pluginType
+	upstreamDefaults[pluginTag] = upstreams
+}
 
 // RegisterUpstreamAPI 注册路由
 func RegisterUpstreamAPI(router *chi.Mux) {
@@ -169,10 +181,13 @@ func saveUpstreamOverrides() error {
 // handleGetAliAPITags 获取扫描到的插件 Tag
 func handleGetAliAPITags(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	tags := discoveredAliAPITags
-	if tags == nil {
-		tags = []string{}
+	upstreamOverridesLock.RLock()
+	tags := make([]string, 0, len(upstreamPluginTypes))
+	for tag := range upstreamPluginTypes {
+		tags = append(tags, tag)
 	}
+	sort.Strings(tags)
+	upstreamOverridesLock.RUnlock()
 	// DEBUG
 	mlog.L().Info("[Debug UpstreamAPI] API Request: Get Tags", zap.Strings("returning", tags))
 	json.NewEncoder(w).Encode(tags)
@@ -186,9 +201,12 @@ func handleGetUpstreamConfig(w http.ResponseWriter, r *http.Request) {
 	upstreamOverridesLock.RLock()
 	defer upstreamOverridesLock.RUnlock()
 	
-	safeData := upstreamOverrides
-	if safeData == nil {
-		safeData = make(GlobalUpstreamOverrides)
+	safeData := make(GlobalUpstreamOverrides, len(upstreamDefaults)+len(upstreamOverrides))
+	for tag, entries := range upstreamDefaults {
+		safeData[tag] = entries
+	}
+	for tag, entries := range upstreamOverrides {
+		safeData[tag] = entries
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(safeData)

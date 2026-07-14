@@ -93,6 +93,25 @@ type UpstreamConfig struct {
 
 func Init(bp *coremain.BP, args any) (any, error) {
 	a := args.(*Args)
+	defaults := make([]coremain.UpstreamOverrideConfig, 0, len(a.Upstreams))
+	for _, u := range a.Upstreams {
+		protocol := protocolFromAddr(u.Addr)
+		if u.Type == "aliapi" {
+			protocol = "aliapi"
+		}
+		defaults = append(defaults, coremain.UpstreamOverrideConfig{
+			Tag: u.Tag, Enabled: true, Protocol: protocol, Addr: u.Addr,
+			DialAddr: u.DialAddr, IdleTimeout: u.IdleTimeout,
+			UpstreamQueryTimeout: u.UpstreamQueryTimeout, EnablePipeline: u.EnablePipeline,
+			EnableHTTP3: u.EnableHTTP3, InsecureSkipVerify: u.InsecureSkipVerify,
+			Socks5: u.Socks5, SoMark: u.SoMark, BindToDevice: u.BindToDevice,
+			Bootstrap: u.Bootstrap, BootstrapVer: u.BootstrapVer,
+			AccountID: a.AccountID, AccessKeyID: a.AccessKeyID,
+			AccessKeySecret: a.AccessKeySecret, ServerAddr: a.ServerAddr,
+			EcsClientIP: a.EcsClientIP, EcsClientMask: a.EcsClientMask,
+		})
+	}
+	coremain.RegisterUpstreamDefaults(bp.Tag(), PluginType, defaults)
 	
 	// [Debug] Log entry
 	bp.L().Info("[Debug AliAPI] Init plugin instance", zap.String("plugin_tag", bp.Tag()))
@@ -170,6 +189,22 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+func protocolFromAddr(addr string) string {
+	lower := strings.ToLower(addr)
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		return "https"
+	case strings.HasPrefix(lower, "tls://"):
+		return "tls"
+	case strings.HasPrefix(lower, "quic://"):
+		return "quic"
+	case strings.HasPrefix(lower, "tcp://"):
+		return "tcp"
+	default:
+		return "udp"
+	}
 }
 
 // applyUpstreamOverrides 负责根据本地 JSON 文件内容动态修改插件运行参数
