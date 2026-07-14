@@ -1001,7 +1001,10 @@
             'GC 累计耗时': 'fa-stopwatch', '上次 GC 时间': 'fa-clock', 'Go 版本': 'fa-code-branch', '线程数': 'fa-sitemap',
             '打开文件描述符': 'fa-folder-open', '实时 QPS': 'fa-gauge-high', '错误 QPS': 'fa-triangle-exclamation',
             '累计上游请求': 'fa-arrow-up-right-dots', '累计上游错误': 'fa-circle-exclamation', '上游错误率': 'fa-percent',
-            '当前并发': 'fa-code-fork', '平均响应延迟': 'fa-stopwatch', '上游标识': 'fa-network-wired'
+            '当前并发': 'fa-code-fork', '平均响应延迟': 'fa-stopwatch', '上游标识': 'fa-network-wired',
+            '检查总数': 'fa-magnifying-glass', '拦截次数': 'fa-shield-halved', '放行次数': 'fa-circle-check',
+            '未命中次数': 'fa-circle-minus', '广告拦截率': 'fa-percent', '当前规则数': 'fa-list-check',
+            '规则重载次数': 'fa-rotate', '重载失败次数': 'fa-triangle-exclamation', '平均匹配耗时': 'fa-stopwatch'
         };
 
         const switchProfiles = [
@@ -1248,6 +1251,28 @@
             });
         }
 
+        function parseAdguardMetrics(metricsText) {
+            const plugins = new Map();
+            const pattern = /^mosdns_adguard_(query_total|blocked_total|allowed_total|miss_total|rules_current|reload_total|reload_failed_total|match_duration_seconds_(?:sum|count))\{([^}]*)\}\s+([^\s]+)/gm;
+            let match;
+            while ((match = pattern.exec(metricsText)) !== null) {
+                const labels = parsePrometheusLabels(match[2]);
+                if (!labels.tag) continue;
+                const item = plugins.get(labels.tag) || { tag: labels.tag, query_total: 0, blocked_total: 0, allowed_total: 0, miss_total: 0, rules_current: 0, reload_total: 0, reload_failed_total: 0, match_duration_sum: 0, match_duration_count: 0 };
+                const value = Number.parseFloat(match[3]);
+                if (!Number.isFinite(value)) continue;
+                if (match[1] === 'match_duration_seconds_sum') item.match_duration_sum = value;
+                else if (match[1] === 'match_duration_seconds_count') item.match_duration_count = value;
+                else item[match[1]] = value;
+                plugins.set(labels.tag, item);
+            }
+            return [...plugins.values()].sort((a, b) => a.tag.localeCompare(b.tag)).map(item => ({
+                ...item,
+                block_rate: item.query_total > 0 ? `${(item.blocked_total / item.query_total * 100).toFixed(2)}%` : '0.00%',
+                avg_match_duration: item.match_duration_count > 0 ? `${(item.match_duration_sum / item.match_duration_count * 1000).toFixed(3)} ms` : '0.000 ms'
+            }));
+        }
+
         async function fetchData() {
             if (isRefreshing) return null;
             isRefreshing = true;
@@ -1257,7 +1282,7 @@
                 if (!response.ok) throw new Error(`网络响应错误: ${response.statusText} (${response.status})`);
                 const text = await response.text();
                 syncDiscoveredCacheConfig(text);
-                const data = { caches: {}, system: {}, upstreams: parseUpstreamMetrics(text) };
+                const data = { caches: {}, system: {}, upstreams: parseUpstreamMetrics(text), adguard: parseAdguardMetrics(text) };
                 const systemMetrics = parseSystemMetrics(text);
                 
                 cacheOrder.forEach(key => {
@@ -1352,6 +1377,48 @@
             });
         }
 
+        function renderAdguardCards(plugins) {
+            const mainContent = getById('main-content');
+            const activeTags = new Set(plugins.map(item => item.tag));
+            mainContent.querySelectorAll('.card[data-adguard-tag]').forEach(card => {
+                if (!activeTags.has(card.dataset.adguardTag)) card.remove();
+            });
+            plugins.forEach(item => {
+                let card = [...mainContent.querySelectorAll('.card[data-adguard-tag]')].find(element => element.dataset.adguardTag === item.tag);
+                if (!card) {
+                    card = createElement('div', 'card visible');
+                    card.dataset.adguardTag = item.tag;
+                    const heading = createElement('h2');
+                    heading.append(createElement('i', 'fas fa-shield-halved'), createElement('span', 'title-text'), createElement('span', 'status-dot status-green'));
+                    card.append(heading, createElement('div', 'card-title-gradient-bar'), createElement('div', 'metrics-container'));
+                    mainContent.appendChild(card);
+                }
+                card.querySelector('.title-text').innerText = `AdGuard · ${item.tag}`;
+                const metrics = [
+                    { label: '检查总数', numericValue: item.query_total },
+                    { label: '拦截次数', numericValue: item.blocked_total },
+                    { label: '放行次数', numericValue: item.allowed_total },
+                    { label: '未命中次数', numericValue: item.miss_total },
+                    { label: '广告拦截率', value: item.block_rate, accent: true },
+                    { label: '当前规则数', numericValue: item.rules_current },
+                    { label: '规则重载次数', numericValue: item.reload_total },
+                    { label: '重载失败次数', numericValue: item.reload_failed_total },
+                    { label: '平均匹配耗时', value: item.avg_match_duration }
+                ];
+                const container = card.querySelector('.metrics-container');
+                container.innerHTML = '';
+                metrics.forEach(metric => {
+                    const wrapper = createElement('div', 'metric-item');
+                    const label = createElement('div', 'metric-label');
+                    label.innerHTML = `<i class="fas ${iconMap[metric.label] || 'fa-question-circle'}"></i> <span>${metric.label}</span>`;
+                    const value = createElement('div', `metric-value${metric.accent ? ' accent' : ''}`);
+                    value.innerText = metric.numericValue !== undefined ? formatNumber(metric.numericValue) : metric.value;
+                    wrapper.append(label, value);
+                    container.appendChild(wrapper);
+                });
+            });
+        }
+
         async function refreshData(forceRebuild = false, updateCharts = false) {
             await updateCoreModeStatus();
             const data = await fetchData();
@@ -1411,6 +1478,7 @@
                 }
             });
             renderUpstreamCards(data.upstreams || []);
+            renderAdguardCards(data.adguard || []);
             updateMetrics('metrics-system', [{ label: '启动时间', value: data.system.start_time }, { label: 'CPU 时间', value: data.system.cpu_time }, { label: '常驻内存 (RSS)', value: data.system.resident_memory }, { label: '系统累计接收流量', value: data.system.net_recv }, { label: '系统累计发送流量', value: data.system.net_send }, { label: 'GC 次数', value: data.system.gc_count }, { label: 'GC 累计耗时', value: data.system.gc_sum }, { label: '上次 GC 时间', value: data.system.last_gc_time }, { label: 'Go 版本', value: data.system.go_version, accent: true }, { label: '线程数', numericValue: data.system.threads }, { label: '打开文件描述符', numericValue: data.system.open_fds }, ]);
             const lastUpdatedEl = getById('last_updated');
             if(lastUpdatedEl) lastUpdatedEl.innerHTML = `<i class="fas fa-clock"></i> 最后更新: ${new Date().toLocaleTimeString()}`;

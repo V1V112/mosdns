@@ -24,6 +24,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/net/proxy"
 )
 
@@ -88,6 +89,15 @@ type AdguardRule struct {
 	httpClient   *http.Client
 	reloadID     atomic.Uint64
 
+	queryTotal    prometheus.Counter
+	blockedTotal  prometheus.Counter
+	allowedTotal  prometheus.Counter
+	missTotal     prometheus.Counter
+	rulesCurrent  prometheus.Gauge
+	reloadTotal   prometheus.Counter
+	reloadFailed  prometheus.Counter
+	matchDuration prometheus.Histogram
+
 	// 用于优雅关闭
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -95,6 +105,35 @@ type AdguardRule struct {
 	// 新增：订阅者支持
 	subscribers []func()
 	subsMu      sync.RWMutex
+}
+
+func (p *AdguardRule) initMetrics(tag string) {
+	labels := prometheus.Labels{"tag": tag}
+	p.queryTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "query_total", Help: "Total number of domains checked by AdGuard rules.", ConstLabels: labels})
+	p.blockedTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "blocked_total", Help: "Total number of domains blocked by AdGuard rules.", ConstLabels: labels})
+	p.allowedTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "allowed_total", Help: "Total number of domains explicitly allowed by AdGuard exception rules.", ConstLabels: labels})
+	p.missTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "miss_total", Help: "Total number of domains not matched by AdGuard rules.", ConstLabels: labels})
+	p.rulesCurrent = prometheus.NewGauge(prometheus.GaugeOpts{Name: "rules_current", Help: "Current number of active AdGuard rules.", ConstLabels: labels})
+	p.reloadTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "reload_total", Help: "Total number of AdGuard rule reload attempts.", ConstLabels: labels})
+	p.reloadFailed = prometheus.NewCounter(prometheus.CounterOpts{Name: "reload_failed_total", Help: "Total number of AdGuard rule reloads with one or more errors.", ConstLabels: labels})
+	p.matchDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:        "match_duration_seconds",
+		Help:        "AdGuard domain matching duration in seconds.",
+		ConstLabels: labels,
+		Buckets:     prometheus.ExponentialBuckets(0.000001, 5, 9),
+	})
+}
+
+func (p *AdguardRule) registerMetricsTo(r prometheus.Registerer) error {
+	for _, collector := range []prometheus.Collector{
+		p.queryTotal, p.blockedTotal, p.allowedTotal, p.missTotal,
+		p.rulesCurrent, p.reloadTotal, p.reloadFailed, p.matchDuration,
+	} {
+		if err := r.Register(collector); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // 确保实现了必要的接口
@@ -234,6 +273,11 @@ func newAdguardRule(bp *coremain.BP, args any) (any, error) {
 		cancel:       cancel,
 		subscribers:  make([]func(), 0),
 	}
+	p.initMetrics(bp.Tag())
+	if err := p.registerMetricsTo(prometheus.WrapRegistererWithPrefix("adguard_", bp.M().GetMetricsReg())); err != nil {
+		cancel()
+		return nil, fmt.Errorf("adguard_rule: failed to register metrics: %w", err)
+	}
 
 	if err := p.loadConfig(); err != nil {
 		log.Printf("[adguard_rule] failed to load config file: %v. Starting with empty config.", err)
@@ -280,17 +324,24 @@ func (p *AdguardRule) GetDomainMatcher() domain.Matcher[struct{}] {
 
 // Match 实现了 domain.Matcher 接口
 func (p *AdguardRule) Match(domainStr string) (value struct{}, ok bool) {
+	p.queryTotal.Inc()
+	timer := prometheus.NewTimer(p.matchDuration)
+	defer timer.ObserveDuration()
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	if _, matched := p.allowMatcher.Match(domainStr); matched {
+		p.allowedTotal.Inc()
 		return struct{}{}, false
 	}
 
 	if _, matched := p.denyMatcher.Match(domainStr); matched {
+		p.blockedTotal.Inc()
 		return struct{}{}, true
 	}
 
+	p.missTotal.Inc()
 	return struct{}{}, false
 }
 
@@ -356,6 +407,8 @@ func (p *AdguardRule) saveConfig() error {
 func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
+	p.reloadTotal.Inc()
+	var reloadFailed atomic.Bool
 
 	log.Println("[adguard_rule] starting to reload all rules...")
 
@@ -380,6 +433,7 @@ func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 					downloadCtx, cancel := context.WithTimeout(ctx, downloadTimeout)
 					defer cancel()
 					if err := p.downloadRule(downloadCtx, ruleID); err != nil {
+						reloadFailed.Store(true)
 						log.Printf("[adguard_rule] ERROR: failed to download rule on initial load: %v", err)
 					}
 				}(rule.ID)
@@ -398,6 +452,7 @@ func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 	for _, rule := range enabledRules {
 		file, err := os.Open(rule.localPath)
 		if err != nil {
+			reloadFailed.Store(true)
 			log.Printf("[adguard_rule] WARN: skipping enabled rule '%s', cannot open local file %s: %v", rule.Name, rule.localPath, err)
 			continue
 		}
@@ -407,6 +462,7 @@ func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 		file.Close() // 确保文件句柄被关闭
 
 		if err != nil {
+			reloadFailed.Store(true)
 			log.Printf("[adguard_rule] ERROR: failed to parse rule file for '%s' (%s): %v", rule.Name, rule.localPath, err)
 		}
 		totalRuleCount += count
@@ -416,6 +472,10 @@ func (p *AdguardRule) reloadAllRules(ctx context.Context, initialLoad bool) {
 	p.allowMatcher = newAllowMatcher
 	p.denyMatcher = newDenyMatcher
 	p.mu.Unlock()
+	p.rulesCurrent.Set(float64(totalRuleCount))
+	if reloadFailed.Load() {
+		p.reloadFailed.Inc()
+	}
 
 	log.Printf("[adguard_rule] finished reloading. Total active rules from enabled lists: %d", totalRuleCount)
 	
