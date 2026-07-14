@@ -440,7 +440,9 @@ func (m *Mosdns) loadPresetPlugins() error {
 			return fmt.Errorf("failed to init preset plugin %s, %w", tag, err)
 		}
 		m.plugins[tag] = p
-		m.pluginTypes[tag] = "preset"
+		// Preset plugins expose their registered kind so callers can discover
+		// them even when an instance tag is renamed.
+		m.pluginTypes[tag] = tag
 	}
 	return nil
 }

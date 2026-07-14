@@ -159,21 +159,42 @@ document.addEventListener('DOMContentLoaded', () => {
     };
     let toastTimeout;
 
-    const SHUNT_RULE_SAVE_PATHS = ['top_domains/save', 'my_fakeiplist/save', 'my_nodenov4list/save', 'my_nodenov6list/save', 'my_notinlist/save', 'my_nov4list/save', 'my_nov6list/save', 'my_realiplist/save'];
-    const SHUNT_RULE_FLUSH_PATHS = ['top_domains/flush', 'my_fakeiplist/flush', 'my_nodenov4list/flush', 'my_nodenov6list/flush', 'my_notinlist/flush', 'my_nov4list/flush', 'my_nov6list/flush', 'my_realiplist/flush'];
-
     const debounce = (func, wait) => { let timeout; return function executedFunction(...args) { const later = () => { clearTimeout(timeout); func(...args); }; clearTimeout(timeout); timeout = setTimeout(later, wait); }; };
 
     // 轻量级请求器 + /metrics 简易缓存，减少同一时段的重复请求
     let __metricsInflight = null; let __metricsStamp = 0;
-    const api = { fetch: async (url, options = {}) => { try { const response = await fetch(url, { ...options, signal: options.signal }); if (!response.ok) { let errorMsg = `API Error: ${response.status} ${response.statusText}`; try { const errorBody = await response.json(); if (errorBody && errorBody.error) { errorMsg = errorBody.error; } } catch (e) { try { errorMsg = await response.text() || errorMsg; } catch (textErr) { } } if (response.status !== 404) { ui.showToast(errorMsg, 'error'); } throw new Error(errorMsg); } const tc = response.headers.get('X-Total-Count'); const ct = response.headers.get('content-type'); const data = (ct && ct.includes('application/json')) ? await response.json() : await response.text(); return tc !== null ? { body: data, totalCount: parseInt(tc, 10) } : data; } catch (error) { if (error.name !== 'AbortError') { console.error(error); } throw error; } }, getStatus: (signal) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/status`, { signal }), getCapacity: (signal) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/capacity`, { signal }), start: () => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/start`, { method: 'POST' }), stop: () => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/stop`, { method: 'POST' }), clear: () => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/clear`, { method: 'POST' }), setCapacity: (capacity) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/capacity`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ capacity: parseInt(capacity, 10) }) }), getMetrics: (signal) => { const now = Date.now(); if (__metricsInflight && (now - __metricsStamp) < 3000) return __metricsInflight; __metricsInflight = api.fetch('/metrics', { signal }); __metricsStamp = now; return __metricsInflight; }, getCoreMode: (signal) => api.fetch('/plugins/switch3/show', { signal }), clearCache: (cacheTag) => api.fetch(`/plugins/${cacheTag}/flush`), getCacheContents: (cacheTag, signal) => api.fetch(`/plugins/${cacheTag}/show`, { signal }), v2: { getStats: (signal) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/stats`, { signal }), getTopDomains: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/domain?limit=${limit}`, { signal }), getTopClients: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/client?limit=${limit}`, { signal }), getSlowest: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/slowest?limit=${limit}`, { signal }), getDomainSetRank: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/domain_set?limit=${limit}`, { signal }), getLogs: (signal, params = {}) => { const queryParams = new URLSearchParams({ page: 1, limit: CONSTANTS.LOGS_PER_PAGE, ...params }); for (let [key, value] of queryParams.entries()) { if (!value) { queryParams.delete(key); } } return api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/logs?${queryParams}`, { signal }); } } };
+    const api = { fetch: async (url, options = {}) => { try { const response = await fetch(url, { ...options, signal: options.signal }); if (!response.ok) { let errorMsg = `API Error: ${response.status} ${response.statusText}`; try { const errorBody = await response.json(); if (errorBody && errorBody.error) { errorMsg = errorBody.error; } } catch (e) { try { errorMsg = await response.text() || errorMsg; } catch (textErr) { } } if (response.status !== 404) { ui.showToast(errorMsg, 'error'); } throw new Error(errorMsg); } const tc = response.headers.get('X-Total-Count'); const ct = response.headers.get('content-type'); const data = (ct && ct.includes('application/json')) ? await response.json() : await response.text(); return tc !== null ? { body: data, totalCount: parseInt(tc, 10) } : data; } catch (error) { if (error.name !== 'AbortError') { console.error(error); } throw error; } }, getStatus: (signal) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/status`, { signal }), getCapacity: (signal) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/capacity`, { signal }), start: () => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/start`, { method: 'POST' }), stop: () => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/stop`, { method: 'POST' }), clear: () => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/clear`, { method: 'POST' }), setCapacity: (capacity) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v1/audit/capacity`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ capacity: parseInt(capacity, 10) }) }), getMetrics: (signal) => { const now = Date.now(); if (__metricsInflight && (now - __metricsStamp) < 3000) return __metricsInflight; __metricsInflight = api.fetch('/metrics', { signal }); __metricsStamp = now; return __metricsInflight; }, clearCache: (cacheTag) => api.fetch(`/plugins/${encodeURIComponent(cacheTag)}/flush`), getCacheContents: (cacheTag, signal) => api.fetch(`/plugins/${cacheTag}/show`, { signal }), v2: { getStats: (signal) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/stats`, { signal }), getTopDomains: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/domain?limit=${limit}`, { signal }), getTopClients: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/client?limit=${limit}`, { signal }), getSlowest: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/slowest?limit=${limit}`, { signal }), getDomainSetRank: (signal, limit = 50) => api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/rank/domain_set?limit=${limit}`, { signal }), getLogs: (signal, params = {}) => { const queryParams = new URLSearchParams({ page: 1, limit: CONSTANTS.LOGS_PER_PAGE, ...params }); for (let [key, value] of queryParams.entries()) { if (!value) { queryParams.delete(key); } } return api.fetch(`${CONSTANTS.API_BASE_URL}/api/v2/audit/logs?${queryParams}`, { signal }); } } };
+
+    const pluginRegistry = {
+        plugins: null,
+        pending: null,
+        async load(force = false) {
+            if (!force && this.plugins) return this.plugins;
+            if (!force && this.pending) return this.pending;
+            this.pending = api.fetch('/api/v1/plugins').then(items => {
+                this.plugins = Array.isArray(items) ? items : [];
+                this.pending = null;
+                return this.plugins;
+            }).catch(error => { this.pending = null; throw error; });
+            return this.pending;
+        },
+        async tags(type) {
+            return (await this.load()).filter(plugin => plugin.type === type).map(plugin => plugin.tag).sort((a, b) => a.localeCompare(b));
+        },
+        async tag(type) { return (await this.tags(type))[0] || ''; },
+        async path(type, suffix = '') {
+            const tag = await this.tag(type);
+            if (!tag) throw new Error(`未发现 ${type} 插件`);
+            return `/plugins/${encodeURIComponent(tag)}${suffix}`;
+        }
+    };
 
     const requeryApi = {
-        getConfig: (signal) => api.fetch(`/plugins/requery`, { signal }),
-        getStatus: (signal) => api.fetch(`/plugins/requery/status`, { signal }),
-        trigger: () => api.fetch(`/plugins/requery/trigger`, { method: 'POST' }),
-        cancel: () => api.fetch(`/plugins/requery/cancel`, { method: 'POST' }),
-        updateSchedulerConfig: (config) => api.fetch(`/plugins/requery/scheduler/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }),
+        getConfig: async (signal) => api.fetch(await pluginRegistry.path('requery'), { signal }),
+        getStatus: async (signal) => api.fetch(await pluginRegistry.path('requery', '/status'), { signal }),
+        trigger: async () => api.fetch(await pluginRegistry.path('requery', '/trigger'), { method: 'POST' }),
+        cancel: async () => api.fetch(await pluginRegistry.path('requery', '/cancel'), { method: 'POST' }),
+        updateSchedulerConfig: async (config) => api.fetch(await pluginRegistry.path('requery', '/scheduler/config'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }),
     };
 
     const updateApi = {
@@ -190,8 +211,8 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     const clientnameApi = {
-        get: () => api.fetch(`/plugins/clientname`),
-        update: (data) => api.fetch(`/plugins/clientname`, {
+        get: async () => api.fetch(await pluginRegistry.path('clientname')),
+        update: async (data) => api.fetch(await pluginRegistry.path('clientname'), {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data),
@@ -201,7 +222,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const coreApi = {
         getMode: async () => {
             try {
-                const response = await api.fetch('/plugins/switch3/show');
+                const response = await api.fetch(await pluginRegistry.path('switch3', '/show'));
                 if (typeof response === 'string') {
                     return response.trim();
                 }
@@ -2310,7 +2331,7 @@ function renderRuleTable(tbody, rules, mode) {
                     enable_regexp: Boolean(form.elements.enable_regexp?.checked),
                     update_interval_hours: parseInt(form.elements.update_interval_hours.value, 10) || 24
                 };
-                const targetPluginTag = diversionManager.sdSetInstanceMap[data.type];
+                const targetPluginTag = diversionManager.typeToTag.get(data.type) || form.dataset.sourcePluginTag;
                 if (!targetPluginTag || (diversionManager.availablePluginTags.size > 0 && !diversionManager.availablePluginTags.has(targetPluginTag))) {
                     throw new Error('当前配置不支持所选规则类型');
                 }
@@ -2373,44 +2394,31 @@ function renderRuleTable(tbody, rules, mode) {
     };
     const diversionManager = {
         availablePluginTags: new Set(),
-        sdSetInstanceMap: {
-            'geolocation-!cn@cn': 'geosite:direct',
-            'geosite:cn': 'geosite:direct',
-            'geolocation-!cn': 'geosite:overseas',
-            'geolocation-cn@!cn': 'geosite:overseas',
-            'geosite:gfw': 'geosite:gfw',
-            'geosite:ai': 'geosite:category-ai-!cn',
-            'geosite:github': 'geosite:github',
-            'geosite:onedrive': 'geosite:onedrive',
-            'geosite:pikpak': 'geosite:pikpak',
-            'geosite:pinterest': 'geosite:pinterest',
-            'geosite:cloudflare': 'geosite:cloudflare',
-            'geoip:cn': 'geoip:cn',
-            'geoip:cloudflare': 'geoip:cloudflare',
-            'nft_add': 'nft_add'
-        },
+        typeToTag: new Map(),
         resolvePluginTag(rule) {
-            return rule?._pluginTag || this.sdSetInstanceMap[rule?.type];
+            return rule?._pluginTag || this.typeToTag.get(rule?.type);
         },
         syncTypeOptions(selectedType = '') {
             const select = elements.ruleForm?.elements?.type;
             if (!select) return;
             [...select.options].forEach(option => {
                 if (!option.value) return;
-                const pluginTag = this.sdSetInstanceMap[option.value];
+                const pluginTag = this.typeToTag.get(option.value);
                 option.disabled = this.availablePluginTags.size > 0 && !this.availablePluginTags.has(pluginTag) && option.value !== selectedType;
                 option.hidden = option.disabled;
             });
         },
         async load() {
             try {
-                const pluginTags = [...new Set(Object.values(this.sdSetInstanceMap))];
+                const plugins = await pluginRegistry.load();
+                const pluginTags = plugins.filter(plugin => ['sd_set', 'si_set'].includes(plugin.type)).map(plugin => plugin.tag);
                 const promises = pluginTags.map(tag => api.fetch(`/plugins/${tag}/config`));
                 const results = await Promise.allSettled(promises);
                 this.availablePluginTags = new Set(pluginTags.filter((_, index) => results[index].status === 'fulfilled' && Array.isArray(results[index].value)));
                 state.diversionRules = results.flatMap((result, index) => result.status === 'fulfilled' && Array.isArray(result.value)
                     ? result.value.map(rule => ({ ...rule, _pluginTag: pluginTags[index] }))
                     : []);
+                this.typeToTag = new Map(state.diversionRules.filter(rule => rule.type).map(rule => [rule.type, rule._pluginTag]));
             } catch (e) {
                 this.availablePluginTags = new Set();
                 state.diversionRules = [];
@@ -2715,7 +2723,8 @@ function renderRuleTable(tbody, rules, mode) {
         ui.setLoading(elements.saveShuntRulesBtn, true);
         ui.showToast('正在后台保存所有分流规则...');
         try {
-            const requests = SHUNT_RULE_SAVE_PATHS.map(path => api.fetch(`/plugins/${path}`));
+            const tags = await pluginRegistry.tags('domain_output');
+            const requests = tags.map(tag => api.fetch(`/plugins/${encodeURIComponent(tag)}/save`));
             const results = await Promise.allSettled(requests);
 
             const failed = results.filter(r => r.status === 'rejected');
@@ -2737,7 +2746,8 @@ function renderRuleTable(tbody, rules, mode) {
         ui.setLoading(elements.clearShuntRulesBtn, true);
         ui.showToast('正在后台清空所有分流规则...');
         try {
-            const requests = SHUNT_RULE_FLUSH_PATHS.map(path => api.fetch(`/plugins/${path}`));
+            const tags = await pluginRegistry.tags('domain_output');
+            const requests = tags.map(tag => api.fetch(`/plugins/${encodeURIComponent(tag)}/flush`));
             await Promise.allSettled(requests);
             ui.showToast('所有分流规则已清空', 'success');
             await updateDomainListStats();
