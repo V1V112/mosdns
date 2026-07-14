@@ -140,6 +140,7 @@ document.addEventListener('DOMContentLoaded', () => {
         dataViewTableContainer: document.getElementById('data-view-table-container'),
 
         listMgmtNav: document.querySelector('.list-mgmt-nav'),
+        listProfileNote: document.getElementById('list-profile-note'),
         listContentLoader: document.getElementById('list-content-loader'),
         listContentTextArea: document.getElementById('list-content-textarea'),
         listContentInfo: document.getElementById('list-content-info'),
@@ -289,8 +290,10 @@ document.addEventListener('DOMContentLoaded', () => {
         openRuleModal(mode, rule = null) {
             const form = elements.ruleForm;
             form.reset();
+            form.dataset.sourcePluginTag = rule?._pluginTag || '';
             elements.ruleMode.value = mode;
             const isDiversion = mode === 'diversion';
+            if (isDiversion && typeof diversionManager !== 'undefined') diversionManager.syncTypeOptions(rule?.type);
             elements.modalTitle.textContent = rule ? `修改${isDiversion ? '分流' : '拦截'}规则` : `添加${isDiversion ? '分流' : '拦截'}规则`;
             elements.ruleTypeWrapper.style.display = isDiversion ? 'block' : 'none';
             elements.ruleFilesWrapper.style.display = isDiversion ? 'block' : 'none';
@@ -2127,6 +2130,7 @@ function renderRuleTable(tbody, rules, mode) {
                 const tr = document.createElement('tr');
                 tr.dataset.ruleId = mode === 'adguard' ? rule.id : rule.name;
                 if (rule.type) tr.dataset.ruleType = rule.type;
+                if (rule._pluginTag) tr.dataset.rulePluginTag = rule._pluginTag;
 
                 const lastUpdated = rule.last_updated && !rule.last_updated.startsWith('0001-01-01') ? formatRelativeTime(rule.last_updated) : '从未';
                 
@@ -2173,6 +2177,7 @@ function renderRuleTable(tbody, rules, mode) {
                 const item = renderRuleTableRow(rule, mode);
                 item.dataset.ruleId = mode === 'adguard' ? rule.id : rule.name;
                 if (rule.type) item.dataset.ruleType = rule.type;
+                if (rule._pluginTag) item.dataset.rulePluginTag = rule._pluginTag;
                 return item;
             }
         }, mode);
@@ -2194,10 +2199,132 @@ function renderRuleTable(tbody, rules, mode) {
     }
 
     async function handleAdguardUpdateCheck() { ui.setLoading(elements.checkAdguardUpdatesBtn, true); ui.showToast('已开始在后台更新所有启用的拦截规则...'); try { await api.fetch('/plugins/adguard/update', { method: 'POST' }); ui.showToast('更新请求已发送，5秒后自动刷新列表...', 'success'); await new Promise(resolve => setTimeout(resolve, 5000)); await adguardManager.load(); ui.showToast('拦截规则列表已刷新！', 'success'); } catch (e) { } finally { ui.setLoading(elements.checkAdguardUpdatesBtn, false); } }
-    async function handleRuleTableClick(event, mode) { const target = event.target.closest('button, input.rule-enabled-toggle'); if (!target) return; const itemElement = target.closest('[data-rule-id]'); if (!itemElement) return; const id = itemElement.dataset.ruleId; const rules = mode === 'adguard' ? state.adguardRules : state.diversionRules; const rule = rules.find(r => (mode === 'adguard' ? r.id : r.name) === id); if (!rule) return; if (target.matches('.rule-edit-btn')) ui.openRuleModal(mode, rule); else if (target.matches('.rule-delete-btn')) { if (confirm(`确定要删除规则 "${rule.name}" 吗？此操作不可恢复。`)) { ui.setLoading(target, true); try { if (mode === 'adguard') await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'DELETE' }); else await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[rule.type]}/config/${id}`, { method: 'DELETE' }); ui.showToast(`规则 "${rule.name}" 已删除`); await (mode === 'adguard' ? adguardManager.load() : diversionManager.load()); } catch (e) { console.error(`Failed to delete rule ${id}:`, e); } finally { ui.setLoading(target, false); } } } else if (target.matches('.rule-update-btn')) { ui.setLoading(target, true); ui.showToast(`正在后台更新规则 "${rule.name}"...`); try { await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[rule.type]}/update/${id}`, { method: 'POST' }); ui.showToast('更新请求已发送, 5秒后自动刷新', 'success'); setTimeout(() => diversionManager.load(), 5000); } catch (e) { } finally { ui.setLoading(target, false); } } else if (target.matches('.rule-enabled-toggle')) { const updatedRule = { ...rule, enabled: target.checked }; target.disabled = true; try { if (mode === 'adguard') await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedRule) }); else await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[rule.type]}/config/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedRule) }); rule.enabled = target.checked; ui.showToast(`规则 "${rule.name}" 已${target.checked ? '启用' : '禁用'}`); } catch (error) { target.checked = !target.checked; } finally { target.disabled = false; } } }
-    async function handleRuleFormSubmit(event) { event.preventDefault(); ui.setLoading(elements.saveRuleBtn, true); const form = elements.ruleForm; const mode = form.elements['mode'].value; const id = form.elements['id'].value; try { if (mode === 'adguard') { const data = { name: form.elements['name'].value, url: form.elements['url'].value, auto_update: form.elements['auto_update'].checked, update_interval_hours: parseInt(form.elements['update_interval_hours'].value, 10) || 24 }; if (id) { const originalRule = state.adguardRules.find(r => r.id === id); await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) }); } else { await api.fetch('/plugins/adguard/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) }); } ui.showToast(`广告拦截规则${id ? '更新' : '添加'}成功`); await adguardManager.load(); } else { const data = { name: form.elements['name'].value, url: form.elements['url'].value, type: form.elements['type'].value, files: form.elements['files'].value, auto_update: form.elements['auto_update'].checked, enable_regexp: form.elements['enable_regexp'] ? form.elements['enable_regexp'].checked : false, update_interval_hours: parseInt(form.elements['update_interval_hours'].value, 10) || 24 }; const pluginTag = diversionManager.sdSetInstanceMap[data.type]; if (!pluginTag) throw new Error('无效的分流规则类型'); if (id) { const originalRule = state.diversionRules.find(r => r.name === id); if (data.name !== id) { if (!confirm(`规则名称已从 "${id}" 更改为 "${data.name}"。\n\n这将删除旧规则并创建一个新规则，确定要继续吗？`)) throw new Error('User cancelled name change.'); await api.fetch(`/plugins/${diversionManager.sdSetInstanceMap[originalRule.type]}/config/${id}`, { method: 'DELETE' }); await api.fetch(`/plugins/${pluginTag}/config/${data.name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: originalRule.enabled }) }); } else { await api.fetch(`/plugins/${pluginTag}/config/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) }); } } else { await api.fetch(`/plugins/${pluginTag}/config/${data.name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) }); } ui.showToast(`分流规则${id ? '更新' : '添加'}成功`); await diversionManager.load(); if (!id || (id && data.name !== id)) { ui.showToast('正在后台获取规则详情...'); setTimeout(() => diversionManager.load(), 5000); } } ui.closeRuleModal(); } catch (err) { console.error(`${mode} form submission failed:`, err); } finally { ui.setLoading(elements.saveRuleBtn, false); } }
+    async function handleRuleTableClick(event, mode) {
+        const target = event.target.closest('button, input.rule-enabled-toggle');
+        if (!target) return;
+        const itemElement = target.closest('[data-rule-id]');
+        if (!itemElement) return;
+        const id = itemElement.dataset.ruleId;
+        const sourceTag = itemElement.dataset.rulePluginTag;
+        const rules = mode === 'adguard' ? state.adguardRules : state.diversionRules;
+        const rule = rules.find(item => mode === 'adguard' ? item.id === id : item.name === id && (!sourceTag || item._pluginTag === sourceTag));
+        if (!rule) return;
+        if (target.matches('.rule-edit-btn')) {
+            ui.openRuleModal(mode, rule);
+            return;
+        }
+
+        const pluginTag = mode === 'adguard' ? 'adguard' : diversionManager.resolvePluginTag(rule);
+        if (!pluginTag) {
+            ui.showToast(`无法确定规则“${rule.name}”所属插件`, 'error');
+            return;
+        }
+        if (target.matches('.rule-delete-btn')) {
+            if (!confirm(`确定要删除规则 "${rule.name}" 吗？此操作不可恢复。`)) return;
+            ui.setLoading(target, true);
+            try {
+                const url = mode === 'adguard' ? `/plugins/adguard/rules/${id}` : `/plugins/${pluginTag}/config/${id}`;
+                await api.fetch(url, { method: 'DELETE' });
+                ui.showToast(`规则 "${rule.name}" 已删除`);
+                await (mode === 'adguard' ? adguardManager.load() : diversionManager.load());
+            } finally {
+                ui.setLoading(target, false);
+            }
+        } else if (target.matches('.rule-update-btn')) {
+            ui.setLoading(target, true);
+            ui.showToast(`正在后台更新规则 "${rule.name}"...`);
+            try {
+                await api.fetch(`/plugins/${pluginTag}/update/${id}`, { method: 'POST' });
+                ui.showToast('更新请求已发送，5 秒后自动刷新', 'success');
+                setTimeout(() => diversionManager.load(), 5000);
+            } finally {
+                ui.setLoading(target, false);
+            }
+        } else if (target.matches('.rule-enabled-toggle')) {
+            const updatedRule = { ...rule, enabled: target.checked };
+            delete updatedRule._pluginTag;
+            target.disabled = true;
+            try {
+                const url = mode === 'adguard' ? `/plugins/adguard/rules/${id}` : `/plugins/${pluginTag}/config/${id}`;
+                await api.fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedRule) });
+                rule.enabled = target.checked;
+                ui.showToast(`规则 "${rule.name}" 已${target.checked ? '启用' : '禁用'}`);
+            } catch (error) {
+                target.checked = !target.checked;
+            } finally {
+                target.disabled = false;
+            }
+        }
+    }
+    async function handleRuleFormSubmit(event) {
+        event.preventDefault();
+        ui.setLoading(elements.saveRuleBtn, true);
+        const form = elements.ruleForm;
+        const mode = form.elements.mode.value;
+        const id = form.elements.id.value;
+        try {
+            if (mode === 'adguard') {
+                const data = {
+                    name: form.elements.name.value.trim(),
+                    url: form.elements.url.value.trim(),
+                    auto_update: form.elements.auto_update.checked,
+                    update_interval_hours: parseInt(form.elements.update_interval_hours.value, 10) || 24
+                };
+                if (id) {
+                    const originalRule = state.adguardRules.find(rule => rule.id === id);
+                    await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) });
+                } else {
+                    await api.fetch('/plugins/adguard/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) });
+                }
+                ui.showToast(`广告拦截规则${id ? '更新' : '添加'}成功`);
+                await adguardManager.load();
+            } else {
+                const data = {
+                    name: form.elements.name.value.trim(),
+                    url: form.elements.url.value.trim(),
+                    type: form.elements.type.value,
+                    files: form.elements.files.value.trim(),
+                    auto_update: form.elements.auto_update.checked,
+                    enable_regexp: Boolean(form.elements.enable_regexp?.checked),
+                    update_interval_hours: parseInt(form.elements.update_interval_hours.value, 10) || 24
+                };
+                const targetPluginTag = diversionManager.sdSetInstanceMap[data.type];
+                if (!targetPluginTag || (diversionManager.availablePluginTags.size > 0 && !diversionManager.availablePluginTags.has(targetPluginTag))) {
+                    throw new Error('当前配置不支持所选规则类型');
+                }
+
+                if (id) {
+                    const sourcePluginTag = form.dataset.sourcePluginTag;
+                    const originalRule = state.diversionRules.find(rule => rule.name === id && (!sourcePluginTag || rule._pluginTag === sourcePluginTag));
+                    if (!originalRule) throw new Error('找不到要修改的原规则');
+                    const originalPluginTag = diversionManager.resolvePluginTag(originalRule);
+                    if (!originalPluginTag) throw new Error('无法确定原规则所属插件');
+                    const moved = originalPluginTag !== targetPluginTag;
+                    const renamed = data.name !== id;
+                    if (moved || renamed) {
+                        if (!confirm(`规则将${renamed ? '更名' : ''}${moved ? '移动到其他规则组' : ''}，需要删除旧规则并创建新规则，确定继续吗？`)) return;
+                        await api.fetch(`/plugins/${targetPluginTag}/config/${data.name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: originalRule.enabled }) });
+                        await api.fetch(`/plugins/${originalPluginTag}/config/${id}`, { method: 'DELETE' });
+                    } else {
+                        await api.fetch(`/plugins/${targetPluginTag}/config/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: originalRule.enabled }) });
+                    }
+                } else {
+                    await api.fetch(`/plugins/${targetPluginTag}/config/${data.name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) });
+                }
+                ui.showToast(`分流规则${id ? '更新' : '添加'}成功`);
+                await diversionManager.load();
+            }
+            ui.closeRuleModal();
+        } catch (err) {
+            console.error(`${mode} form submission failed:`, err);
+            ui.showToast(err.message || '规则保存失败', 'error');
+        } finally {
+            ui.setLoading(elements.saveRuleBtn, false);
+        }
+    }
     const adguardManager = { async load() { try { state.adguardRules = await api.fetch('/plugins/adguard/rules') || []; } catch (error) { state.adguardRules = []; } this.render(); }, render() { renderRuleTable(elements.adguardRulesTbody, state.adguardRules, 'adguard'); }, };
     const diversionManager = {
+        availablePluginTags: new Set(),
         sdSetInstanceMap: {
             'geolocation-!cn@cn': 'geosite:direct',
             'geosite:cn': 'geosite:direct',
@@ -2214,15 +2341,33 @@ function renderRuleTable(tbody, rules, mode) {
             'geoip:cloudflare': 'geoip:cloudflare',
             'nft_add': 'nft_add'
         },
+        resolvePluginTag(rule) {
+            return rule?._pluginTag || this.sdSetInstanceMap[rule?.type];
+        },
+        syncTypeOptions(selectedType = '') {
+            const select = elements.ruleForm?.elements?.type;
+            if (!select) return;
+            [...select.options].forEach(option => {
+                if (!option.value) return;
+                const pluginTag = this.sdSetInstanceMap[option.value];
+                option.disabled = this.availablePluginTags.size > 0 && !this.availablePluginTags.has(pluginTag) && option.value !== selectedType;
+                option.hidden = option.disabled;
+            });
+        },
         async load() {
             try {
                 const pluginTags = [...new Set(Object.values(this.sdSetInstanceMap))];
                 const promises = pluginTags.map(tag => api.fetch(`/plugins/${tag}/config`));
                 const results = await Promise.allSettled(promises);
-                state.diversionRules = results.filter(r => r.status === 'fulfilled' && Array.isArray(r.value)).flatMap(r => r.value);
+                this.availablePluginTags = new Set(pluginTags.filter((_, index) => results[index].status === 'fulfilled' && Array.isArray(results[index].value)));
+                state.diversionRules = results.flatMap((result, index) => result.status === 'fulfilled' && Array.isArray(result.value)
+                    ? result.value.map(rule => ({ ...rule, _pluginTag: pluginTags[index] }))
+                    : []);
             } catch (e) {
+                this.availablePluginTags = new Set();
                 state.diversionRules = [];
             }
+            this.syncTypeOptions();
             this.render();
         },
         render() { renderRuleTable(elements.diversionRulesTbody, state.diversionRules, 'diversion'); },
@@ -2716,7 +2861,9 @@ const cacheManager = {
     const listManager = {
         MAX_LINES: 10000,
         currentTag: null,
-        profiles: [
+        isTruncated: false,
+        profiles: [],
+        legacyProfiles: [
             { tag: 'whitelist', name: '白名单' },
             { tag: 'blocklist', name: '黑名单' },
             { tag: 'greylist', name: '灰名单' },
@@ -2728,9 +2875,14 @@ const cacheManager = {
             { tag: 'nft_ip', name: 'NFT IP' },
             { tag: 'rewrite', name: '重定向' }
         ],
+        currentConfigProfiles: [
+            { tag: 'custom_fakeip', name: '自定义 FakeIP 域名', readOnly: true },
+            { tag: 'custom_direct', name: '自定义 Direct 域名', readOnly: true }
+        ],
 
-        init() {
+        async init() {
             if (state.listManagerInitialized) return;
+            state.listManagerInitialized = true;
             elements.listMgmtNav.addEventListener('click', e => {
                 e.preventDefault();
                 const link = e.target.closest('.list-mgmt-link');
@@ -2739,19 +2891,82 @@ const cacheManager = {
                 }
             });
             elements.listSaveBtn.addEventListener('click', () => this.saveList());
-            // 首屏不立即加载巨大列表，交给空闲时机/用户点击触发，避免刷新时卡顿
-            if ('requestIdleCallback' in window) requestIdleCallback(() => this.loadList('whitelist'), { timeout: 2000 });
-            else setTimeout(() => this.loadList('whitelist'), 1200);
-            state.listManagerInitialized = true;
+            await this.discoverProfiles();
+        },
+
+        async profileExists(profile) {
+            try {
+                const response = await fetch(`/plugins/${profile.tag}/show?limit=1`);
+                try { await response.body?.cancel(); } catch (_) { }
+                return response.ok;
+            } catch (_) {
+                return false;
+            }
+        },
+
+        async discoverProfiles() {
+            elements.listContentLoader.style.display = 'flex';
+            elements.listContentTextArea.style.display = 'none';
+            elements.listContentInfo.textContent = '正在检测可用名单...';
+            ui.setLoading(elements.listSaveBtn, true);
+
+            const currentChecks = await Promise.all(this.currentConfigProfiles.map(profile => this.profileExists(profile)));
+            const currentProfiles = this.currentConfigProfiles.filter((_, index) => currentChecks[index]);
+            if (currentProfiles.length > 0) {
+                this.profiles = currentProfiles;
+                state.isCustomConfigProfile = true;
+                if (elements.listProfileNote) {
+                    elements.listProfileNote.textContent = '当前配置的静态名单来自 YAML，仅支持查看；geosite/geoip 在线规则请在“在线分流”中管理。';
+                }
+            } else {
+                const legacyChecks = await Promise.all(this.legacyProfiles.map(profile => this.profileExists(profile)));
+                this.profiles = this.legacyProfiles.filter((_, index) => legacyChecks[index]);
+                if (elements.listProfileNote) {
+                    elements.listProfileNote.textContent = this.profiles.length > 0 ? '仅显示当前 MosDNS 实际注册且支持名单接口的插件。' : '当前配置没有可通过此页面管理的文本名单。';
+                }
+            }
+
+            this.renderNavigation();
+            elements.listContentLoader.style.display = 'none';
+            ui.setLoading(elements.listSaveBtn, false);
+            if (this.profiles.length > 0) {
+                await this.loadList(this.profiles[0].tag);
+            } else {
+                elements.listContentTextArea.value = '';
+                elements.listContentTextArea.readOnly = true;
+                elements.listContentTextArea.style.display = 'block';
+                elements.listContentInfo.textContent = '无可用名单';
+                elements.listSaveBtn.disabled = true;
+            }
+        },
+
+        renderNavigation() {
+            elements.listMgmtNav.innerHTML = '';
+            this.profiles.forEach((profile, index) => {
+                const link = document.createElement('a');
+                link.href = '#';
+                link.className = `list-mgmt-link${index === 0 ? ' active' : ''}`;
+                link.dataset.listTag = profile.tag;
+                link.textContent = profile.name;
+                if (profile.readOnly) link.title = '该名单来自 YAML 配置，只读';
+                elements.listMgmtNav.appendChild(link);
+            });
+        },
+
+        getProfile(tag) {
+            return this.profiles.find(profile => profile.tag === tag);
         },
 
         async loadList(tag) {
+            const profile = this.getProfile(tag);
+            if (!profile) return;
             this.currentTag = tag;
-            // Abort any previous in-flight request and reset textarea to avoid old content persisting
             try { this._abortController?.abort(); } catch (_) { }
-            this._abortController = new AbortController();
-            // Clear previous content so switching lists reflects immediately
+            const controller = new AbortController();
+            this._abortController = controller;
+            this.isTruncated = false;
             elements.listContentTextArea.value = '';
+            elements.listContentTextArea.readOnly = Boolean(profile.readOnly);
             elements.listContentTextArea.scrollTop = 0;
             elements.listMgmtNav.querySelectorAll('.list-mgmt-link').forEach(l => l.classList.toggle('active', l.dataset.listTag === tag));
 
@@ -2778,17 +2993,14 @@ const cacheManager = {
             ui.setLoading(elements.listSaveBtn, true);
 
             try {
-                // 流式读取，最多加载 MAX_LINES 行，避免一次性 split 大字符串拖慢主线程
-// 这里的 this.MAX_LINES 是 10000
-const res = await fetch(`/plugins/${tag}/show?limit=${this.MAX_LINES}`, { 
-    signal: this._abortController.signal 
-});
+                const res = await fetch(`/plugins/${tag}/show?limit=${this.MAX_LINES}`, { signal: controller.signal });
 
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const reader = res.body?.getReader();
                 let totalLines = 0, shownLines = 0;
                 let buffer = '';
-                const CHUNK_LIMIT = this.MAX_LINES; // 达到就停止
+                const loadedLines = [];
+                const CHUNK_LIMIT = this.MAX_LINES;
                 let cancelled = false;
                 if (reader) {
                     const decoder = new TextDecoder();
@@ -2802,12 +3014,12 @@ const res = await fetch(`/plugins/${tag}/show?limit=${this.MAX_LINES}`, {
                             const line = buffer.slice(0, nl);
                             buffer = buffer.slice(nl + 1);
                             if (shownLines < CHUNK_LIMIT) {
-                                elements.listContentTextArea.value += (shownLines ? '\n' : '') + line;
+                                loadedLines.push(line);
                                 shownLines++;
                             }
                             if (shownLines >= CHUNK_LIMIT) {
-                                // 够了，取消后续读取
                                 cancelled = true;
+                                this.isTruncated = true;
                                 try { reader.cancel(); } catch (_) { }
                                 break;
                             }
@@ -2818,39 +3030,53 @@ const res = await fetch(`/plugins/${tag}/show?limit=${this.MAX_LINES}`, {
                     if (!cancelled && buffer.length > 0) {
                         totalLines++;
                         if (shownLines < CHUNK_LIMIT) {
-                            elements.listContentTextArea.value += (shownLines ? '\n' : '') + buffer;
+                            loadedLines.push(buffer);
                             shownLines++;
                         }
                     }
+                    elements.listContentTextArea.value = loadedLines.join('\n');
                 } else {
-                    // 兼容不支持流式的环境
                     const text = await res.text();
                     const parts = text.split('\n');
                     totalLines = parts.length;
                     elements.listContentTextArea.value = parts.slice(0, CHUNK_LIMIT).join('\n');
                     shownLines = Math.min(totalLines, CHUNK_LIMIT);
+                    this.isTruncated = totalLines > CHUNK_LIMIT;
                 }
-                if (shownLines >= CHUNK_LIMIT) elements.listContentInfo.textContent = `内容较长，已仅加载前 ${CHUNK_LIMIT} 行。`;
-                else elements.listContentInfo.textContent = `共 ${shownLines} 行。`;
+                if (this.isTruncated) elements.listContentInfo.textContent = `内容超过 ${CHUNK_LIMIT} 行，仅供查看前 ${CHUNK_LIMIT} 行，已禁止保存以防截断。`;
+                else elements.listContentInfo.textContent = `${profile.name} · 共 ${shownLines} 行${profile.readOnly ? ' · 只读' : ''}`;
             } catch (error) {
                 if (error?.name === 'AbortError') {
-                    // 用户快速切换导致的中断，不提示错误
-                    elements.listContentInfo.textContent = '已取消';
+                    if (this._abortController === controller) elements.listContentInfo.textContent = '已取消';
                 } else {
-                    elements.listContentTextArea.value = `加载列表“${tag}”失败。`;
+                    elements.listContentTextArea.value = '';
+                    elements.listContentTextArea.readOnly = true;
                     elements.listContentInfo.textContent = '加载失败';
-                    ui.showToast(`加载列表“${tag}”失败`, 'error');
+                    ui.showToast(`加载“${profile.name}”失败：${error.message}`, 'error');
                 }
             } finally {
-                elements.listContentLoader.style.display = 'none';
-                elements.listContentTextArea.style.display = 'block';
-                ui.setLoading(elements.listSaveBtn, false);
-                this._abortController = null;
+                if (this._abortController === controller) {
+                    elements.listContentLoader.style.display = 'none';
+                    elements.listContentTextArea.style.display = 'block';
+                    ui.setLoading(elements.listSaveBtn, false);
+                    elements.listSaveBtn.disabled = Boolean(profile.readOnly || this.isTruncated);
+                    elements.listSaveBtn.title = profile.readOnly ? '该名单来自 YAML 配置，不能在此保存' : (this.isTruncated ? '列表未完整加载，禁止覆盖保存' : '保存名单');
+                    this._abortController = null;
+                }
             }
         },
 
         async saveList() {
             if (!this.currentTag) return;
+            const profile = this.getProfile(this.currentTag);
+            if (!profile || profile.readOnly) {
+                ui.showToast('该名单来自 YAML 配置，请修改配置文件后重启 MosDNS', 'error');
+                return;
+            }
+            if (this.isTruncated) {
+                ui.showToast('名单未完整加载，已阻止截断覆盖', 'error');
+                return;
+            }
             ui.setLoading(elements.listSaveBtn, true);
             try {
                 const values = elements.listContentTextArea.value.split('\n').map(s => s.trim()).filter(Boolean);
@@ -2859,10 +3085,10 @@ const res = await fetch(`/plugins/${tag}/show?limit=${this.MAX_LINES}`, {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ values })
                 });
-                ui.showToast(`列表“${this.currentTag}”已保存`, 'success');
+                ui.showToast(`“${profile.name}”已保存`, 'success');
                 elements.listContentInfo.textContent = `保存成功！共 ${values.length} 行。`;
             } catch (error) {
-                ui.showToast(`保存列表“${this.currentTag}”失败`, 'error');
+                ui.showToast(`保存“${profile.name}”失败：${error.message}`, 'error');
             } finally {
                 ui.setLoading(elements.listSaveBtn, false);
             }

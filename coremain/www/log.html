@@ -988,19 +988,10 @@
                     </nav>
                     <div id="list-mgmt-sub-tab" class="sub-tab-content active" style="padding: 1.25rem;">
                         <div class="list-mgmt-grid">
-                            <nav class="list-mgmt-nav">
-                                <a href="#" class="list-mgmt-link active" data-list-tag="whitelist">白名单</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="blocklist">黑名单</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="greylist">灰名单</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="realiplist">!CN fakeip filter</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="cnfakeipfilter">CN fakeip filter</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="ddnslist">DDNS 域名</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="client_ip">客户端 IP</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="direct_ip">直连 IP</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="nft_ip">NFT IP</a>
-                                <a href="#" class="list-mgmt-link" data-list-tag="rewrite">重定向</a>
-                            </nav>
+                            <nav class="list-mgmt-nav" aria-label="可管理名单"></nav>
                             <div class="list-mgmt-content">
+                                <p id="list-profile-note"
+                                    style="font-size: 0.85rem; color: var(--color-text-secondary); margin: 0 0 1rem;"></p>
                                 <div class="lazy-placeholder" id="list-content-loader" style="min-height: 300px;">
                                     <div class="spinner"></div>
                                 </div>
