@@ -73,6 +73,12 @@ type DomainSetLight struct {
 	subscribers []func()
 }
 
+func (d *DomainSetLight) ListPluginKind() string { return "domain" }
+
+func (d *DomainSetLight) ListPluginWritable() bool {
+	return d.ruleFile != "" && strings.EqualFold(filepath.Ext(d.ruleFile), ".txt")
+}
+
 // GetRules 实现 RuleExporter 接口
 func (d *DomainSetLight) GetRules() ([]string, error) {
 	d.mu.RLock()

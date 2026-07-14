@@ -55,6 +55,12 @@ type DomainSet struct {
 	subscribers []func()
 }
 
+func (d *DomainSet) ListPluginKind() string { return "domain" }
+
+func (d *DomainSet) ListPluginWritable() bool {
+	return d.ruleFile != "" && strings.EqualFold(filepath.Ext(d.ruleFile), ".txt")
+}
+
 // GetRules 实现 RuleExporter 接口
 func (d *DomainSet) GetRules() ([]string, error) {
 	d.mu.RLock()

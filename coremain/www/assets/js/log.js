@@ -32,7 +32,7 @@ function closeAndUnlock(dialogElement) {
 
 
 document.addEventListener('DOMContentLoaded', () => {
-    const CONSTANTS = { API_BASE_URL: '', LOGS_PER_PAGE: 50, HISTORY_LENGTH: 60, DEFAULT_AUTO_REFRESH_INTERVAL: 15, ANIMATION_DURATION: 1000, MOBILE_BREAKPOINT: 1024, TOAST_DURATION: 3000, SKELETON_ROWS: 10, TOOLTIP_SHOW_DELAY: 200, TOOLTIP_HIDE_DELAY: 250, UPDATE_AUTO_MINUTES_DEFAULT: 1440 };
+    const CONSTANTS = { API_BASE_URL: '', ADGUARD_PLUGIN_TAG: 'adguard', LOGS_PER_PAGE: 50, HISTORY_LENGTH: 60, DEFAULT_AUTO_REFRESH_INTERVAL: 15, ANIMATION_DURATION: 1000, MOBILE_BREAKPOINT: 1024, TOAST_DURATION: 3000, SKELETON_ROWS: 10, TOOLTIP_SHOW_DELAY: 200, TOOLTIP_HIDE_DELAY: 250, UPDATE_AUTO_MINUTES_DEFAULT: 1440 };
     let state = { isUpdating: false, isCapturing: false, isMobile: false, isTouchDevice: false, isCustomConfigProfile: false, currentLogPage: 1, isLogLoading: false, logPaginationInfo: null, displayedLogs: [], currentLogSearchTerm: '', clientAliases: {}, topDomains: [], topClients: [], slowestQueries: [], domainSetRank: [], shuntColors: {}, logSort: { key: 'query_time', order: 'desc' }, autoRefresh: { enabled: false, intervalId: null, intervalSeconds: CONSTANTS.DEFAULT_AUTO_REFRESH_INTERVAL }, data: { totalQueries: { current: null, previous: null }, avgDuration: { current: null, previous: null } }, history: { totalQueries: [], avgDuration: [], timestamps: [] }, lastUpdateTime: null, adguardRules: [], diversionRules: [], requery: { status: null, config: null, pollId: null }, dataView: { rawEntries: [], filteredEntries: [], viewType: 'domain', currentOffset: 0, currentLimit: 100, currentQuery: '', currentConfig: null, hasMore: true, totalCount: 0 }, coreMode: 'A', cacheStats: {}, listManagerInitialized: false, featureSwitches: {}, systemInfo: {}, update: { status: null, loading: false, auto: { enabled: true, intervalMinutes: CONSTANTS.UPDATE_AUTO_MINUTES_DEFAULT, timerId: null } } };
     const elements = {
         html: document.documentElement, body: document.body, container: document.querySelector('.container'), initialLoader: document.getElementById('initial-loader'),
@@ -2198,7 +2198,8 @@ function renderRuleTable(tbody, rules, mode) {
         return card;
     }
 
-    async function handleAdguardUpdateCheck() { ui.setLoading(elements.checkAdguardUpdatesBtn, true); ui.showToast('已开始在后台更新所有启用的拦截规则...'); try { await api.fetch('/plugins/adguard/update', { method: 'POST' }); ui.showToast('更新请求已发送，5秒后自动刷新列表...', 'success'); await new Promise(resolve => setTimeout(resolve, 5000)); await adguardManager.load(); ui.showToast('拦截规则列表已刷新！', 'success'); } catch (e) { } finally { ui.setLoading(elements.checkAdguardUpdatesBtn, false); } }
+    const adguardPluginPath = (suffix = '') => `/plugins/${CONSTANTS.ADGUARD_PLUGIN_TAG}${suffix}`;
+    async function handleAdguardUpdateCheck() { ui.setLoading(elements.checkAdguardUpdatesBtn, true); ui.showToast('已开始在后台更新所有启用的拦截规则...'); try { await api.fetch(adguardPluginPath('/update'), { method: 'POST' }); ui.showToast('更新请求已发送，5秒后自动刷新列表...', 'success'); await new Promise(resolve => setTimeout(resolve, 5000)); await adguardManager.load(); ui.showToast('拦截规则列表已刷新！', 'success'); } catch (e) { } finally { ui.setLoading(elements.checkAdguardUpdatesBtn, false); } }
     async function handleRuleTableClick(event, mode) {
         const target = event.target.closest('button, input.rule-enabled-toggle');
         if (!target) return;
@@ -2214,7 +2215,7 @@ function renderRuleTable(tbody, rules, mode) {
             return;
         }
 
-        const pluginTag = mode === 'adguard' ? 'adguard' : diversionManager.resolvePluginTag(rule);
+        const pluginTag = mode === 'adguard' ? CONSTANTS.ADGUARD_PLUGIN_TAG : diversionManager.resolvePluginTag(rule);
         if (!pluginTag) {
             ui.showToast(`无法确定规则“${rule.name}”所属插件`, 'error');
             return;
@@ -2223,7 +2224,7 @@ function renderRuleTable(tbody, rules, mode) {
             if (!confirm(`确定要删除规则 "${rule.name}" 吗？此操作不可恢复。`)) return;
             ui.setLoading(target, true);
             try {
-                const url = mode === 'adguard' ? `/plugins/adguard/rules/${id}` : `/plugins/${pluginTag}/config/${id}`;
+                const url = mode === 'adguard' ? adguardPluginPath(`/rules/${id}`) : `/plugins/${pluginTag}/config/${id}`;
                 await api.fetch(url, { method: 'DELETE' });
                 ui.showToast(`规则 "${rule.name}" 已删除`);
                 await (mode === 'adguard' ? adguardManager.load() : diversionManager.load());
@@ -2245,7 +2246,7 @@ function renderRuleTable(tbody, rules, mode) {
             delete updatedRule._pluginTag;
             target.disabled = true;
             try {
-                const url = mode === 'adguard' ? `/plugins/adguard/rules/${id}` : `/plugins/${pluginTag}/config/${id}`;
+                const url = mode === 'adguard' ? adguardPluginPath(`/rules/${id}`) : `/plugins/${pluginTag}/config/${id}`;
                 await api.fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updatedRule) });
                 rule.enabled = target.checked;
                 ui.showToast(`规则 "${rule.name}" 已${target.checked ? '启用' : '禁用'}`);
@@ -2272,9 +2273,9 @@ function renderRuleTable(tbody, rules, mode) {
                 };
                 if (id) {
                     const originalRule = state.adguardRules.find(rule => rule.id === id);
-                    await api.fetch(`/plugins/adguard/rules/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) });
+                    await api.fetch(adguardPluginPath(`/rules/${id}`), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...originalRule, ...data }) });
                 } else {
-                    await api.fetch('/plugins/adguard/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) });
+                    await api.fetch(adguardPluginPath('/rules'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...data, enabled: true }) });
                 }
                 ui.showToast(`广告拦截规则${id ? '更新' : '添加'}成功`);
                 await adguardManager.load();
@@ -2322,7 +2323,7 @@ function renderRuleTable(tbody, rules, mode) {
             ui.setLoading(elements.saveRuleBtn, false);
         }
     }
-    const adguardManager = { async load() { try { state.adguardRules = await api.fetch('/plugins/adguard/rules') || []; } catch (error) { state.adguardRules = []; } this.render(); }, render() { renderRuleTable(elements.adguardRulesTbody, state.adguardRules, 'adguard'); }, };
+    const adguardManager = { tag: CONSTANTS.ADGUARD_PLUGIN_TAG, async load() { try { state.adguardRules = await api.fetch(adguardPluginPath('/rules')) || []; } catch (error) { state.adguardRules = []; } this.render(); }, render() { renderRuleTable(elements.adguardRulesTbody, state.adguardRules, 'adguard'); }, };
     const diversionManager = {
         availablePluginTags: new Set(),
         sdSetInstanceMap: {
@@ -2863,22 +2864,6 @@ const cacheManager = {
         currentTag: null,
         isTruncated: false,
         profiles: [],
-        legacyProfiles: [
-            { tag: 'whitelist', name: '白名单' },
-            { tag: 'blocklist', name: '黑名单' },
-            { tag: 'greylist', name: '灰名单' },
-            { tag: 'realiplist', name: '!CN fakeip filter' },
-            { tag: 'cnfakeipfilter', name: 'CN fakeip filter' },
-            { tag: 'ddnslist', name: 'DDNS 域名' },
-            { tag: 'client_ip', name: '客户端 IP' },
-            { tag: 'direct_ip', name: '直连 IP' },
-            { tag: 'nft_ip', name: 'NFT IP' },
-            { tag: 'rewrite', name: '重定向' }
-        ],
-        currentConfigProfiles: [
-            { tag: 'custom_fakeip', name: '自定义 FakeIP 域名', readOnly: true },
-            { tag: 'custom_direct', name: '自定义 Direct 域名', readOnly: true }
-        ],
 
         async init() {
             if (state.listManagerInitialized) return;
@@ -2894,36 +2879,28 @@ const cacheManager = {
             await this.discoverProfiles();
         },
 
-        async profileExists(profile) {
-            try {
-                const response = await fetch(`/plugins/${profile.tag}/show?limit=1`);
-                try { await response.body?.cancel(); } catch (_) { }
-                return response.ok;
-            } catch (_) {
-                return false;
-            }
-        },
-
         async discoverProfiles() {
             elements.listContentLoader.style.display = 'flex';
             elements.listContentTextArea.style.display = 'none';
             elements.listContentInfo.textContent = '正在检测可用名单...';
             ui.setLoading(elements.listSaveBtn, true);
 
-            const currentChecks = await Promise.all(this.currentConfigProfiles.map(profile => this.profileExists(profile)));
-            const currentProfiles = this.currentConfigProfiles.filter((_, index) => currentChecks[index]);
-            if (currentProfiles.length > 0) {
-                this.profiles = currentProfiles;
-                state.isCustomConfigProfile = true;
-                if (elements.listProfileNote) {
-                    elements.listProfileNote.textContent = '当前配置的静态名单来自 YAML，仅支持查看；geosite/geoip 在线规则请在“在线分流”中管理。';
-                }
-            } else {
-                const legacyChecks = await Promise.all(this.legacyProfiles.map(profile => this.profileExists(profile)));
-                this.profiles = this.legacyProfiles.filter((_, index) => legacyChecks[index]);
-                if (elements.listProfileNote) {
-                    elements.listProfileNote.textContent = this.profiles.length > 0 ? '仅显示当前 MosDNS 实际注册且支持名单接口的插件。' : '当前配置没有可通过此页面管理的文本名单。';
-                }
+            try {
+                const discovered = await api.fetch('/api/v1/list-plugins');
+                this.profiles = (Array.isArray(discovered) ? discovered : []).map(item => ({
+                    tag: item.tag,
+                    name: item.tag,
+                    kind: item.kind,
+                    readOnly: !item.writable
+                }));
+            } catch (_) {
+                this.profiles = [];
+            }
+            if (elements.listProfileNote) {
+                const writableCount = this.profiles.filter(profile => !profile.readOnly).length;
+                elements.listProfileNote.textContent = this.profiles.length > 0
+                    ? `已自动识别 ${this.profiles.length} 个名单插件，其中 ${writableCount} 个可写；可写状态由插件文件配置决定。`
+                    : '当前配置没有声明兼容名单管理接口的插件。';
             }
 
             this.renderNavigation();

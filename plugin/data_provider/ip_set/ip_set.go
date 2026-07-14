@@ -77,6 +77,10 @@ type IPSet struct {
 	mutex sync.Mutex
 }
 
+func (d *IPSet) ListPluginKind() string { return "ip" }
+
+func (d *IPSet) ListPluginWritable() bool { return len(d.files) > 0 }
+
 func (d *IPSet) GetIPMatcher() netlist.Matcher {
 	return d
 }
