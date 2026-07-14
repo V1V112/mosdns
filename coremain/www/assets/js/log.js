@@ -698,11 +698,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
         async loadStatus(signal) {
             try {
-                const fetchPromises = this.profiles.map(p => api.fetch(`/plugins/${p.tag}/show`, { signal }));
+                const loadedPlugins = await pluginRegistry.load();
+                const switchPlugins = loadedPlugins.filter(plugin => /^switch\d+$/.test(plugin.type));
+                this.activeProfiles = this.profiles.flatMap(profile => switchPlugins
+                    .filter(plugin => plugin.type === profile.tag)
+                    .map(plugin => ({ ...profile, type: profile.tag, tag: plugin.tag })));
+                if (this.activeProfiles.length === 0) {
+                    elements.featureSwitchesModule.style.display = 'none';
+                    return;
+                }
+                elements.featureSwitchesModule.style.display = '';
+                const fetchPromises = this.activeProfiles.map(p => api.fetch(`/plugins/${encodeURIComponent(p.tag)}/show`, { signal }));
                 const results = await Promise.allSettled(fetchPromises);
 
                 results.forEach((result, index) => {
-                    const profile = this.profiles[index];
+                    const profile = this.activeProfiles[index];
                     if (result.status === 'fulfilled') {
                         state.featureSwitches[profile.tag] = result.value.trim();
                     } else {
@@ -719,13 +729,15 @@ document.addEventListener('DOMContentLoaded', () => {
         },
 
         render() {
-            const coreStatus = state.featureSwitches['switch3'];
+            const coreProfile = (this.activeProfiles || []).find(profile => profile.type === 'switch3');
+            const coreStatus = coreProfile ? state.featureSwitches[coreProfile.tag] : 'error';
+            if (elements.coreModeSwitchGroup) elements.coreModeSwitchGroup.style.display = coreProfile ? '' : 'none';
             elements.coreModeSwitchGroup.querySelectorAll('button').forEach(btn => {
                 btn.classList.toggle('active', btn.dataset.mode === coreStatus);
                 btn.disabled = coreStatus === 'error';
             });
 
-            const secondaryProfiles = this.profiles.filter(p => !p.modes);
+            const secondaryProfiles = (this.activeProfiles || []).filter(p => !p.modes);
             let html = '';
             secondaryProfiles.forEach(profile => {
                 const status = state.featureSwitches[profile.tag];
@@ -753,13 +765,15 @@ document.addEventListener('DOMContentLoaded', () => {
         },
 
         async handleCoreSwitch(button) {
-            const tag = 'switch3';
+            const profile = (this.activeProfiles || []).find(item => item.type === 'switch3');
+            if (!profile) return;
+            const tag = profile.tag;
             const valueToPost = button.dataset.mode;
             ui.setLoading(button, true);
             button.parentElement.querySelectorAll('button').forEach(b => b.disabled = true);
 
             try {
-                await api.fetch(`/plugins/${tag}/post`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: valueToPost }) });
+                await api.fetch(`/plugins/${encodeURIComponent(tag)}/post`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: valueToPost }) });
                 state.featureSwitches[tag] = valueToPost;
                 this.render();
                 ui.showToast('核心模式已切换，即将开始刷新分流缓存...', 'success');
@@ -777,23 +791,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
         async handleSecondarySwitch(checkbox) {
             const tag = checkbox.dataset.switchTag;
-            const profile = this.profiles.find(p => p.tag === tag);
+            const profile = (this.activeProfiles || []).find(p => p.tag === tag);
             if (!profile) return;
 
             checkbox.disabled = true;
             const valueToPost = checkbox.checked ? profile.valueForOn : (profile.valueForOn === 'A' ? 'B' : 'A');
 
             try {
-                await api.fetch(`/plugins/${tag}/post`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: valueToPost }) });
+                await api.fetch(`/plugins/${encodeURIComponent(tag)}/post`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value: valueToPost }) });
                 state.featureSwitches[tag] = valueToPost;
                 ui.showToast(`“${profile.name}” 已${checkbox.checked ? '启用' : '禁用'}`);
-                if (tag === 'switch9') {
+                if (profile.type === 'switch9') {
                     (async () => {
                         ui.showToast('附加操作：正在清空核心缓存...', 'info');
-                        const results = await Promise.allSettled([
-                            api.fetch('/plugins/cache_all/flush'),
-                            api.fetch('/plugins/cache_all_noleak/flush')
-                        ]);
+                        const cacheTags = await pluginRegistry.tags('cache');
+                        const results = await Promise.allSettled(cacheTags.map(cacheTag =>
+                            api.fetch(`/plugins/${encodeURIComponent(cacheTag)}/flush`)));
 
                         const failedCount = results.filter(r => r.status === 'rejected').length;
                         if (failedCount > 0) {
