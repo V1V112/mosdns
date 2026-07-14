@@ -663,7 +663,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const switchManager = {
         profiles: [
-            { tag: 'switch3', name: '核心运行模式', tip: '切换后将执行一次“全新任务”刷新分流缓存。兼容模式性能更高，安全模式防泄露和劫持能力更强。', modes: { 'A': { name: '兼容模式', icon: 'fa-globe-americas' }, 'B': { name: '安全模式', icon: 'fa-shield-alt' } } },
+            { tag: 'switch3', name: 'switch3 模式', tip: 'A/B 的具体作用由 MosDNS 配置中引用该插件的规则决定，面板不预设业务含义。', modes: { 'A': { name: '模式 A' }, 'B': { name: '模式 B' } } },
             { tag: 'switch1', name: '请求屏蔽', desc: '对无解析结果的请求进行屏蔽', tip: '建议开启，避免无ipv4及ipv6结果的非必要DNS解析。', valueForOn: 'A' },
             { tag: 'switch5', name: '类型屏蔽', desc: '屏蔽 SOA、PTR、HTTPS 等请求', tip: '建议开启，可减少不必要的网络请求，提高效率。', valueForOn: 'A' },
             { tag: 'switch4', name: '过期缓存1', desc: '启用国内缓存、国外缓存 (兼容)、国外缓存 (安全)、国内域名fakeip缓存', tip: '建议开启，可以提升重复查询的响应速度，即使缓存已过期。', valueForOn: 'A' },
@@ -732,6 +732,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const coreProfile = (this.activeProfiles || []).find(profile => profile.type === 'switch3');
             const coreStatus = coreProfile ? state.featureSwitches[coreProfile.tag] : 'error';
             if (elements.coreModeSwitchGroup) elements.coreModeSwitchGroup.style.display = coreProfile ? '' : 'none';
+            const coreModeLabel = document.getElementById('core-mode-label');
+            if (coreModeLabel && coreProfile) coreModeLabel.textContent = `${coreProfile.tag} 模式`;
             elements.coreModeSwitchGroup.querySelectorAll('button').forEach(btn => {
                 btn.classList.toggle('active', btn.dataset.mode === coreStatus);
                 btn.disabled = coreStatus === 'error';
