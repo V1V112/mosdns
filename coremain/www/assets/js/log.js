@@ -148,6 +148,7 @@ document.addEventListener('DOMContentLoaded', () => {
         listMgmtRewriteHint: document.getElementById('list-mgmt-rewrite-hint'),
 
         featureSwitchesModule: document.getElementById('feature-switches-module'),
+        coreModeControl: document.getElementById('core-mode-control'),
         coreModeSwitchGroup: document.getElementById('core-mode-switch-group'),
         secondarySwitchesContainer: document.getElementById('secondary-switches-container'),
         systemInfoContainer: document.getElementById('system-info-container'),
@@ -731,7 +732,7 @@ document.addEventListener('DOMContentLoaded', () => {
         render() {
             const coreProfile = (this.activeProfiles || []).find(profile => profile.type === 'switch3');
             const coreStatus = coreProfile ? state.featureSwitches[coreProfile.tag] : 'error';
-            if (elements.coreModeSwitchGroup) elements.coreModeSwitchGroup.style.display = coreProfile ? '' : 'none';
+            if (elements.coreModeControl) elements.coreModeControl.style.display = coreProfile ? '' : 'none';
             const coreModeLabel = document.getElementById('core-mode-label');
             if (coreModeLabel && coreProfile) coreModeLabel.textContent = `${coreProfile.tag} 模式`;
             elements.coreModeSwitchGroup.querySelectorAll('button').forEach(btn => {
