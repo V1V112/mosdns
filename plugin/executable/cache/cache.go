@@ -90,6 +90,7 @@ const (
 )
 
 var _ sequence.RecursiveExecutable = (*Cache)(nil)
+var _ sequence.ContinuationBinder = (*Cache)(nil)
 
 // keyBufferPool 用于复用生成 Key 时的字节缓冲区，显著降低内存分配压力
 var keyBufferPool = sync.Pool{
@@ -206,7 +207,7 @@ func (a *FallbackProbeArgs) UnmarshalYAML(node *yaml.Node) error {
 
 type ActiveRefreshArgs struct {
 	Enabled          bool                    `yaml:"enabled"`
-	RefreshSequence  string                  `yaml:"refresh_sequence"`
+	RestoreOnStartup bool                    `yaml:"restore_on_startup"`
 	Threshold        int                     `yaml:"threshold"`
 	RequeryTimeoutMS int                     `yaml:"requery_timeout_ms"`
 	Workers          int                     `yaml:"workers"`
@@ -227,7 +228,7 @@ type ActiveRefreshArgs struct {
 
 type activeRefreshArgsRaw struct {
 	Enabled          bool                    `yaml:"enabled"`
-	RefreshSequence  string                  `yaml:"refresh_sequence"`
+	RestoreOnStartup bool                    `yaml:"restore_on_startup"`
 	Threshold        int                     `yaml:"threshold"`
 	RequeryTimeoutMS int                     `yaml:"requery_timeout_ms"`
 	Workers          int                     `yaml:"workers"`
@@ -262,7 +263,7 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	a.Enabled = raw.Enabled
-	a.RefreshSequence = raw.RefreshSequence
+	a.RestoreOnStartup = raw.RestoreOnStartup
 	a.Threshold = raw.Threshold
 	a.RequeryTimeoutMS = raw.RequeryTimeoutMS
 	a.Workers = raw.Workers
@@ -588,20 +589,6 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 				return nil, err
 			}
 			activeExcludeIPMatcher = matcher
-		}
-		if tag := strings.TrimSpace(args.ActiveRefresh.RefreshSequence); tag != "" {
-			if opts.BQ == nil || opts.BQ.M() == nil {
-				return nil, fmt.Errorf("active_refresh.refresh_sequence: plugin %q cannot be resolved without mosdns context", tag)
-			}
-			plugin := opts.BQ.M().GetPlugin(tag)
-			if plugin == nil {
-				return nil, fmt.Errorf("active_refresh.refresh_sequence: plugin %q not found", tag)
-			}
-			execPlugin, ok := plugin.(sequence.Executable)
-			if !ok || execPlugin == nil {
-				return nil, fmt.Errorf("active_refresh.refresh_sequence: plugin %q is not executable", tag)
-			}
-			activeRefreshExec = execPlugin
 		}
 	}
 

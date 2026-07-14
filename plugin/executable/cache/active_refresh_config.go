@@ -14,6 +14,7 @@ var removedActiveRefreshFields = map[string]string{
 	"interval":             "active_refresh.interval has been removed; refresh scheduling is now TTL-based and dynamic",
 	"min_refresh_interval": "active_refresh.min_refresh_interval has been removed; retry intervals are now calculated dynamically",
 	"max_entries_per_scan": "active_refresh.max_entries_per_scan has been removed; use max_tasks_per_batch instead",
+	"refresh_sequence":     "active_refresh.refresh_sequence has been removed; the cache continuation is now bound automatically by sequence",
 }
 
 // ValidateRawConfig runs before mapstructure decoding. It provides explicit
@@ -32,7 +33,7 @@ func (a *Args) ValidateRawConfig(raw any) error {
 	if !ok {
 		return nil
 	}
-	for _, field := range []string{"interval", "min_refresh_interval", "max_entries_per_scan"} {
+	for _, field := range []string{"interval", "min_refresh_interval", "max_entries_per_scan", "refresh_sequence"} {
 		if _, exists := active[field]; exists {
 			return fmt.Errorf("%s", removedActiveRefreshFields[field])
 		}

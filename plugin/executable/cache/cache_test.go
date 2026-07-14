@@ -189,7 +189,7 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 		"exclude_ip": []any{"203.0.113.0/24"},
 		"active_refresh": map[string]any{
 			"enabled":             true,
-			"refresh_sequence":    "refresh_dns",
+			"restore_on_startup":  true,
 			"threshold":           60,
 			"requery_timeout_ms":  1000,
 			"workers":             16,
@@ -231,8 +231,8 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 	if !ar.Enabled {
 		t.Fatal("active refresh should be enabled")
 	}
-	if ar.RefreshSequence != "refresh_dns" {
-		t.Fatalf("refresh sequence = %q, want refresh_dns", ar.RefreshSequence)
+	if !ar.RestoreOnStartup {
+		t.Fatal("restore on startup should be enabled")
 	}
 	if ar.RequeryTimeoutMS != 1000 || ar.MaxRefreshQPS != 30 || ar.RefreshBurst != 60 {
 		t.Fatalf("active limits mismatch: %#v", ar)

@@ -8,11 +8,13 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
@@ -1080,11 +1082,24 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	if n, err := source.writeDump(buf); err != nil || n != 1 {
 		t.Fatalf("write dump: entries=%d err=%v", n, err)
 	}
-	target := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{RestoreOnStartup: true}}, Opts{})
 	defer target.Close()
-	target.bindActiveRefreshReplay(sequence.ChainWalker{})
 	if n, err := target.readDump(buf); err != nil || n != 1 {
 		t.Fatalf("read dump: entries=%d err=%v", n, err)
+	}
+	plugins := map[string]any{
+		"cache": target,
+		"resolver": sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+			qCtx.SetResponse(testAResponse(t, qCtx.Q(), "192.0.2.99", 60))
+			return nil
+		}),
+	}
+	m := coremain.NewTestMosdnsWithPlugins(plugins)
+	if _, err := sequence.NewSequence(coremain.NewBP("restore-sequence", m), []sequence.RuleArgs{
+		{Exec: "$cache"},
+		{Exec: "$resolver"},
+	}); err != nil {
+		t.Fatal(err)
 	}
 	target.activeMu.RLock()
 	meta := target.activeMeta[k]
@@ -1097,6 +1112,56 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	}
 	if got := time.Unix(0, meta.lastAccess.Load()); time.Since(got) < 50*time.Second || time.Since(got) > 70*time.Second {
 		t.Fatalf("restored last access = %s", got)
+	}
+	replayCtx := meta.qCtx.CopyWithoutResponse()
+	replayNext := meta.next.Fork()
+	if err := replayNext.ExecNext(context.Background(), replayCtx); err != nil {
+		t.Fatal(err)
+	}
+	if replayCtx.R() == nil {
+		t.Fatal("restored task continuation did not reach resolver")
+	}
+}
+
+func TestRestoreOnStartupDisabledLoadsCacheWithoutRefreshTasks(t *testing.T) {
+	source := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer source.Close()
+	k, _, _ := seedTrackedEntry(t, source, "restore-disabled.example.", time.Hour, 10*time.Minute)
+	buf := new(bytes.Buffer)
+	if n, err := source.writeDump(buf); err != nil || n != 1 {
+		t.Fatalf("write dump: entries=%d err=%v", n, err)
+	}
+
+	target := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer target.Close()
+	if err := target.BindContinuation(sequence.ChainWalker{}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := target.readDump(buf); err != nil || n != 1 {
+		t.Fatalf("read dump: entries=%d err=%v", n, err)
+	}
+	if current, _, present := target.backend.Get(k); !present || current == nil {
+		t.Fatal("dump entry was not loaded into cache")
+	}
+	target.activeMu.RLock()
+	metaLen, futureLen := len(target.activeMeta), len(target.activeSchedule)
+	target.activeMu.RUnlock()
+	target.activeRestoreMu.Lock()
+	restoreLen := len(target.activeRestore)
+	target.activeRestoreMu.Unlock()
+	if metaLen != 0 || futureLen != 0 || restoreLen != 0 {
+		t.Fatalf("disabled startup restore created state: meta=%d future=%d restore=%d", metaLen, futureLen, restoreLen)
+	}
+}
+
+func TestRestoreOnStartupRejectsMultipleSequenceBindings(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{RestoreOnStartup: true}}, Opts{})
+	defer c.Close()
+	if err := c.BindContinuation(sequence.ChainWalker{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BindContinuation(sequence.ChainWalker{}); err == nil || !strings.Contains(err.Error(), "more than one sequence") {
+		t.Fatalf("second binding error = %v, want multiple-sequence error", err)
 	}
 }
 
@@ -1113,7 +1178,7 @@ func TestDumpRestoreStormRemainsBatchAndPendingBounded(t *testing.T) {
 	}
 
 	target := newDormantActiveCache(t, &Args{Size: 256, ActiveRefresh: ActiveRefreshArgs{
-		MaxTasksPerBatch: 3, MaxPendingTasks: 4,
+		RestoreOnStartup: true, MaxTasksPerBatch: 3, MaxPendingTasks: 4,
 	}}, Opts{})
 	defer target.Close()
 	target.bindActiveRefreshReplay(sequence.ChainWalker{})

@@ -38,6 +38,25 @@ type dummy struct {
 	wantReturn bool
 }
 
+type continuationBinderDummy struct {
+	next      ChainWalker
+	bindCount int
+	bindErr   error
+}
+
+func (d *continuationBinderDummy) Exec(ctx context.Context, qCtx *query_context.Context, next ChainWalker) error {
+	return next.ExecNext(ctx, qCtx)
+}
+
+func (d *continuationBinderDummy) BindContinuation(next ChainWalker) error {
+	d.bindCount++
+	if d.bindErr != nil {
+		return d.bindErr
+	}
+	d.next = next.Fork()
+	return nil
+}
+
 func (d *dummy) Match(ctx context.Context, qCtx *query_context.Context) (bool, error) {
 	if d.wantErr != nil {
 		return false, d.wantErr
@@ -208,5 +227,42 @@ func TestUseOrigExecutableIsRemoved(t *testing.T) {
 	_, err := NewSequence(coremain.NewBP("test", m), []RuleArgs{{Exec: "use_orig $resolver"}})
 	if err == nil || !strings.Contains(err.Error(), "invalid executable type use_orig") {
 		t.Fatalf("NewSequence() error = %v, want invalid executable type use_orig", err)
+	}
+}
+
+func TestSequenceBindsCompiledContinuation(t *testing.T) {
+	plugins := make(map[string]any)
+	m := coremain.NewTestMosdnsWithPlugins(plugins)
+	binder := new(continuationBinderDummy)
+	plugins["binder"] = binder
+	plugins["target"] = &dummy{wantR: new(dns.Msg)}
+
+	if _, err := NewSequence(coremain.NewBP("test", m), []RuleArgs{
+		{Exec: "$binder"},
+		{Exec: "$target"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if binder.bindCount != 1 {
+		t.Fatalf("bind count = %d, want 1", binder.bindCount)
+	}
+
+	qCtx := query_context.NewContext(new(dns.Msg))
+	if err := binder.next.ExecNext(context.Background(), qCtx); err != nil {
+		t.Fatal(err)
+	}
+	if qCtx.R() == nil {
+		t.Fatal("bound continuation did not execute the following rule")
+	}
+}
+
+func TestSequenceReportsContinuationBindingFailure(t *testing.T) {
+	plugins := make(map[string]any)
+	m := coremain.NewTestMosdnsWithPlugins(plugins)
+	plugins["binder"] = &continuationBinderDummy{bindErr: errors.New("duplicate continuation")}
+
+	_, err := NewSequence(coremain.NewBP("test", m), []RuleArgs{{Exec: "$binder"}})
+	if err == nil || !strings.Contains(err.Error(), "duplicate continuation") {
+		t.Fatalf("NewSequence() error = %v, want binding failure", err)
 	}
 }

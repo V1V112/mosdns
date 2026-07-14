@@ -29,6 +29,14 @@ type RecursiveExecutable interface {
 	Exec(ctx context.Context, qCtx *query_context.Context, next ChainWalker) error
 }
 
+// ContinuationBinder is implemented by recursive plugins that need their
+// immutable post-plugin chain before the first request is executed. Sequence
+// calls BindContinuation after compilation, when a stable ChainWalker can be
+// constructed for the rules following the plugin.
+type ContinuationBinder interface {
+	BindContinuation(next ChainWalker) error
+}
+
 // Executable represents something that is executable.
 type Executable interface {
 	Exec(ctx context.Context, qCtx *query_context.Context) error

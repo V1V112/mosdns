@@ -55,10 +55,10 @@ type fastExecutor interface {
 
 type Sequence struct {
 	chain            []*ChainNode
-	anonymousPlugins[]any
+	anonymousPlugins []any
 	logger           *zap.Logger
 	isInline         bool
-	instructions[]instruction
+	instructions     []instruction
 }
 
 func (s *Sequence) Close() error {
@@ -68,18 +68,18 @@ func (s *Sequence) Close() error {
 	return nil
 }
 
-type Args =[]RuleArgs
+type Args = []RuleArgs
 
 func Init(bp *coremain.BP, args any) (any, error) {
 	return NewSequence(NewBQ(bp.M(), bp.L()), *args.(*Args))
 }
 
-func NewSequence(bq BQ, ra[]RuleArgs) (*Sequence, error) {
+func NewSequence(bq BQ, ra []RuleArgs) (*Sequence, error) {
 	s := &Sequence{
 		logger: bq.L(),
 	}
 
-	var rc[]RuleConfig
+	var rc []RuleConfig
 	for i, ra := range ra {
 		rule, err := parseArgs(ra)
 		if err != nil {
@@ -92,17 +92,43 @@ func NewSequence(bq BQ, ra[]RuleArgs) (*Sequence, error) {
 		return nil, err
 	}
 	s.compile()
+	if err := s.bindContinuations(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
+// bindContinuations gives recursive plugins a startup-safe copy of the rules
+// following their node. The compiled instruction and chain slices are
+// immutable, so the walker can be retained and forked by background workers.
+func (s *Sequence) bindContinuations() error {
+	for i, node := range s.chain {
+		binder, ok := node.RE.(ContinuationBinder)
+		if !ok {
+			continue
+		}
+		next := ChainWalker{
+			p:      i + 1,
+			chain:  s.chain,
+			ins:    s.instructions,
+			logger: s.logger,
+		}
+		if err := binder.BindContinuation(next); err != nil {
+			return fmt.Errorf("failed to bind continuation for rule #%d (%s): %w", i, node.PluginName, err)
+		}
+	}
+	return nil
+}
+
 func (s *Sequence) compile() {
-	var ins[]instruction
+	var ins []instruction
 	for _, node := range s.chain {
 		instr := instruction{node: node}
 
 		// 1. 检查 Matchers 是否全都可以优化
 		allMatchersOptimizable := true
-		var checks[]func(qCtx *query_context.Context) bool
+		var checks []func(qCtx *query_context.Context) bool
 
 		for _, m := range node.Matches {
 			if fm, ok := m.Matcher.(fastMatcher); ok {
@@ -229,7 +255,7 @@ func (s *Sequence) newNode(bq BQ, r RuleConfig, ri int) (*ChainNode, error) {
 			n.PluginName = fmt.Sprintf("anonymous_exec(%s: %v)", ec.Type, ec.Args)
 		}
 	} else {
-		var names[]string
+		var names []string
 		for _, ec := range r.Execs {
 			if len(ec.Tag) > 0 {
 				names = append(names, ec.Tag)
@@ -258,10 +284,10 @@ func (s *Sequence) newNode(bq BQ, r RuleConfig, ri int) (*ChainNode, error) {
 		n.E = e
 		n.RE = re
 	} else if len(r.Execs) > 1 {
-		var subRules[]RuleConfig
+		var subRules []RuleConfig
 		for _, ec := range r.Execs {
 			subRules = append(subRules, RuleConfig{
-				Execs:[]ExecConfig{ec},
+				Execs: []ExecConfig{ec},
 			})
 		}
 
@@ -276,6 +302,9 @@ func (s *Sequence) newNode(bq BQ, r RuleConfig, ri int) (*ChainNode, error) {
 		}
 
 		subSeq.compile()
+		if err := subSeq.bindContinuations(); err != nil {
+			return nil, fmt.Errorf("failed to bind multi-exec continuation: %w", err)
+		}
 		s.anonymousPlugins = append(s.anonymousPlugins, subSeq)
 		n.E = subSeq
 	}
@@ -394,7 +423,7 @@ func (r reverseMatch) GetFastCheck() func(qCtx *query_context.Context) bool {
 	if fm, ok := r.m.(fastMatcher); ok {
 		if innerCheck := fm.GetFastCheck(); innerCheck != nil {
 			return func(qCtx *query_context.Context) bool {
-				return !innerCheck(qCtx) 
+				return !innerCheck(qCtx)
 			}
 		}
 	}

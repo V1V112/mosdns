@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"strings"
@@ -1319,18 +1320,35 @@ func (c *Cache) updateActiveRefreshAfterCommit(
 	c.notifyActiveScheduler()
 }
 
+// BindContinuation receives the immutable rules following this cache from the
+// sequence compiler. Dump-restored refresh work can therefore be rebuilt at
+// startup without a dedicated refresh_sequence or a bootstrap client query.
+func (c *Cache) BindContinuation(next sequence.ChainWalker) error {
+	if !c.activeRefreshEnabled() || !c.args.ActiveRefresh.RestoreOnStartup || c.activeRefreshExec != nil {
+		return nil
+	}
+	return c.installActiveRefreshReplay(next, true)
+}
+
 func (c *Cache) bindActiveRefreshReplay(next sequence.ChainWalker) {
-	if !c.activeRefreshEnabled() {
-		return
+	_ = c.installActiveRefreshReplay(next, false)
+}
+
+func (c *Cache) installActiveRefreshReplay(next sequence.ChainWalker, rejectDuplicate bool) error {
+	if !c.activeRefreshEnabled() || !c.args.ActiveRefresh.RestoreOnStartup {
+		return nil
 	}
 	c.activeRestoreMu.Lock()
 	if !c.activeReplayBound {
 		c.activeReplayNext = next.Fork()
 		c.activeReplayBound = true
+	} else if rejectDuplicate {
+		c.activeRestoreMu.Unlock()
+		return fmt.Errorf("cache is referenced by more than one sequence while active_refresh.restore_on_startup is enabled")
 	}
 	if len(c.activeRestore) == 0 {
 		c.activeRestoreMu.Unlock()
-		return
+		return nil
 	}
 	entries := make([]decodedDumpEntry, 0, len(c.activeRestore))
 	for _, entry := range c.activeRestore {
@@ -1340,10 +1358,11 @@ func (c *Cache) bindActiveRefreshReplay(next sequence.ChainWalker) {
 	replayNext := c.activeReplayNext.Fork()
 	c.activeRestoreMu.Unlock()
 	c.restoreActiveRefreshEntries(entries, replayNext)
+	return nil
 }
 
 func (c *Cache) queueRestoredActiveRefresh(entries []decodedDumpEntry) {
-	if !c.activeRefreshEnabled() || len(entries) == 0 {
+	if !c.activeRefreshEnabled() || !c.args.ActiveRefresh.RestoreOnStartup || len(entries) == 0 {
 		return
 	}
 	c.activeRestoreMu.Lock()
