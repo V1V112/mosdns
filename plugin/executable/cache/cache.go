@@ -59,9 +59,8 @@ const (
 	dumpMaximumBlockLength = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
 	dumpMaximumTotalLength = 256 << 20
 
-	shardCount   = 256   // 256分段锁，平衡锁竞争与内存开销
-	l1TotalCap   = 51200 // L1 总容量限制
-	shardMaxSize = 200   // 每个分段桶的配额 (51200/shardCount)
+	shardCount = 256   // 256分段锁，平衡锁竞争与内存开销
+	l1TotalCap = 51200 // L1 总容量限制
 
 	// 后台异步任务池参数
 	maxConcurrentLazyUpdate = 256
@@ -118,6 +117,8 @@ func (k key) Sum() uint64 {
 type item struct {
 	generation            uint64
 	staleSourceGeneration uint64
+	activeMeta            atomic.Pointer[activeRefreshMeta]
+	backendRemoved        atomic.Bool
 	lastRealAccess        atomic.Int64
 	refreshSuccess        atomic.Int64
 	resp                  []byte
@@ -146,6 +147,7 @@ type l1Item struct {
 	domainSet      string
 	upstreamOpt    *dns.OPT
 	source         *item
+	slot           int
 }
 
 type l1Shard struct {
@@ -593,9 +595,18 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 	}
 
 	lifecycleCtx, cancel := context.WithCancel(context.Background())
-	backend := cache.New[key, *item](cache.Opts{Size: args.Size})
+	var p *Cache
+	backend := cache.NewWithRemovalCallback[key, *item](cache.Opts{Size: args.Size}, func(k key, old *item, cause cache.RemovalCause) {
+		if old == nil {
+			return
+		}
+		old.backendRemoved.Store(true)
+		if cause != cache.RemovalCauseFlushed && p != nil {
+			p.removeL1IfSource(k, old)
+		}
+	})
 	lb := map[string]string{"tag": opts.MetricsTag}
-	p := &Cache{
+	p = &Cache{
 		args:                       args,
 		logger:                     logger,
 		backend:                    backend,
@@ -687,11 +698,18 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 		p.activeRefreshEvents.WithLabelValues(event)
 	}
 
+	l1Budget := min(args.Size, l1TotalCap)
+	baseL1Capacity := l1Budget / shardCount
+	extraL1Shards := l1Budget % shardCount
 	for i := 0; i < shardCount; i++ {
+		capacity := baseL1Capacity
+		if i < extraL1Shards {
+			capacity++
+		}
 		p.shards[i] = &l1Shard{
-			items: make(map[key]*l1Item, shardMaxSize),
-			order: make([]key, shardMaxSize),
-			ref:   make(map[key]bool, shardMaxSize),
+			items: make(map[key]*l1Item, capacity),
+			order: make([]key, capacity),
+			ref:   make(map[key]bool, capacity),
 		}
 	}
 
@@ -730,30 +748,50 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 }
 
 // 架构优化：去除内部的 msg.Copy()，改为外部拷贝后传入，极大降低持锁时间
-func (s *l1Shard) updateL1(k key, msg *dns.Msg, source *item) {
-	if source == nil {
-		return
+func (s *l1Shard) updateL1(k key, msg *dns.Msg, source *item) bool {
+	if source == nil || source.backendRemoved.Load() {
+		return false
 	}
 	s.Lock()
 	defer s.Unlock()
+	if source.backendRemoved.Load() {
+		return false
+	}
+	return s.updateL1Locked(k, msg, source)
+}
 
-	if _, ok := s.items[k]; ok {
+func (s *l1Shard) updateL1Locked(k key, msg *dns.Msg, source *item) bool {
+	capacity := len(s.order)
+	if capacity == 0 {
+		return false
+	}
+
+	if current, ok := s.items[k]; ok {
 		s.items[k] = &l1Item{
 			msg: msg, storedTime: source.storedTime, expirationTime: source.expirationTime,
 			domainSet: source.domainSet, upstreamOpt: copyOPT(source.upstreamOpt), source: source,
+			slot: current.slot,
 		}
 		s.ref[k] = true
-		return
+		return true
 	}
 
 	for {
-		oldKey := s.order[s.pos]
+		slot := s.pos
+		oldKey := s.order[slot]
 		if oldKey == "" {
+			break
+		}
+		oldItem, ok := s.items[oldKey]
+		if !ok || oldItem.slot != slot {
+			// A callback removed this generation, or the same key was inserted
+			// into another slot. The stale clock slot must not affect the new one.
+			s.order[slot] = ""
 			break
 		}
 		if s.ref[oldKey] {
 			s.ref[oldKey] = false
-			s.pos = (s.pos + 1) % shardMaxSize
+			s.pos = (s.pos + 1) % capacity
 			continue
 		}
 		delete(s.items, oldKey)
@@ -761,13 +799,42 @@ func (s *l1Shard) updateL1(k key, msg *dns.Msg, source *item) {
 		break
 	}
 
+	slot := s.pos
 	s.items[k] = &l1Item{
 		msg: msg, storedTime: source.storedTime, expirationTime: source.expirationTime,
 		domainSet: source.domainSet, upstreamOpt: copyOPT(source.upstreamOpt), source: source,
+		slot: slot,
 	}
-	s.order[s.pos] = k
+	s.order[slot] = k
 	s.ref[k] = true
-	s.pos = (s.pos + 1) % shardMaxSize
+	s.pos = (slot + 1) % capacity
+	return true
+}
+
+func (s *l1Shard) removeIfSource(k key, source *item) bool {
+	if source == nil {
+		return false
+	}
+	s.Lock()
+	defer s.Unlock()
+	current, ok := s.items[k]
+	if !ok || current.source != source {
+		return false
+	}
+	delete(s.items, k)
+	delete(s.ref, k)
+	if current.slot >= 0 && current.slot < len(s.order) && s.order[current.slot] == k {
+		s.order[current.slot] = ""
+	}
+	return true
+}
+
+func (c *Cache) removeL1IfSource(k key, source *item) bool {
+	shard := c.shards[k.Sum()%shardCount]
+	if shard == nil {
+		return false
+	}
+	return shard.removeIfSource(k, source)
 }
 
 func (c *Cache) containsExcluded(msg *dns.Msg) bool {
@@ -843,7 +910,7 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	shard.RUnlock()
 
 	now := time.Now()
-	if ok1 && now.Before(v1.expirationTime) {
+	if ok1 && v1.source != nil && !v1.source.backendRemoved.Load() && now.Before(v1.expirationTime) {
 		c.hitTotal.Inc()
 		recordRealCacheAccess(v1.source, now)
 		c.observeActiveRefresh(k, v1.source, qCtx, next, now, v1.msg)
@@ -1179,15 +1246,14 @@ func (c *Cache) dumpCache() error {
 	if len(c.args.DumpFile) == 0 {
 		return nil
 	}
-	f, err := os.Create(c.args.DumpFile)
-	if err != nil {
+	var en int
+	err := writeFileAtomically(c.args.DumpFile, func(f *os.File) error {
+		var err error
+		en, err = c.writeDump(f)
 		return err
-	}
-	defer f.Close()
-
-	en, err := c.writeDump(f)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to write dump, %w", err)
+		return fmt.Errorf("failed to persist dump, %w", err)
 	}
 	c.logger.Info("cache dumped", zap.Int("entries", en))
 	return nil
@@ -1196,14 +1262,18 @@ func (c *Cache) dumpCache() error {
 func (c *Cache) Api() *chi.Mux {
 	r := chi.NewRouter()
 
-	r.Get("/flush", coremain.WithAsyncGC(func(w http.ResponseWriter, req *http.Request) {
+	flushCache := coremain.WithAsyncGC(func(w http.ResponseWriter, req *http.Request) {
 		c.logger.Info("flushing cache via api")
 		c.flushMu.Lock()
 		c.refreshEpoch.Add(1)
 		c.backend.Flush()
 		c.clearRuntimeViews()
 		c.updatedKey.Store(0)
-		dumpErr := c.dumpCache()
+		dumpConfigured := len(c.args.DumpFile) > 0
+		var dumpErr error
+		if dumpConfigured {
+			dumpErr = c.dumpCache()
+		}
 		c.flushMu.Unlock()
 		c.notifyActiveScheduler()
 
@@ -1214,8 +1284,19 @@ func (c *Cache) Api() *chi.Mux {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("Cache flushed and the empty dump was persisted.\n"))
-	}))
+		if dumpConfigured {
+			_, _ = w.Write([]byte("Cache flushed and the empty dump was persisted.\n"))
+		} else {
+			_, _ = w.Write([]byte("Cache flushed.\n"))
+		}
+	})
+	r.Post("/flush", flushCache)
+	r.Delete("/flush", flushCache)
+	r.Get("/flush", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Deprecated", "true")
+		w.Header().Set("Warning", `299 mosdns "GET /flush is deprecated; use POST /flush or DELETE /flush"`)
+		flushCache(w, req)
+	})
 
 	r.Get("/dump", coremain.WithAsyncGC(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("content-type", "application/octet-stream")
@@ -1347,10 +1428,11 @@ func (c *Cache) Api() *chi.Mux {
 func (c *Cache) clearRuntimeViews() {
 	for i := 0; i < shardCount; i++ {
 		c.shards[i].Lock()
-		c.shards[i].items = make(map[key]*l1Item, shardMaxSize)
-		c.shards[i].order = make([]key, shardMaxSize)
+		capacity := len(c.shards[i].order)
+		c.shards[i].items = make(map[key]*l1Item, capacity)
+		c.shards[i].order = make([]key, capacity)
 		c.shards[i].pos = 0
-		c.shards[i].ref = make(map[key]bool, shardMaxSize)
+		c.shards[i].ref = make(map[key]bool, capacity)
 		c.shards[i].Unlock()
 	}
 
@@ -1539,6 +1621,7 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 	c.refreshEpoch.Add(1)
 	for _, entry := range entries {
 		entry.item.generation = c.generation.Add(1)
+		entry.item.backendRemoved.Store(false)
 		c.backend.Store(entry.k, entry.item, entry.cacheExpiration)
 	}
 	// Loading is merge-compatible at L2, but any overwritten entry makes its
@@ -2227,8 +2310,7 @@ func (c *Cache) promoteL1IfCurrent(k key, expected *item, epoch uint64, msg *dns
 	if !ok || current != expected {
 		return false
 	}
-	c.shards[k.Sum()%shardCount].updateL1(k, l1Msg, expected)
-	return true
+	return c.shards[k.Sum()%shardCount].updateL1(k, l1Msg, expected)
 }
 
 func (c *Cache) commitPreparedForeground(k key, observed *item, epoch uint64, prepared *preparedCacheEntry) bool {
@@ -2262,6 +2344,7 @@ func (c *Cache) commitPreparedMatching(k key, epoch uint64, checkEpoch bool, mat
 	commitMu.Lock()
 	defer commitMu.Unlock()
 	prepared.item.generation = c.generation.Add(1)
+	prepared.item.backendRemoved.Store(false)
 	if match != nil {
 		if !c.backend.StoreIf(k, prepared.item, prepared.cacheExpiration, match) {
 			return false

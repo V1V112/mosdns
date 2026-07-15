@@ -278,7 +278,8 @@ func TestMaxRefreshSuccessLimitStopsUntilRealAccess(t *testing.T) {
 	c.activeMu.RLock()
 	meta := c.activeMeta[k]
 	c.activeMu.RUnlock()
-	if !present || meta == nil || meta.expected != current || meta.task != nil || !meta.stopped.Load() || meta.refreshCount.Load() != 1 {
+	if !present || meta == nil || meta.expected != current || meta.task != nil || !meta.stopped.Load() ||
+		current.refreshSuccess.Load() != 1 || current.activeMeta.Load() != nil {
 		t.Fatalf("max-refresh stop state: present=%v current=%#v meta=%#v", present, current, meta)
 	}
 	msg := new(dns.Msg)
@@ -287,7 +288,8 @@ func TestMaxRefreshSuccessLimitStopsUntilRealAccess(t *testing.T) {
 	}
 	c.observeActiveRefresh(k, current, qCtx, sequence.ChainWalker{}, time.Now(), msg)
 	c.activeMu.RLock()
-	resumed := meta.task != nil && !meta.stopped.Load() && meta.refreshCount.Load() == 0
+	resumed := meta.task != nil && !meta.stopped.Load() && current.refreshSuccess.Load() == 0 &&
+		current.activeMeta.Load() == meta && meta.boundGeneration.Load() == current.generation
 	c.activeMu.RUnlock()
 	if !resumed {
 		t.Fatalf("real access did not resume stopped metadata: %#v", meta)
@@ -421,8 +423,7 @@ func TestInactiveEntryStopsAndRealHitReactivates(t *testing.T) {
 
 	c.activeMu.Lock()
 	meta := c.activeMeta[k]
-	meta.lastAccess.Store(time.Now().Add(-time.Hour).UnixNano())
-	meta.expected.lastRealAccess.Store(meta.lastAccess.Load())
+	meta.expected.lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
 	meta.task.dueAt = time.Now().Add(-time.Millisecond)
 	heap.Fix(&c.activeSchedule, meta.task.scheduleIndex)
 	c.activeMu.Unlock()
@@ -445,7 +446,7 @@ func TestInactiveEntryStopsAndRealHitReactivates(t *testing.T) {
 	c.activeMu.RLock()
 	reactivated := c.activeMeta[k]
 	c.activeMu.RUnlock()
-	if reactivated == nil || reactivated.task == nil || reactivated.refreshCount.Load() != 0 {
+	if reactivated == nil || reactivated.task == nil || p.item.refreshSuccess.Load() != 0 {
 		t.Fatalf("real cache hit did not reactivate refresh: %#v", reactivated)
 	}
 }
@@ -486,6 +487,43 @@ func TestRealHitRecalculatesIdleWakeWithoutMovingTTLDeadline(t *testing.T) {
 	}
 }
 
+func TestTrackedHitDoesNotWaitForActiveMu(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, p := seedTrackedEntry(t, c, "lock-free-hit.example.", time.Hour, 0)
+	c.activeMu.RLock()
+	meta := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if meta == nil || p.item.activeMeta.Load() != meta || meta.boundGeneration.Load() != p.item.generation {
+		t.Fatalf("active handle was not published: meta=%#v handle=%#v", meta, p.item.activeMeta.Load())
+	}
+	p.item.refreshSuccess.Store(3)
+	hitAt := time.Now()
+
+	c.activeMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		c.observeActiveRefresh(k, p.item, qCtx, sequence.ChainWalker{}, hitAt, p.msg)
+		close(done)
+	}()
+	select {
+	case <-done:
+		c.activeMu.Unlock()
+	case <-time.After(time.Second):
+		c.activeMu.Unlock()
+		<-done
+		t.Fatal("tracked cache hit waited for activeMu")
+	}
+
+	if got := p.item.refreshSuccess.Load(); got != 0 {
+		t.Fatalf("refresh success count after real hit = %d, want 0", got)
+	}
+	if got := time.Unix(0, p.item.lastRealAccess.Load()); got.Before(hitAt) {
+		t.Fatalf("last access = %s, want >= %s", got, hitAt)
+	}
+}
+
 func TestPendingIdleSentinelExtendedByRealHitIsRequeued(t *testing.T) {
 	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{
 		MaxIdleTime: 10,
@@ -496,14 +534,15 @@ func TestPendingIdleSentinelExtendedByRealHitIsRequeued(t *testing.T) {
 	now := time.Now()
 	c.activeMu.Lock()
 	meta := c.activeMeta[k]
-	meta.lastAccess.Store(now.Add(-10 * time.Second).UnixNano())
+	meta.expected.lastRealAccess.Store(now.Add(-10 * time.Second).UnixNano())
 	meta.task.dueAt = now.Add(-time.Millisecond)
 	heap.Fix(&c.activeSchedule, meta.task.scheduleIndex)
 	c.activeMu.Unlock()
 	c.moveDueActiveTasks(now)
-	// The real hit races after transfer to pending, so scheduleIndex is already
-	// gone and trackActiveRefresh cannot simply heap.Fix the old idle sentinel.
-	c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, now, p.msg)
+	// The real hit races after transfer to pending. The lock-free hit path only
+	// updates entry activity; worker preparation must observe it and return the
+	// old idle sentinel to the future heap.
+	c.observeActiveRefresh(k, p.item, qCtx, sequence.ChainWalker{}, now, p.msg)
 	task := c.popPendingTask()
 	if task == nil {
 		t.Fatal("idle sentinel was not pending")
@@ -540,6 +579,76 @@ func TestOldGenerationObservationCannotDeleteNewMetadata(t *testing.T) {
 	c.activeMu.RUnlock()
 	if meta == nil || meta.expected != newer.item || meta.task == nil || meta.task.generation != newer.item.generation {
 		t.Fatalf("old observation damaged new metadata: %#v", meta)
+	}
+}
+
+func TestOldGenerationHandleCannotResetNewGenerationActivity(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "old-handle.example.", time.Minute, 0)
+	old.item.refreshSuccess.Store(2)
+	newer := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	if !c.commitPrepared(k, old.item, c.refreshEpoch.Load(), newer) {
+		t.Fatal("failed to commit newer generation")
+	}
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, qCtx, sequence.ChainWalker{})
+
+	c.activeMu.RLock()
+	meta := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if meta == nil || meta.expected != newer.item || newer.item.activeMeta.Load() != meta {
+		t.Fatalf("new generation handle was not installed: meta=%#v handle=%#v", meta, newer.item.activeMeta.Load())
+	}
+	if old.item.activeMeta.Load() != nil {
+		t.Fatalf("old generation retained active handle: %#v", old.item.activeMeta.Load())
+	}
+
+	// Model an L1 lookup that captured the old pointer before the replacement.
+	// Its activity must remain generation-local and must not reset the current
+	// generation's consecutive refresh count.
+	newer.item.refreshSuccess.Store(2)
+	c.observeActiveRefresh(k, old.item, qCtx, sequence.ChainWalker{}, time.Now(), old.msg)
+	if got := newer.item.refreshSuccess.Load(); got != 2 {
+		t.Fatalf("stale generation reset current refresh count to %d", got)
+	}
+	if newer.item.activeMeta.Load() != meta || meta.boundGeneration.Load() != newer.item.generation {
+		t.Fatal("stale generation disturbed the current active handle")
+	}
+}
+
+func TestGenerationHandoffPreservesRealHitBeforeHandleDetach(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{
+		MaxRefreshTimes: 1,
+	}}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "handoff-hit.example.", time.Minute, 0)
+	newer := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	if !c.commitPrepared(k, old.item, c.refreshEpoch.Load(), newer) {
+		t.Fatal("failed to commit newer generation")
+	}
+	committedAccess := newer.item.lastRealAccess.Load()
+	hitAt := time.Now().Add(time.Millisecond)
+	// The backend and L1 already contain newer, but an in-progress L1 hit may
+	// still hold old until the metadata handoff detaches its handle.
+	c.observeActiveRefresh(k, old.item, qCtx, sequence.ChainWalker{}, hitAt, old.msg)
+	if old.item.lastRealAccess.Load() <= committedAccess {
+		t.Fatal("test hit did not advance old generation activity")
+	}
+
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, true, qCtx, sequence.ChainWalker{})
+	c.activeMu.RLock()
+	meta := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if meta == nil || meta.expected != newer.item || meta.task == nil || meta.stopped.Load() {
+		t.Fatalf("handoff hit was lost and stopped the new generation: %#v", meta)
+	}
+	if got := newer.item.refreshSuccess.Load(); got != 0 {
+		t.Fatalf("new generation refresh count = %d, want reset by real hit", got)
+	}
+	if got := newer.item.lastRealAccess.Load(); got < hitAt.UnixNano() {
+		t.Fatalf("new generation last access = %d, want >= %d", got, hitAt.UnixNano())
 	}
 }
 
@@ -654,11 +763,11 @@ func TestConcurrentRealHitCannotBeLostByStopDecision(t *testing.T) {
 			heap.Remove(&c.activeSchedule, task.scheduleIndex)
 		}
 		if i%2 == 0 {
-			meta.lastAccess.Store(time.Now().Add(-time.Hour).UnixNano())
-			meta.refreshCount.Store(0)
+			meta.expected.lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
+			meta.expected.refreshSuccess.Store(0)
 		} else {
-			meta.lastAccess.Store(time.Now().UnixNano())
-			meta.refreshCount.Store(1)
+			meta.expected.lastRealAccess.Store(time.Now().UnixNano())
+			meta.expected.refreshSuccess.Store(1)
 		}
 		c.activeMu.Unlock()
 
@@ -682,7 +791,8 @@ func TestConcurrentRealHitCannotBeLostByStopDecision(t *testing.T) {
 		c.activeMu.RLock()
 		currentMeta := c.activeMeta[k]
 		valid := currentMeta != nil && currentMeta.expected == p.item && currentMeta.task != nil &&
-			!currentMeta.stopped.Load() && currentMeta.refreshCount.Load() == 0
+			!currentMeta.stopped.Load() && p.item.refreshSuccess.Load() == 0 &&
+			p.item.activeMeta.Load() == currentMeta && currentMeta.boundGeneration.Load() == p.item.generation
 		c.activeMu.RUnlock()
 		if !valid {
 			t.Fatalf("real hit was lost at iteration %d: %#v", i, currentMeta)
@@ -1073,9 +1183,7 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	source.activeMu.RLock()
 	sourceMeta := source.activeMeta[k]
 	source.activeMu.RUnlock()
-	sourceMeta.lastAccess.Store(time.Now().Add(-time.Minute).UnixNano())
-	sourceMeta.refreshCount.Store(2)
-	sourceMeta.expected.lastRealAccess.Store(sourceMeta.lastAccess.Load())
+	sourceMeta.expected.lastRealAccess.Store(time.Now().Add(-time.Minute).UnixNano())
 	sourceMeta.expected.refreshSuccess.Store(2)
 
 	buf := new(bytes.Buffer)
@@ -1107,10 +1215,10 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	if meta == nil || meta.task == nil || meta.expected == nil || meta.expected.generation == 0 {
 		t.Fatalf("restored metadata is incomplete: %#v", meta)
 	}
-	if got := meta.refreshCount.Load(); got != 2 {
+	if got := meta.expected.refreshSuccess.Load(); got != 2 {
 		t.Fatalf("restored consecutive refreshes = %d, want 2", got)
 	}
-	if got := time.Unix(0, meta.lastAccess.Load()); time.Since(got) < 50*time.Second || time.Since(got) > 70*time.Second {
+	if got := time.Unix(0, meta.expected.lastRealAccess.Load()); time.Since(got) < 50*time.Second || time.Since(got) > 70*time.Second {
 		t.Fatalf("restored last access = %s", got)
 	}
 	replayCtx := meta.qCtx.CopyWithoutResponse()
@@ -1269,7 +1377,7 @@ func TestRestoreDoesNotOverwriteConcurrentMetadata(t *testing.T) {
 	k, qCtx, old := seedTrackedEntry(t, c, "restore-concurrent.example.", time.Hour, 0)
 	c.activeMu.RLock()
 	originalMeta := c.activeMeta[k]
-	originalAccess := originalMeta.lastAccess.Load()
+	originalAccess := originalMeta.expected.lastRealAccess.Load()
 	c.activeMu.RUnlock()
 	oldEntry := decodedDumpEntry{
 		k: k, item: old.item, cacheExpiration: old.cacheExpiration,
@@ -1279,7 +1387,7 @@ func TestRestoreDoesNotOverwriteConcurrentMetadata(t *testing.T) {
 	c.activeMu.RLock()
 	preserved := c.activeMeta[k]
 	c.activeMu.RUnlock()
-	if preserved != originalMeta || preserved.lastAccess.Load() != originalAccess || preserved.refreshCount.Load() != 0 {
+	if preserved != originalMeta || preserved.expected.lastRealAccess.Load() != originalAccess || preserved.expected.refreshSuccess.Load() != 0 {
 		t.Fatalf("restore overwrote newer same-generation activity: %#v", preserved)
 	}
 

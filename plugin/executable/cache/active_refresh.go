@@ -72,9 +72,11 @@ type activeRefreshMeta struct {
 	expected *item
 	task     *refreshTask
 
-	lastAccess   atomic.Int64
-	refreshCount atomic.Int64
-	stopped      atomic.Bool
+	// boundGeneration is the generation for which expected.activeMeta points to
+	// this metadata. Hits use it as a lock-free validation token; all task and
+	// heap mutations remain protected by activeMu.
+	boundGeneration atomic.Uint64
+	stopped         atomic.Bool
 }
 
 type activeRefreshWork struct {
@@ -267,29 +269,56 @@ func (c *Cache) activeEvent(name string) {
 	}
 }
 
+// bindActiveMetaHandleLocked publishes the lock-free hit-path handle only
+// after meta has a live task for expected. The caller must hold activeMu.
+func bindActiveMetaHandleLocked(meta *activeRefreshMeta, expected *item) {
+	if meta == nil || expected == nil || meta.task == nil {
+		return
+	}
+	meta.expected = expected
+	meta.boundGeneration.Store(expected.generation)
+	expected.activeMeta.Store(meta)
+}
+
+// clearActiveMetaHandleLocked invalidates the generation token before
+// detaching the pointer. A concurrent hit that already loaded the pointer will
+// therefore take the version-validating slow path instead of treating a
+// replaced or stopped generation as tracked. The caller must hold activeMu.
+func clearActiveMetaHandleLocked(meta *activeRefreshMeta) {
+	if meta == nil {
+		return
+	}
+	meta.boundGeneration.Store(0)
+	if expected := meta.expected; expected != nil {
+		expected.activeMeta.CompareAndSwap(meta, nil)
+	}
+}
+
+func clearActiveMetaTaskLocked(meta *activeRefreshMeta) {
+	if meta == nil {
+		return
+	}
+	clearActiveMetaHandleLocked(meta)
+	meta.task = nil
+}
+
 func (c *Cache) observeActiveRefresh(k key, expected *item, qCtx *query_context.Context, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
 	if !c.activeRefreshEnabled() || expected == nil || qCtx == nil {
 		return
 	}
-	// k may be a zero-copy view over a pooled request buffer on the L1 path.
-	durableKey := key(strings.Clone(string(k)))
-	// Ordinary hits on an already tracked generation only update activity and
-	// (when still in the future heap) its idle sentinel. Avoid a backend lookup,
-	// query-context copy and per-key commit lock on this hot path. Generation and
-	// exclusions are checked again before any worker or token is consumed.
-	c.activeMu.Lock()
-	if meta := c.activeMeta[durableKey]; meta != nil && meta.expected == expected && meta.task != nil && !meta.stopped.Load() {
-		recordRealCacheAccess(expected, now)
-		meta.lastAccess.Store(now.UnixNano())
-		meta.refreshCount.Store(0)
-		dueChanged := c.recalculateScheduledDueLocked(meta, now)
-		c.activeMu.Unlock()
-		if dueChanged {
-			c.notifyActiveScheduler()
-		}
+	// Ordinary hits touch only entry-owned atomics and this generation-checked
+	// handle. In particular, they do not contend on the global activeMu. The
+	// idle sentinel may wake once at its previous deadline; prepareActiveWork
+	// rechecks lastRealAccess and returns it to the future heap when the hit
+	// extended the idle boundary.
+	recordRealCacheAccess(expected, now)
+	if meta := expected.activeMeta.Load(); meta != nil &&
+		meta.boundGeneration.Load() == expected.generation && !meta.stopped.Load() {
 		return
 	}
-	c.activeMu.Unlock()
+
+	// k may be a zero-copy view over a pooled request buffer on the L1 path.
+	durableKey := key(strings.Clone(string(k)))
 	c.trackActiveRefresh(durableKey, expected, qCtx, next, now, response)
 }
 
@@ -352,9 +381,6 @@ func (c *Cache) trackActiveRefresh(k key, expected *item, qCtx *query_context.Co
 	sameGeneration := meta.expected == expected
 	meta.qCtx = qCtx.CopyWithoutResponse()
 	meta.next = next.Fork()
-	meta.expected = expected
-	meta.lastAccess.Store(now.UnixNano())
-	meta.refreshCount.Store(0)
 	meta.stopped.Store(false)
 	// A real hit must not postpone an already scheduled TTL deadline. This is
 	// especially important for an expired answer whose existing task is a
@@ -369,6 +395,7 @@ func (c *Cache) trackActiveRefresh(k key, expected *item, qCtx *query_context.Co
 		}
 	} else {
 		c.recalculateScheduledDueLocked(meta, now)
+		bindActiveMetaHandleLocked(meta, expected)
 	}
 	c.activeMu.Unlock()
 	commitMu.Unlock()
@@ -392,7 +419,7 @@ func (c *Cache) recalculateScheduledDueLocked(meta *activeRefreshMeta, now time.
 	t := meta.task
 	due := t.refreshAt
 	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-		idleAt := time.Unix(0, meta.lastAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
+		idleAt := time.Unix(0, meta.expected.lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
 		if idleAt.Before(due) {
 			due = idleAt
 		}
@@ -446,6 +473,18 @@ func (c *Cache) evictLeastUrgentMetaLocked() bool {
 		if c.activeMeta[victim.k] != victim || c.activeMetaPinnedForEviction(victim, current, present) {
 			skipped[victim] = struct{}{}
 			continue
+		}
+		lastAccess := int64(0)
+		if victim.expected != nil {
+			lastAccess = victim.expected.lastRealAccess.Load()
+			clearActiveMetaHandleLocked(victim)
+			if victim.expected.lastRealAccess.Load() != lastAccess {
+				// A real hit overlapped victim selection. Keep this entry and let
+				// the next candidate absorb the metadata pressure.
+				bindActiveMetaHandleLocked(victim, victim.expected)
+				skipped[victim] = struct{}{}
+				continue
+			}
 		}
 		c.removeActiveMetaLocked(victim.k, victim)
 		return true
@@ -516,7 +555,7 @@ func (c *Cache) scheduleEntryLocked(meta *activeRefreshMeta, expected *item, ret
 		meta: meta, dueAt: refreshAt, probeOnly: probeOnly, scheduleIndex: -1, pendingIndex: -1,
 	}
 	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-		idleAt := time.Unix(0, meta.lastAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
+		idleAt := time.Unix(0, expected.lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
 		if idleAt.Before(t.dueAt) {
 			t.dueAt = idleAt
 		}
@@ -527,6 +566,7 @@ func (c *Cache) scheduleEntryLocked(meta *activeRefreshMeta, expected *item, ret
 	meta.task = t
 	meta.expected = expected
 	heap.Push(&c.activeSchedule, t)
+	bindActiveMetaHandleLocked(meta, expected)
 	c.activeEvent("scheduled")
 	return true
 }
@@ -534,7 +574,11 @@ func (c *Cache) scheduleEntryLocked(meta *activeRefreshMeta, expected *item, ret
 func kClone(k key) key { return key(strings.Clone(string(k))) }
 
 func (c *Cache) removeMetaTaskLocked(meta *activeRefreshMeta) {
-	if meta == nil || meta.task == nil {
+	if meta == nil {
+		return
+	}
+	clearActiveMetaHandleLocked(meta)
+	if meta.task == nil {
 		return
 	}
 	t := meta.task
@@ -723,7 +767,7 @@ func (c *Cache) moveDueActiveTasks(now time.Time) {
 			// The full-queue slow path may replace t with a retry after finding
 			// an inflight conflict. Do not detach that newly scheduled task.
 			if t.meta.task == t {
-				t.meta.task = nil
+				clearActiveMetaTaskLocked(t.meta)
 			}
 		}
 		moved++
@@ -749,7 +793,7 @@ func (c *Cache) enqueuePendingLocked(task *refreshTask, now time.Time) bool {
 		}
 		dropped := heap.Remove(&c.activePending, worst).(*refreshTask)
 		if dropped.meta != nil && dropped.meta.task == dropped {
-			dropped.meta.task = nil
+			clearActiveMetaTaskLocked(dropped.meta)
 		}
 		c.activeRefreshDropTotal.Inc()
 		c.activeEvent("queue_dropped")
@@ -789,8 +833,20 @@ func (c *Cache) prunePendingLocked(now time.Time) {
 		}
 		inactive := false
 		if !staleMeta && !backendMissing && !backendChanged && !expired && c.args.ActiveRefresh.MaxIdleTime > 0 {
-			last := time.Unix(0, t.meta.lastAccess.Load())
+			last := time.Unix(0, t.meta.expected.lastRealAccess.Load())
 			inactive = now.Sub(last) >= time.Duration(c.args.ActiveRefresh.MaxIdleTime)*time.Second
+			if inactive {
+				// Publish the slow-path state before the final decision. A hit that
+				// raced the first read either changed lastRealAccess and is observed
+				// below, or sees the invalid handle and rebuilds after activeMu is
+				// released.
+				clearActiveMetaHandleLocked(t.meta)
+				last = time.Unix(0, t.meta.expected.lastRealAccess.Load())
+				inactive = now.Sub(last) >= time.Duration(c.args.ActiveRefresh.MaxIdleTime)*time.Second
+				if !inactive {
+					bindActiveMetaHandleLocked(t.meta, t.meta.expected)
+				}
+			}
 		}
 
 		excludedDomain := false
@@ -816,16 +872,16 @@ func (c *Cache) prunePendingLocked(now time.Time) {
 				}
 				if delay > 0 && now.Add(delay+activeRefreshMinBudget).Before(deadline) {
 					if !c.scheduleRetryLocked(t.meta, t, delay, now, false) && t.meta.task == t {
-						t.meta.task = nil
+						clearActiveMetaTaskLocked(t.meta)
 					}
 				} else if t.meta.task == t {
-					t.meta.task = nil
+					clearActiveMetaTaskLocked(t.meta)
 				}
 				c.activeEvent("duplicate_inflight")
 				continue
 			}
 			if t.meta != nil && t.meta.task == t {
-				t.meta.task = nil
+				clearActiveMetaTaskLocked(t.meta)
 				if (backendMissing || inactive || excludedDomain || excludedIP) && c.activeMeta[t.key] == t.meta {
 					delete(c.activeMeta, t.key)
 				}
@@ -930,10 +986,10 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 		c.discardActiveTask(task, false)
 		return nil, false
 	}
-	// Make activity and max-success decisions atomically with real-hit updates.
-	// If a hit waits behind this lock after a remove/stop decision, its slow path
-	// will recreate or reactivate the task; if it won the lock first, these reads
-	// observe its new lastAccess/count.
+	// Heap/task state is serialized here, while real-hit activity remains
+	// lock-free. Before an inactive/stop decision becomes final we invalidate the
+	// entry handle and re-read its atomics: an overlapping hit is either observed
+	// by that second read or forced onto the slow path.
 	c.activeMu.Lock()
 	if meta.task != task || c.activeMeta[task.key] != meta || meta.expected != expected {
 		c.activeMu.Unlock()
@@ -941,12 +997,17 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 		return nil, false
 	}
 	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-		lastAccess := time.Unix(0, meta.lastAccess.Load())
+		lastAccess := time.Unix(0, expected.lastRealAccess.Load())
 		if now.Sub(lastAccess) >= time.Duration(maxIdle)*time.Second {
-			c.removeActiveMetaLocked(task.key, meta)
-			c.activeMu.Unlock()
-			c.activeEvent("inactive_skipped")
-			return nil, false
+			clearActiveMetaHandleLocked(meta)
+			lastAccess = time.Unix(0, expected.lastRealAccess.Load())
+			if now.Sub(lastAccess) >= time.Duration(maxIdle)*time.Second {
+				c.removeActiveMetaLocked(task.key, meta)
+				c.activeMu.Unlock()
+				c.activeEvent("inactive_skipped")
+				return nil, false
+			}
+			bindActiveMetaHandleLocked(meta, expected)
 		}
 	}
 	if now.Before(task.refreshAt) && task.dueAt.Before(task.refreshAt) {
@@ -955,7 +1016,7 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 		// in that case return it to the future heap instead of querying early.
 		task.dueAt = task.refreshAt
 		if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-			idleAt := time.Unix(0, meta.lastAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
+			idleAt := time.Unix(0, expected.lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
 			if idleAt.Before(task.dueAt) {
 				task.dueAt = idleAt
 			}
@@ -968,11 +1029,15 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 		c.notifyActiveScheduler()
 		return nil, false
 	}
-	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && meta.refreshCount.Load() >= int64(maxRefresh) {
-		meta.task = nil
-		meta.stopped.Store(true)
-		c.activeMu.Unlock()
-		return nil, false
+	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && expected.refreshSuccess.Load() >= int64(maxRefresh) {
+		clearActiveMetaHandleLocked(meta)
+		if expected.refreshSuccess.Load() >= int64(maxRefresh) {
+			clearActiveMetaTaskLocked(meta)
+			meta.stopped.Store(true)
+			c.activeMu.Unlock()
+			return nil, false
+		}
+		bindActiveMetaHandleLocked(meta, expected)
 	}
 	c.activeMu.Unlock()
 	question, ok := questionFromKey(task.key)
@@ -1032,7 +1097,7 @@ func (c *Cache) claimActiveFlight(work *activeRefreshWork) bool {
 func (c *Cache) discardActiveTask(task *refreshTask, removeMeta bool) {
 	c.activeMu.Lock()
 	if task != nil && task.meta != nil && task.meta.task == task {
-		task.meta.task = nil
+		clearActiveMetaTaskLocked(task.meta)
 		if removeMeta && c.activeMeta[task.key] == task.meta {
 			delete(c.activeMeta, task.key)
 		}
@@ -1055,7 +1120,7 @@ func (c *Cache) rescheduleActiveConflict(task *refreshTask, now time.Time) {
 		if delay > 0 && now.Add(delay+activeRefreshMinBudget).Before(deadline) {
 			c.scheduleRetryLocked(task.meta, task, delay, now, false)
 		} else {
-			task.meta.task = nil
+			clearActiveMetaTaskLocked(task.meta)
 		}
 	}
 	c.activeMu.Unlock()
@@ -1079,6 +1144,7 @@ func (c *Cache) scheduleRetryLocked(meta *activeRefreshMeta, previous *refreshTa
 	}
 	meta.task = t
 	heap.Push(&c.activeSchedule, t)
+	bindActiveMetaHandleLocked(meta, meta.expected)
 	c.activeEvent("scheduled")
 	return true
 }
@@ -1283,20 +1349,27 @@ func (c *Cache) updateActiveRefreshAfterCommit(
 			return
 		}
 		meta = &activeRefreshMeta{k: k, qCtx: qCtx.CopyWithoutResponse(), next: next.Fork(), expected: expected}
-		meta.lastAccess.Store(updated.lastRealAccess.Load())
-		meta.refreshCount.Store(updated.refreshSuccess.Load())
 		c.activeMeta[k] = meta
 	} else if meta.expected != expected {
 		c.activeMu.Unlock()
 		return
 	}
 	c.removeMetaTaskLocked(meta)
-	meta.expected = updated
-	if activeSuccess {
-		meta.refreshCount.Add(1)
+	// commitPrepared copied the activity state before publishing updated. A real
+	// hit may have touched the old generation in the short commit-to-metadata
+	// handoff window. The old handle is invalid now, so merge one final snapshot
+	// before installing the new generation. A later stale-L1 hit deliberately
+	// remains generation-local and cannot reset the current entry.
+	lateRealAccess := expected.lastRealAccess.Load()
+	lateRealHit := lateRealAccess > updated.lastRealAccess.Load()
+	if lateRealHit {
+		updated.lastRealAccess.Store(lateRealAccess)
+		updated.refreshSuccess.Store(expected.refreshSuccess.Load())
 	}
-	updated.lastRealAccess.Store(meta.lastAccess.Load())
-	updated.refreshSuccess.Store(meta.refreshCount.Load())
+	meta.expected = updated
+	if activeSuccess && !lateRealHit {
+		updated.refreshSuccess.Add(1)
+	}
 	question, validQuestion := questionFromKey(k)
 	excludedDomain := !validQuestion || c.activeDomainExcluded(question.Name)
 	excludedIP := response != nil && c.containsActiveExcluded(response)
@@ -1311,7 +1384,7 @@ func (c *Cache) updateActiveRefreshAfterCommit(
 		c.notifyActiveScheduler()
 		return
 	}
-	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && meta.refreshCount.Load() >= int64(maxRefresh) {
+	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && updated.refreshSuccess.Load() >= int64(maxRefresh) {
 		meta.stopped.Store(true)
 	} else {
 		c.scheduleEntryLocked(meta, updated, 0, false, now, false)
@@ -1437,8 +1510,6 @@ func (c *Cache) restoreActiveRefreshEntries(entries []decodedDumpEntry, next seq
 			meta := &activeRefreshMeta{
 				k: entry.k, qCtx: qCtx, next: next.Fork(), expected: v,
 			}
-			meta.lastAccess.Store(lastAccess.UnixNano())
-			meta.refreshCount.Store(int64(entry.refreshCount))
 			c.activeMeta[entry.k] = meta
 			if !c.scheduleEntryLocked(meta, v, 0, false, now, true) {
 				delete(c.activeMeta, entry.k)

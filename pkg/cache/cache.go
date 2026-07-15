@@ -39,6 +39,35 @@ type Value interface {
 	any
 }
 
+// RemovalCause describes why a value stopped being the value stored in a
+// Cache.
+type RemovalCause uint8
+
+const (
+	// RemovalCauseReplaced means Store or StoreIf overwrote an unexpired or
+	// expired stored value with a new value.
+	RemovalCauseReplaced RemovalCause = iota + 1
+	// RemovalCauseExpired means Get, StoreIf, or the background cleaner removed
+	// an expired value.
+	RemovalCauseExpired
+	// RemovalCauseCapacity means an entry was evicted to make room in the
+	// capacity-limited cache.
+	RemovalCauseCapacity
+	// RemovalCauseFlushed means an entry was removed by Flush.
+	RemovalCauseFlushed
+)
+
+// RemovalCallback is called when a stored value is replaced or removed.
+//
+// The callback is synchronous and always runs without an internal map-shard
+// lock held, so it may call back into the Cache. Concurrent cache operations
+// may invoke it concurrently and notifications may arrive out of mutation
+// order. A mirror cache should compare value identity/version before removing
+// a newer entry in response to an old notification. A callback must not panic;
+// if it does, the mutation remains committed and later callbacks from the same
+// batch are not run.
+type RemovalCallback[K Key, V Value] func(key K, value V, cause RemovalCause)
+
 // Cache is a simple map cache that stores values in memory.
 // It is safe for concurrent use.
 type Cache[K Key, V Value] struct {
@@ -71,10 +100,44 @@ type elem[V Value] struct {
 // and discards expired values. If cleanerInterval <= 0, a default
 // interval will be used.
 func New[K Key, V Value](opts Opts) *Cache[K, V] {
+	return NewWithRemovalCallback[K, V](opts, nil)
+}
+
+// NewWithRemovalCallback initializes a Cache and reports every value that is
+// replaced or removed. A nil callback disables notifications.
+//
+// Close only stops the cleaner; it does not remove entries and therefore does
+// not emit removal callbacks.
+func NewWithRemovalCallback[K Key, V Value](opts Opts, onRemoval RemovalCallback[K, V]) *Cache[K, V] {
 	opts.init()
+	var mapRemovalCallback concurrent_map.RemovalCallback[K, *elem[V]]
+	if onRemoval != nil {
+		mapRemovalCallback = func(key K, e *elem[V], cause concurrent_map.RemovalCause) {
+			if e == nil {
+				return
+			}
+
+			var cacheCause RemovalCause
+			switch cause {
+			case concurrent_map.RemovalCauseReplaced:
+				cacheCause = RemovalCauseReplaced
+			case concurrent_map.RemovalCauseDeleted:
+				// Cache only deletes map entries when it has observed them as
+				// expired, either on access, in StoreIf, or during GC.
+				cacheCause = RemovalCauseExpired
+			case concurrent_map.RemovalCauseCapacity:
+				cacheCause = RemovalCauseCapacity
+			case concurrent_map.RemovalCauseFlushed:
+				cacheCause = RemovalCauseFlushed
+			default:
+				return
+			}
+			onRemoval(key, e.v, cacheCause)
+		}
+	}
 	c := &Cache[K, V]{
 		closeNotify: make(chan struct{}),
-		m:           concurrent_map.NewMapCache[K, *elem[V]](opts.Size),
+		m:           concurrent_map.NewMapCacheWithRemovalCallback[K, *elem[V]](opts.Size, mapRemovalCallback),
 	}
 	go c.gcLoop(opts.CleanerInterval)
 	return c
@@ -88,6 +151,9 @@ func (c *Cache[K, V]) Close() error {
 	return nil
 }
 
+// Get returns an unexpired value. If it observes an expired value, it removes
+// that exact physical entry and reports RemovalCauseExpired; a concurrent fresh
+// Store is not deleted.
 func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 	if e, hasEntry := c.m.Get(key); hasEntry {
 		if e.expirationTime.Before(time.Now()) {
@@ -103,8 +169,10 @@ func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 	return
 }
 
-// Range calls f through all entries. If f returns an error, the same error will be returned
-// by Range.
+// Range calls f through all entries. It does not discard expired entries and
+// therefore does not emit removal callbacks. If f returns an error, the same
+// error is returned by Range. f runs with the entry's map-shard lock held and
+// must not call back into this Cache.
 func (c *Cache[K, V]) Range(f func(key K, v V, expirationTime time.Time) error) error {
 	cf := func(key K, v *elem[V]) (newV *elem[V], setV bool, delV bool, err error) {
 		return nil, false, false, f(key, v.v, v.expirationTime)
@@ -112,8 +180,10 @@ func (c *Cache[K, V]) Range(f func(key K, v V, expirationTime time.Time) error) 
 	return c.m.RangeDo(cf)
 }
 
-// Store stores this kv in cache. If expirationTime is before time.Now(),
-// Store is an noop.
+// Store stores this kv in cache. If expirationTime is before time.Now(), Store
+// is a no-op. Overwriting a physical entry, including an expired one, reports
+// RemovalCauseReplaced. Displacing a different entry because the shard is full
+// reports RemovalCauseCapacity.
 func (c *Cache[K, V]) Store(key K, v V, expirationTime time.Time) {
 	now := time.Now()
 	if now.After(expirationTime) {
@@ -133,6 +203,9 @@ func (c *Cache[K, V]) Store(key K, v V, expirationTime time.Time) {
 // rejects them. The predicate and store run while holding the same underlying
 // map-shard lock, so another Store, Get expiry deletion, or cache eviction
 // cannot interleave between them.
+//
+// Replacing a physical entry reports RemovalCauseReplaced. If match rejects an
+// expired physical entry, its deletion reports RemovalCauseExpired.
 //
 // match must be non-nil and must not call back into this Cache.
 func (c *Cache[K, V]) StoreIf(key K, v V, expirationTime time.Time, match func(current V, ok bool) bool) bool {
@@ -201,7 +274,9 @@ func (c *Cache[K, V]) Len() int {
 	return c.m.Len()
 }
 
-// Flush removes all stored entries from this cache.
+// Flush removes all stored entries observed during its shard-by-shard pass and
+// reports each with RemovalCauseFlushed. A concurrent Store may survive the
+// pass. All callbacks run after the pass has released every map-shard lock.
 func (c *Cache[K, V]) Flush() {
 	c.m.Flush()
 }

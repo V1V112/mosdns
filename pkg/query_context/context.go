@@ -150,8 +150,16 @@ func (ctx *Context) StartTime() time.Time {
 // logs are not attributed to the client request that originally populated the
 // cache.
 func (ctx *Context) RenewTrace() {
+	previousStart := ctx.startTime
 	ctx.id, ctx.TraceID = newTraceIdentity()
 	ctx.startTime = time.Now()
+	// Some platforms expose a coarse wall-clock resolution. A replay started
+	// immediately after its source context was copied can therefore observe the
+	// exact same timestamp. Keep the new trace's start strictly newer so logs and
+	// elapsed-time accounting cannot be mistaken for the client request.
+	if !ctx.startTime.After(previousStart) {
+		ctx.startTime = previousStart.Add(time.Nanosecond)
+	}
 }
 
 // Q returns the query msg that will be forward to upstream.

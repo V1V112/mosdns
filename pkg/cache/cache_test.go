@@ -291,3 +291,146 @@ func TestCacheGetDoesNotDeleteConcurrentFreshStore(t *testing.T) {
 		t.Fatalf("fresh concurrent store = (%d, %v), want (2, true)", got, ok)
 	}
 }
+
+type testCacheRemovalEvent struct {
+	key   testKey
+	value int
+	cause RemovalCause
+}
+
+func TestCacheRemovalCallbackReportsReplacementCapacityExpiryGCAndFlush(t *testing.T) {
+	var c *Cache[testKey, int]
+	var eventsMu sync.Mutex
+	var events []testCacheRemovalEvent
+	c = NewWithRemovalCallback[testKey, int](
+		Opts{Size: 64, CleanerInterval: time.Hour},
+		func(key testKey, value int, cause RemovalCause) {
+			// Len visits the callback's shard. It would deadlock if a map-shard
+			// write lock were still held while the callback ran.
+			_ = c.Len()
+			eventsMu.Lock()
+			events = append(events, testCacheRemovalEvent{key: key, value: value, cause: cause})
+			eventsMu.Unlock()
+		},
+	)
+	defer c.Close()
+
+	run := func(name string, f func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f()
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s deadlocked in removal callback", name)
+		}
+	}
+
+	future := time.Now().Add(time.Hour)
+	c.Store(0, 10, future)
+	run("Store replacement", func() { c.Store(0, 11, future) })
+	run("Store capacity eviction", func() { c.Store(64, 12, future) })
+	run("StoreIf replacement", func() {
+		if !c.StoreIf(64, 13, future, func(current int, ok bool) bool {
+			return ok && current == 12
+		}) {
+			t.Error("StoreIf did not replace matching value")
+		}
+	})
+
+	// Get removes exactly the expired element it observed.
+	c.m.Set(1, &elem[int]{v: 20, expirationTime: time.Now().Add(-time.Second)})
+	run("Get expiry", func() {
+		if _, _, ok := c.Get(1); ok {
+			t.Error("Get returned an expired value")
+		}
+	})
+
+	// A rejected StoreIf treats an expired current value as absent and removes
+	// its stale physical entry.
+	c.m.Set(2, &elem[int]{v: 30, expirationTime: time.Now().Add(-time.Second)})
+	run("StoreIf expiry", func() {
+		if c.StoreIf(2, 31, future, func(_ int, ok bool) bool { return ok }) {
+			t.Error("StoreIf stored after rejecting an expired value")
+		}
+	})
+
+	// GC reports every expired element it actually removes.
+	c.m.Set(3, &elem[int]{v: 40, expirationTime: time.Now().Add(-time.Second)})
+	run("GC expiry", func() { c.gc(time.Now()) })
+
+	c.Store(4, 50, future)
+	run("Flush", c.Flush)
+
+	want := []testCacheRemovalEvent{
+		{key: 0, value: 10, cause: RemovalCauseReplaced},
+		{key: 0, value: 11, cause: RemovalCauseCapacity},
+		{key: 64, value: 12, cause: RemovalCauseReplaced},
+		{key: 1, value: 20, cause: RemovalCauseExpired},
+		{key: 2, value: 30, cause: RemovalCauseExpired},
+		{key: 3, value: 40, cause: RemovalCauseExpired},
+		{key: 64, value: 13, cause: RemovalCauseFlushed},
+		{key: 4, value: 50, cause: RemovalCauseFlushed},
+	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	if len(events) != len(want) {
+		t.Fatalf("removal events = %#v, want %#v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("removal event %d = %#v, want %#v", i, events[i], want[i])
+		}
+	}
+}
+
+func TestCacheRemovalCallbackSkipsNoopStoreAndEmptyFlush(t *testing.T) {
+	var calls atomic.Int32
+	c := NewWithRemovalCallback[testKey, int](
+		Opts{Size: 64, CleanerInterval: time.Hour},
+		func(testKey, int, RemovalCause) {
+			calls.Add(1)
+		},
+	)
+	defer c.Close()
+
+	c.Store(0, 1, time.Now().Add(-time.Second))
+	if c.StoreIf(0, 1, time.Now().Add(-time.Second), func(int, bool) bool { return true }) {
+		t.Fatal("StoreIf accepted an expired replacement deadline")
+	}
+	c.Flush()
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("no-op operations emitted %d callbacks", got)
+	}
+}
+
+func TestCacheExpiredEntryEmitsOneCallbackUnderConcurrentGet(t *testing.T) {
+	var expirations atomic.Int32
+	c := NewWithRemovalCallback[testKey, int](
+		Opts{Size: 64, CleanerInterval: time.Hour},
+		func(_ testKey, _ int, cause RemovalCause) {
+			if cause == RemovalCauseExpired {
+				expirations.Add(1)
+			}
+		},
+	)
+	defer c.Close()
+	c.m.Set(0, &elem[int]{v: 1, expirationTime: time.Now().Add(-time.Second)})
+
+	const readers = 32
+	var wg sync.WaitGroup
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = c.Get(0)
+		}()
+	}
+	wg.Wait()
+	if got := expirations.Load(); got != 1 {
+		t.Fatalf("expiration callbacks = %d, want 1", got)
+	}
+}

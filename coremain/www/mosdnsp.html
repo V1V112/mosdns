@@ -2128,7 +2128,7 @@
                 try {
                     for (const cacheTag of cacheTags) {
                         const path = `/plugins/${encodeURIComponent(cacheTag)}/flush`;
-                        const response = await fetch(path);
+                        const response = await fetch(path, { method: 'POST' });
                         if (!response.ok) {
                             const errorText = await response.text();
                             throw new Error(`清空缓存失败于 ${path}: ${errorText || response.statusText}`);

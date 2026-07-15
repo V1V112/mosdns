@@ -494,12 +494,12 @@ func TestActiveRefresh_MaxRefreshTimesCountsSuccesses(t *testing.T) {
 	if meta == nil {
 		t.Fatal("active refresh metadata was not tracked")
 	}
-	meta.refreshCount.Store(1)
+	prepared.item.refreshSuccess.Store(1)
 	meta.stopped.Store(true)
 
 	c.observeActiveRefresh(k, prepared.item, qCtx, sequence.ChainWalker{}, now.Add(time.Second), prepared.msg)
 	c.activeMu.RLock()
-	refreshCount := meta.refreshCount.Load()
+	refreshCount := prepared.item.refreshSuccess.Load()
 	stopped := meta.stopped.Load()
 	task := meta.task
 	c.activeMu.RUnlock()
@@ -510,7 +510,7 @@ func TestActiveRefresh_MaxRefreshTimesCountsSuccesses(t *testing.T) {
 
 func TestActiveRefresh_TransientResponseDoesNotReplaceHealthyEntry(t *testing.T) {
 	c := newCacheForTest(t, &Args{
-		Size: 16,
+		Size: shardCount,
 		ActiveRefresh: ActiveRefreshArgs{
 			Enabled: true,
 			Workers: 1,
@@ -732,7 +732,7 @@ func TestHealthyForegroundAnswerReplacesProbeStaleDerivative(t *testing.T) {
 }
 
 func TestL2PromotionCannotRestoreStaleL1(t *testing.T) {
-	c := newCacheForTest(t, &Args{Size: 16}, Opts{})
+	c := newCacheForTest(t, &Args{Size: shardCount}, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("promotion-race.example.", dns.TypeA, dns.ClassINET, true)
@@ -918,7 +918,7 @@ func TestReadDumpInvalidatesDerivedViewsAndRefreshEpoch(t *testing.T) {
 }
 
 func TestNegativeSOATTLKeepsCachedMessageAndL1ExpirationAligned(t *testing.T) {
-	c := newCacheForTest(t, &Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
+	c := newCacheForTest(t, &Args{Size: shardCount, LazyCacheTTL: 3600}, Opts{})
 	defer c.Close()
 
 	for _, tc := range []struct {
@@ -1090,7 +1090,7 @@ func TestFallbackRetentionAndStaleEntryAreBounded(t *testing.T) {
 }
 
 func TestPrepareCacheEntryPreservesUpstreamECSSourceScope(t *testing.T) {
-	c := newCacheForTest(t, &Args{Size: 16}, Opts{})
+	c := newCacheForTest(t, &Args{Size: shardCount}, Opts{})
 	defer c.Close()
 
 	qCtx := newTestQuery("upstream-ecs.example.", dns.TypeA, dns.ClassINET, true)
@@ -1354,5 +1354,177 @@ func TestActiveRefresh_ExcludeDomainMatcher(t *testing.T) {
 	}
 	if _, ok := m.Match("a.test.example.com."); ok {
 		t.Fatal("full rule should not match subdomain")
+	}
+}
+
+func TestBackendCapacityEvictionInvalidatesMatchingL1(t *testing.T) {
+	c := newCacheForTest(t, &Args{Size: 64}, Opts{})
+	defer c.Close()
+
+	var oldKey, replacementKey key
+	var backendShard uint64
+	for i := 0; i < 10000; i++ {
+		candidate := key("capacity-eviction-" + strconv.Itoa(i))
+		l1Shard := c.shards[candidate.Sum()%shardCount]
+		if oldKey == "" {
+			if len(l1Shard.order) == 0 {
+				continue
+			}
+			oldKey = candidate
+			backendShard = candidate.Sum() % 64
+			continue
+		}
+		if candidate != oldKey && candidate.Sum()%64 == backendShard {
+			replacementKey = candidate
+			break
+		}
+	}
+	if oldKey == "" || replacementKey == "" {
+		t.Fatal("failed to find keys in the same backend shard")
+	}
+
+	qCtx := newTestQuery("capacity-eviction.example.", dns.TypeA, dns.ClassINET, true)
+	old := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+	if !c.commitPrepared(oldKey, nil, 0, old) {
+		t.Fatal("failed to seed capacity victim")
+	}
+	oldShard := c.shards[oldKey.Sum()%shardCount]
+	oldShard.RLock()
+	seeded := oldShard.items[oldKey]
+	oldShard.RUnlock()
+	if seeded == nil || seeded.source != old.item {
+		t.Fatal("capacity victim was not seeded in L1")
+	}
+
+	replacement := testPreparedA(t, qCtx.Q(), "192.0.2.2", time.Hour)
+	c.backend.Store(replacementKey, replacement.item, replacement.cacheExpiration)
+	if _, _, ok := c.backend.Get(oldKey); ok {
+		t.Fatal("old entry survived a capacity-one backend insertion")
+	}
+	if !old.item.backendRemoved.Load() {
+		t.Fatal("capacity-evicted item was not marked as removed from L2")
+	}
+	oldShard.RLock()
+	_, present := oldShard.items[oldKey]
+	oldShard.RUnlock()
+	if present {
+		t.Fatal("capacity-evicted backend entry remained hittable in L1")
+	}
+}
+
+func TestL1RemovalMatchesOldPointerAndClearsItsClockSlot(t *testing.T) {
+	c := newCacheForTest(t, &Args{Size: 2 * shardCount}, Opts{})
+	defer c.Close()
+
+	qCtx := newTestQuery("l1-pointer-match.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	old := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+	newer := testPreparedA(t, qCtx.Q(), "192.0.2.2", time.Hour)
+	if !c.commitPrepared(k, nil, 0, old) {
+		t.Fatal("failed to seed old L1 entry")
+	}
+	shard := c.shards[k.Sum()%shardCount]
+	shard.RLock()
+	oldSlot := shard.items[k].slot
+	shard.RUnlock()
+
+	if !c.commitPrepared(k, old.item, c.refreshEpoch.Load(), newer) {
+		t.Fatal("failed to replace old entry")
+	}
+	shard.RLock()
+	current := shard.items[k]
+	oldSlotValue := shard.order[oldSlot]
+	shard.RUnlock()
+	if current == nil || current.source != newer.item {
+		t.Fatal("newer pointer was not installed in L1")
+	}
+	if current.slot == oldSlot || oldSlotValue != "" {
+		t.Fatalf("old clock slot was reused or left stale: old=%d new=%d value=%q", oldSlot, current.slot, oldSlotValue)
+	}
+
+	if c.removeL1IfSource(k, old.item) {
+		t.Fatal("delayed old-pointer notification removed a newer L1 entry")
+	}
+	shard.RLock()
+	preserved := shard.items[k]
+	newSlotValue := shard.order[current.slot]
+	shard.RUnlock()
+	if preserved == nil || preserved.source != newer.item || newSlotValue != k {
+		t.Fatal("newer L1 entry or its clock slot was not preserved")
+	}
+
+	if !c.removeL1IfSource(k, newer.item) {
+		t.Fatal("matching pointer did not remove L1 entry")
+	}
+	shard.RLock()
+	_, present := shard.items[k]
+	clearedSlot := shard.order[current.slot]
+	shard.RUnlock()
+	if present || clearedSlot != "" {
+		t.Fatal("matching removal left the item or its clock slot behind")
+	}
+}
+
+func TestL1CapacityTracksBackendBudgetAndFlushPreservesLayout(t *testing.T) {
+	for _, size := range []int{1, shardCount - 1, shardCount, shardCount + 1, l1TotalCap + 1024} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			c := newCacheForTest(t, &Args{Size: size}, Opts{})
+			defer c.Close()
+			wantTotal := min(size, l1TotalCap)
+			base := wantTotal / shardCount
+			extra := wantTotal % shardCount
+			gotTotal := 0
+			zeroCapacityShards := 0
+			for i, shard := range c.shards {
+				want := base
+				if i < extra {
+					want++
+				}
+				if got := len(shard.order); got != want {
+					t.Fatalf("shard %d capacity = %d, want %d", i, got, want)
+				}
+				gotTotal += len(shard.order)
+				if len(shard.order) == 0 {
+					zeroCapacityShards++
+				}
+			}
+			if gotTotal != wantTotal {
+				t.Fatalf("total L1 capacity = %d, want %d", gotTotal, wantTotal)
+			}
+			if size < shardCount && zeroCapacityShards == 0 {
+				t.Fatal("small cache did not create any zero-capacity L1 shards")
+			}
+		})
+	}
+
+	c := newCacheForTest(t, &Args{Size: shardCount + 1}, Opts{})
+	defer c.Close()
+	capacities := make([]int, shardCount)
+	for i, shard := range c.shards {
+		capacities[i] = len(shard.order)
+	}
+	qCtx := newTestQuery("dynamic-flush.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+	if !c.commitPrepared(k, nil, 0, prepared) {
+		t.Fatal("failed to seed cache before flush")
+	}
+
+	rr := httptest.NewRecorder()
+	c.Api().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/flush", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("flush status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if !prepared.item.backendRemoved.Load() {
+		t.Fatal("flush did not mark the backend item as removed")
+	}
+	for i, shard := range c.shards {
+		shard.RLock()
+		capacity := len(shard.order)
+		items, refs, pos := len(shard.items), len(shard.ref), shard.pos
+		shard.RUnlock()
+		if capacity != capacities[i] || items != 0 || refs != 0 || pos != 0 {
+			t.Fatalf("shard %d after flush: capacity=%d items=%d refs=%d pos=%d", i, capacity, items, refs, pos)
+		}
 	}
 }
