@@ -843,6 +843,126 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 	}
 }
 
+func TestLazyRefreshReservesQueueBeforeContextCopy(t *testing.T) {
+	c := newCacheForTest(t, &Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
+	defer c.Close()
+	qCtx := newTestQuery("lazy-permit.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Minute)
+	if !c.commitPrepared(k, nil, 0, prepared) {
+		t.Fatal("failed to seed lazy cache entry")
+	}
+
+	for i := 0; i < cap(c.lazyQueueSlots); i++ {
+		c.lazyQueueSlots <- struct{}{}
+	}
+	before := counterValue(t, c.lazyDropTotal)
+	c.doLazyUpdate(k, prepared.item, qCtx, sequence.ChainWalker{})
+	if got := counterValue(t, c.lazyDropTotal); got != before+1 {
+		t.Fatalf("lazy drops = %v, want %v", got, before+1)
+	}
+	if len(c.lazyTaskChan) != 0 {
+		t.Fatalf("lazy task was built and queued without a permit: %d", len(c.lazyTaskChan))
+	}
+	flight := refreshFlightKey{k: k, generation: prepared.item.generation}
+	if _, retained := c.refreshInFlight.Load(flight); retained {
+		t.Fatal("queue rejection retained the lazy inflight claim")
+	}
+	for i := 0; i < cap(c.lazyQueueSlots); i++ {
+		<-c.lazyQueueSlots
+	}
+}
+
+func TestLazyRefreshMissingBackendRemovesPinnedActiveMetadata(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
+	defer c.Close()
+	qCtx := newTestQuery("lazy-missing-active.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Minute)
+	if !c.commitPrepared(k, nil, 0, prepared) {
+		t.Fatal("failed to seed lazy cache entry")
+	}
+	c.trackActiveRefresh(k, prepared.item, qCtx, sequence.ChainWalker{}, time.Now(), prepared.msg)
+	flight := refreshFlightKey{k: k, generation: prepared.item.generation}
+	c.refreshInFlight.Store(flight, struct{}{})
+	c.backend.Flush()
+	c.runLazyUpdateTask(&lazyTask{
+		k: k, qCtx: qCtx.CopyWithoutResponse(), expected: prepared.item,
+		epoch: c.refreshEpoch.Load(), flight: flight,
+	})
+	c.activeMu.RLock()
+	_, tracked := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if tracked {
+		t.Fatal("lazy owner left active metadata pinned after backend removal")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestLazyRefreshFinalizerCleansBackendRemovedDuringExecution(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
+	defer c.Close()
+	qCtx := newTestQuery("lazy-finalizer-active.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Minute)
+	if !c.commitPrepared(k, nil, 0, prepared) {
+		t.Fatal("failed to seed lazy cache entry")
+	}
+	c.trackActiveRefresh(k, prepared.item, qCtx, sequence.ChainWalker{}, time.Now(), prepared.msg)
+	if current, _, present := c.backend.Get(k); !present || current != prepared.item {
+		t.Fatal("lazy preflight did not observe the expected backend item")
+	}
+	flight := refreshFlightKey{k: k, generation: prepared.item.generation}
+	c.refreshInFlight.Store(flight, struct{}{})
+	task := &lazyTask{k: k, expected: prepared.item, flight: flight}
+
+	// Model capacity/expiry removal after preflight but before a failed lazy
+	// continuation returns. The deferred owner finalizer must clean metadata.
+	c.backend.Flush()
+	c.finishLazyUpdateTask(task)
+	c.activeMu.RLock()
+	_, tracked := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if tracked {
+		t.Fatal("lazy finalizer left metadata after mid-execution backend removal")
+	}
+	if _, retained := c.refreshInFlight.Load(flight); retained {
+		t.Fatal("lazy finalizer retained its inflight claim")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestLazyQueueRejectionReleasesPinnedMissingMetadata(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16, LazyCacheTTL: 3600}, Opts{})
+	defer c.Close()
+	qCtx := newTestQuery("lazy-rejected-missing.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Minute)
+	if !c.commitPrepared(k, nil, 0, prepared) {
+		t.Fatal("failed to seed lazy cache entry")
+	}
+	c.trackActiveRefresh(k, prepared.item, qCtx, sequence.ChainWalker{}, time.Now(), prepared.msg)
+	for i := 0; i < cap(c.lazyQueueSlots); i++ {
+		c.lazyQueueSlots <- struct{}{}
+	}
+	c.backend.Flush()
+	c.doLazyUpdate(k, prepared.item, qCtx, sequence.ChainWalker{})
+	for i := 0; i < cap(c.lazyQueueSlots); i++ {
+		<-c.lazyQueueSlots
+	}
+	c.activeMu.RLock()
+	_, tracked := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if tracked {
+		t.Fatal("queue rejection left backend-missing active metadata pinned")
+	}
+	flight := refreshFlightKey{k: k, generation: prepared.item.generation}
+	if _, retained := c.refreshInFlight.Load(flight); retained {
+		t.Fatal("queue rejection retained its inflight claim")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
 func TestReadDumpInvalidatesDerivedViewsAndRefreshEpoch(t *testing.T) {
 	targetArgs := &Args{Size: 16}
 	target := newCacheForTest(t, targetArgs, Opts{})

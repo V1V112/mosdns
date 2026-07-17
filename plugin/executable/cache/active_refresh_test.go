@@ -61,6 +61,42 @@ func seedTrackedEntry(t *testing.T, c *Cache, name string, ttl, age time.Duratio
 	return k, qCtx, p
 }
 
+func replayContextForTest(t *testing.T, meta *activeRefreshMeta) *query_context.Context {
+	t.Helper()
+	if meta == nil || meta.replay == nil {
+		t.Fatal("active refresh metadata has no replay snapshot")
+	}
+	qCtx, err := meta.replay.ContextForReplay()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return qCtx
+}
+
+func assertActiveEvictionInvariant(t *testing.T, c *Cache) {
+	t.Helper()
+	c.activeMu.RLock()
+	defer c.activeMu.RUnlock()
+	if len(c.activeMeta) != len(c.activeEviction) {
+		t.Fatalf("active metadata/eviction heap lengths differ: %d/%d", len(c.activeMeta), len(c.activeEviction))
+	}
+	seen := make(map[*activeRefreshMeta]struct{}, len(c.activeEviction))
+	for i, meta := range c.activeEviction {
+		if meta == nil || meta.evictionIndex != i || c.activeMeta[meta.k] != meta {
+			t.Fatalf("invalid eviction heap entry %d: %#v", i, meta)
+		}
+		if _, duplicate := seen[meta]; duplicate {
+			t.Fatalf("duplicate eviction heap entry %d: %#v", i, meta)
+		}
+		seen[meta] = struct{}{}
+	}
+	for k, meta := range c.activeMeta {
+		if _, ok := seen[meta]; !ok || meta.k != k {
+			t.Fatalf("metadata entry is missing from eviction heap: key=%q meta=%#v", k, meta)
+		}
+	}
+}
+
 func TestActiveRefreshDynamicTimingHelpers(t *testing.T) {
 	if got := calculateRetryDelay(12*time.Second, 10*time.Second); got != 4*time.Second {
 		t.Fatalf("retry delay = %s, want 4s", got)
@@ -231,7 +267,7 @@ func TestActiveRefreshSuccessReschedulesFromNewTTL(t *testing.T) {
 	task := c.activeMeta[k].task
 	c.activeMu.RUnlock()
 	work := &activeRefreshWork{
-		task: task, qCtx: task.meta.qCtx.CopyWithoutResponse(), next: task.meta.next.Fork(),
+		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, next: task.meta.next.Fork(),
 		expected: old.item, epoch: c.refreshEpoch.Load(),
 		flight: refreshFlightKey{k: k, generation: old.item.generation},
 	}
@@ -270,7 +306,7 @@ func TestMaxRefreshSuccessLimitStopsUntilRealAccess(t *testing.T) {
 	task := c.activeMeta[k].task
 	c.activeMu.RUnlock()
 	c.runActiveRefreshTask(&activeRefreshWork{
-		task: task, qCtx: task.meta.qCtx.CopyWithoutResponse(), expected: old.item,
+		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: old.item,
 		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: old.item.generation},
 	})
 
@@ -313,7 +349,7 @@ func TestSuccessfulRefreshCommitsNewlyExcludedAnswerThenStops(t *testing.T) {
 	task := c.activeMeta[k].task
 	c.activeMu.RUnlock()
 	c.runActiveRefreshTask(&activeRefreshWork{
-		task: task, qCtx: task.meta.qCtx.CopyWithoutResponse(), expected: old.item,
+		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: old.item,
 		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: old.item.generation},
 	})
 	current, _, ok := c.backend.Get(k)
@@ -341,7 +377,7 @@ func TestActiveRefreshFailureUsesDynamicRetry(t *testing.T) {
 	task := c.activeMeta[k].task
 	c.activeMu.RUnlock()
 	work := &activeRefreshWork{
-		task: task, qCtx: task.meta.qCtx.CopyWithoutResponse(), expected: old.item,
+		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: old.item,
 		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: old.item.generation},
 	}
 	before := time.Now()
@@ -371,7 +407,7 @@ func TestInsufficientTimeSkipsRequery(t *testing.T) {
 	task := c.activeMeta[k].task
 	c.activeMu.RUnlock()
 	work := &activeRefreshWork{
-		task: task, qCtx: task.meta.qCtx.CopyWithoutResponse(), expected: p.item,
+		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: p.item,
 		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: p.item.generation},
 	}
 	c.runActiveRefreshTask(work)
@@ -726,6 +762,278 @@ func TestMetadataCapPinsInflightAndDispatchedTask(t *testing.T) {
 	}
 }
 
+func TestMetadataEvictionHeapUsesLeastUrgentOrder(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 4096}, Opts{})
+	defer c.Close()
+
+	k1, _, _ := seedTrackedEntry(t, c, "eviction-one.example.", time.Hour, 0)
+	k2, _, _ := seedTrackedEntry(t, c, "eviction-two.example.", 2*time.Hour, 0)
+	k3, _, _ := seedTrackedEntry(t, c, "eviction-three.example.", 3*time.Hour, 0)
+	assertActiveEvictionInvariant(t, c)
+
+	// Keep the backend roomy while exercising the metadata admission cap.
+	c.args.Size = 3
+	c.activeMu.Lock()
+	evicted := c.evictLeastUrgentMetaLocked()
+	_, has1 := c.activeMeta[k1]
+	_, has2 := c.activeMeta[k2]
+	_, has3 := c.activeMeta[k3]
+	c.activeMu.Unlock()
+	if !evicted || !has1 || !has2 || has3 {
+		t.Fatalf("least-urgent eviction: evicted=%v present=%v/%v/%v", evicted, has1, has2, has3)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestMetadataEvictionHeapFixesGenerationHandoff(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 4096}, Opts{})
+	defer c.Close()
+
+	k1, qCtx1, old := seedTrackedEntry(t, c, "eviction-handoff.example.", time.Hour, 0)
+	k2, _, _ := seedTrackedEntry(t, c, "eviction-other.example.", 2*time.Hour, 0)
+	newer := testPreparedA(t, qCtx1.Q(), "192.0.2.2", 3*time.Hour)
+	if !c.commitPrepared(k1, old.item, c.refreshEpoch.Load(), newer) {
+		t.Fatal("failed to commit handoff generation")
+	}
+	c.updateActiveRefreshAfterCommit(k1, old.item, newer.item, time.Now(), newer.msg, false, qCtx1, sequence.ChainWalker{})
+	assertActiveEvictionInvariant(t, c)
+
+	c.args.Size = 2
+	c.activeMu.Lock()
+	evicted := c.evictLeastUrgentMetaLocked()
+	_, has1 := c.activeMeta[k1]
+	_, has2 := c.activeMeta[k2]
+	c.activeMu.Unlock()
+	if !evicted || has1 || !has2 {
+		t.Fatalf("handoff heap fix: evicted=%v present=%v/%v", evicted, has1, has2)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestMetadataEvictionProbeBudgetIsBounded(t *testing.T) {
+	const entries = activeRefreshEvictionProbes + 6
+	c := newDormantActiveCache(t, &Args{Size: 8192}, Opts{})
+	defer c.Close()
+
+	flights := make([]refreshFlightKey, 0, entries)
+	for i := 0; i < entries; i++ {
+		k, _, p := seedTrackedEntry(t, c, "eviction-pinned-"+strconv.Itoa(i)+".example.", time.Hour, 0)
+		flight := refreshFlightKey{k: k, generation: p.item.generation}
+		c.refreshInFlight.Store(flight, struct{}{})
+		flights = append(flights, flight)
+	}
+	c.args.Size = entries
+	c.activeMu.Lock()
+	evicted := c.evictLeastUrgentMetaLocked()
+	remaining := len(c.activeMeta)
+	c.activeMu.Unlock()
+	if evicted || remaining != entries {
+		t.Fatalf("all-pinned eviction: evicted=%v remaining=%d, want %d", evicted, remaining, entries)
+	}
+	assertActiveEvictionInvariant(t, c)
+
+	// Unpin the current root. The next attempt should need only one indexed
+	// candidate instead of revisiting the full metadata map.
+	c.activeMu.RLock()
+	root := c.activeEviction[0]
+	rootFlight := refreshFlightKey{k: root.k, generation: root.expected.generation}
+	c.activeMu.RUnlock()
+	c.refreshInFlight.Delete(rootFlight)
+	c.activeMu.Lock()
+	evicted = c.evictLeastUrgentMetaLocked()
+	remaining = len(c.activeMeta)
+	c.activeMu.Unlock()
+	if !evicted || remaining != entries-1 {
+		t.Fatalf("unblocked indexed eviction: evicted=%v remaining=%d", evicted, remaining)
+	}
+	for _, flight := range flights {
+		c.refreshInFlight.Delete(flight)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestBackendRemovalHintCleansIndexedMetadata(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, _, p := seedTrackedEntry(t, c, "backend-removal.example.", time.Hour, 0)
+	// Replace the physical backend envelope with an already-expired one using
+	// the same item, then let Get emit the exact Expired callback.
+	c.backend.Store(k, p.item, time.Now().Add(10*time.Millisecond))
+	time.Sleep(25 * time.Millisecond)
+	if _, _, present := c.backend.Get(k); present {
+		t.Fatal("expired backend item remained present")
+	}
+	c.moveDueActiveTasks(time.Now())
+	c.activeMu.RLock()
+	_, tracked := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if tracked {
+		t.Fatal("backend removal hint left stale active metadata")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestOutOfOrderBackendRemovalHintPreservesHandoff(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "backend-removal-handoff.example.", time.Hour, 0)
+	newer := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Hour)
+	if !c.commitPrepared(k, old.item, c.refreshEpoch.Load(), newer) {
+		t.Fatal("failed to commit handoff generation")
+	}
+	// Simulate a delayed capacity/expiry notification for the old physical
+	// entry. The newer backend pointer must protect the metadata handoff.
+	c.noteActiveBackendRemoval(k, old.item)
+	c.moveDueActiveTasks(time.Now())
+	c.activeMu.RLock()
+	preserved := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if preserved == nil || preserved.expected != old.item {
+		t.Fatalf("out-of-order removal destroyed handoff metadata: %#v", preserved)
+	}
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, qCtx, sequence.ChainWalker{})
+	c.activeMu.RLock()
+	handedOff := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if handedOff == nil || handedOff.expected != newer.item || handedOff.task == nil {
+		t.Fatalf("generation handoff did not recover: %#v", handedOff)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestBackendRemovalHintsRearmAfterFullBatch(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 128}, Opts{})
+	defer c.Close()
+
+	const hints = activeRefreshEvictionProbes + 6
+	for i := 0; i < hints; i++ {
+		c.noteActiveBackendRemoval(key("removal-hint-"+strconv.Itoa(i)), &item{generation: uint64(i + 1)})
+	}
+	select {
+	case <-c.activeWake:
+	default:
+		t.Fatal("removal hints did not wake the scheduler")
+	}
+	c.activeMu.Lock()
+	c.drainActiveBackendRemovalsLocked(activeRefreshEvictionProbes)
+	c.activeMu.Unlock()
+	remaining := 0
+	c.activeRemoved.Range(func(_, _ any) bool {
+		remaining++
+		return true
+	})
+	if remaining != hints-activeRefreshEvictionProbes {
+		t.Fatalf("remaining removal hints = %d, want %d", remaining, hints-activeRefreshEvictionProbes)
+	}
+	select {
+	case <-c.activeWake:
+	default:
+		t.Fatal("full removal batch did not re-arm the scheduler")
+	}
+	c.activeMu.Lock()
+	c.drainActiveBackendRemovalsLocked(activeRefreshEvictionProbes)
+	c.activeMu.Unlock()
+	remaining = 0
+	c.activeRemoved.Range(func(_, _ any) bool {
+		remaining++
+		return true
+	})
+	if remaining != 0 {
+		t.Fatalf("removal hints were not fully drained: %d", remaining)
+	}
+}
+
+func TestBackendRemovalHintKeepsNewestGeneration(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+	k := key("versioned-removal-hint")
+	old := &item{generation: 1}
+	newer := &item{generation: 2}
+
+	c.noteActiveBackendRemoval(k, newer)
+	c.noteActiveBackendRemoval(k, old)
+	if stored, ok := c.activeRemoved.Load(k); !ok || stored != newer {
+		t.Fatalf("older delayed hint replaced newer hint: %#v, %v", stored, ok)
+	}
+	c.activeRemoved.Clear()
+	c.noteActiveBackendRemoval(k, old)
+	c.noteActiveBackendRemoval(k, newer)
+	if stored, ok := c.activeRemoved.Load(k); !ok || stored != newer {
+		t.Fatalf("newer hint did not replace older hint: %#v, %v", stored, ok)
+	}
+}
+
+func TestNewerRemovalHintCleansOlderMetadataWhenBackendAbsent(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, _, old := seedTrackedEntry(t, c, "newer-hint-old-meta.example.", time.Hour, 0)
+	c.activeMu.Lock()
+	meta := c.activeMeta[k]
+	c.removeMetaTaskLocked(meta)
+	meta.stopped.Store(true)
+	c.activeMu.Unlock()
+	c.backend.Flush()
+	c.noteActiveBackendRemoval(k, &item{generation: old.item.generation + 1})
+	c.activeMu.Lock()
+	c.drainActiveBackendRemovalsLocked(activeRefreshEvictionProbes)
+	_, tracked := c.activeMeta[k]
+	c.activeMu.Unlock()
+	if tracked {
+		t.Fatal("newer removal hint left older stopped metadata without a backend owner")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestDiscardedHandoffOwnerCleansMissingMetadata(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, _, old := seedTrackedEntry(t, c, "discarded-handoff-owner.example.", time.Hour, 0)
+	c.activeMu.Lock()
+	task := c.activeMeta[k].task
+	heap.Remove(&c.activeSchedule, task.scheduleIndex)
+	c.activeMu.Unlock()
+	c.backend.Flush()
+	c.discardActiveTask(task, false)
+	c.activeMu.RLock()
+	_, tracked := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if tracked {
+		t.Fatal("discarded handoff owner left metadata after backend disappeared")
+	}
+	if old.item.activeMeta.Load() != nil {
+		t.Fatal("discarded handoff owner left the entry handle attached")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveOwnerFinalizerCleansBackendRemovedDuringExecution(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, _, old := seedTrackedEntry(t, c, "active-finalizer-missing.example.", time.Hour, 0)
+	c.activeMu.RLock()
+	task := c.activeMeta[k].task
+	c.activeMu.RUnlock()
+	flight := refreshFlightKey{k: k, generation: old.item.generation}
+	c.refreshInFlight.Store(flight, struct{}{})
+	c.backend.Flush()
+	c.finishActiveRefreshWork(&activeRefreshWork{task: task, expected: old.item, flight: flight})
+	c.activeMu.RLock()
+	_, tracked := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if tracked {
+		t.Fatal("active owner finalizer left metadata after backend removal")
+	}
+	if _, retained := c.refreshInFlight.Load(flight); retained {
+		t.Fatal("active owner finalizer retained its inflight claim")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
 func TestMetadataHandoffRecoversEvictedContainer(t *testing.T) {
 	c := newDormantActiveCache(t, &Args{Size: 1}, Opts{})
 	defer c.Close()
@@ -745,6 +1053,339 @@ func TestMetadataHandoffRecoversEvictedContainer(t *testing.T) {
 	c.activeMu.RUnlock()
 	if recovered == nil || recovered.expected != newer.item || recovered.task == nil || recovered.task.generation != newer.item.generation {
 		t.Fatalf("evicted handoff metadata was not recovered: %#v", recovered)
+	}
+}
+
+func TestActiveRefreshHandoffUsesExistingReplayWhenNewSnapshotFails(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "snapshot-failure-handoff.example.", time.Minute, 0)
+	c.activeMu.RLock()
+	originalReplay := c.activeMeta[k].replay
+	c.activeMu.RUnlock()
+	qCtx.Q().Extra = append(qCtx.Q().Extra, &dns.TXT{
+		Hdr: dns.RR_Header{Name: "snapshot-failure-handoff.example.", Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+		Txt: []string{strings.Repeat("x", 256)},
+	})
+	if _, err := qCtx.SnapshotForReplay(); err == nil {
+		t.Fatal("malformed request unexpectedly produced a replay snapshot")
+	}
+	newer := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	committed, displaced := c.commitPreparedForegroundWithDisplaced(k, old.item, c.refreshEpoch.Load(), newer)
+	if !committed || displaced != old.item {
+		t.Fatal("failed to commit replacement generation")
+	}
+	newerAccess := time.Now().Add(time.Second).UnixNano()
+	newer.item.lastRealAccess.Store(newerAccess)
+
+	// A foreground request whose DNS message cannot be packed has no new replay
+	// snapshot. The existing immutable template must still hand off to the new
+	// cache generation instead of leaving metadata attached to old.
+	c.adoptExistingActiveRefreshReplay(k, newer.item, old.item, displaced, time.Now(), newer.msg)
+	c.activeMu.RLock()
+	handedOff := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if handedOff == nil || handedOff.expected != newer.item || handedOff.task == nil || handedOff.task.generation != newer.item.generation {
+		t.Fatalf("existing replay was not handed off: %#v", handedOff)
+	}
+	if handedOff.replay != originalReplay {
+		t.Fatal("handoff replaced the pristine replay template")
+	}
+	if old.item.activeMeta.Load() != nil || newer.item.activeMeta.Load() != handedOff {
+		t.Fatal("generation handles were not transferred to the committed item")
+	}
+	if got := newer.item.lastRealAccess.Load(); got != newerAccess {
+		t.Fatalf("adoption overwrote newer concurrent activity: got %d, want %d", got, newerAccess)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshReplayAdoptionCrossesFallbackDerivative(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "snapshot-fallback-race.example.", time.Minute, 0)
+	old.item.refreshSuccess.Store(7)
+	c.activeMu.RLock()
+	originalReplay := c.activeMeta[k].replay
+	c.activeMu.RUnlock()
+	epoch := c.refreshEpoch.Load()
+	stale := testPreparedA(t, qCtx.Q(), "192.0.2.1", 30*time.Second)
+	stale.item.isStale = true
+	stale.item.staleSourceGeneration = old.item.generation
+	if !c.commitPrepared(k, old.item, epoch, stale) {
+		t.Fatal("failed to install fallback derivative")
+	}
+	c.updateActiveRefreshAfterCommit(k, old.item, stale.item, time.Now(), stale.msg, false, qCtx, sequence.ChainWalker{})
+	c.activeMu.RLock()
+	staleMeta := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if staleMeta == nil || staleMeta.expected != stale.item {
+		t.Fatalf("fallback metadata handoff failed: %#v", staleMeta)
+	}
+
+	fresh := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	committed, displaced := c.commitPreparedForegroundWithDisplaced(k, old.item, epoch, fresh)
+	if !committed || displaced != stale.item {
+		t.Fatal("healthy foreground answer did not replace fallback derivative")
+	}
+	c.adoptExistingActiveRefreshReplay(k, fresh.item, old.item, displaced, time.Now(), fresh.msg)
+	c.activeMu.RLock()
+	handedOff := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if handedOff == nil || handedOff.expected != fresh.item || handedOff.task == nil || handedOff.task.generation != fresh.item.generation {
+		t.Fatalf("fallback replay was not adopted by foreground generation: %#v", handedOff)
+	}
+	if handedOff.replay != originalReplay {
+		t.Fatal("fallback race replaced the existing immutable replay")
+	}
+	if stale.item.activeMeta.Load() != nil || fresh.item.activeMeta.Load() != handedOff {
+		t.Fatal("fallback generation handle was not transferred")
+	}
+	if got := fresh.item.refreshSuccess.Load(); got != 0 {
+		t.Fatalf("foreground adoption inherited refresh-success count %d", got)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshReplayAdoptionHandlesPendingFallbackHandoff(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "snapshot-pending-fallback.example.", time.Minute, 0)
+	c.activeMu.RLock()
+	originalReplay := c.activeMeta[k].replay
+	c.activeMu.RUnlock()
+	epoch := c.refreshEpoch.Load()
+	stale := testPreparedA(t, qCtx.Q(), "192.0.2.1", 30*time.Second)
+	stale.item.isStale = true
+	stale.item.staleSourceGeneration = old.item.generation
+	if !c.commitPrepared(k, old.item, epoch, stale) {
+		t.Fatal("failed to publish fallback derivative")
+	}
+	// Model the short window where backend already contains stale while its
+	// metadata handoff is still waiting: meta intentionally remains on old.
+	c.activeMu.RLock()
+	pending := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if pending == nil || pending.expected != old.item {
+		t.Fatalf("test did not preserve pending fallback handoff: %#v", pending)
+	}
+
+	fresh := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	committed, displaced := c.commitPreparedForegroundWithDisplaced(k, old.item, epoch, fresh)
+	if !committed || displaced != stale.item {
+		t.Fatal("foreground answer did not displace pending fallback")
+	}
+	c.adoptExistingActiveRefreshReplay(k, fresh.item, old.item, displaced, time.Now(), fresh.msg)
+	c.activeMu.RLock()
+	handedOff := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if handedOff == nil || handedOff.expected != fresh.item || handedOff.replay != originalReplay || handedOff.task == nil {
+		t.Fatalf("pending fallback replay was not adopted: %#v", handedOff)
+	}
+	if old.item.activeMeta.Load() != nil || fresh.item.activeMeta.Load() != handedOff {
+		t.Fatal("pending fallback left the wrong generation handle")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshReplayAdoptionCleansUnrelatedOrphan(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "snapshot-removal-race.example.", time.Minute, 0)
+	c.activeMu.RLock()
+	originalReplay := c.activeMeta[k].replay
+	c.activeMu.RUnlock()
+	c.backend.Flush()
+	c.activeMu.RLock()
+	orphaned := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if orphaned == nil || orphaned.expected != old.item {
+		t.Fatalf("test did not retain metadata across backend removal: %#v", orphaned)
+	}
+
+	fresh := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	committed, displaced := c.commitPreparedForegroundWithDisplaced(k, nil, c.refreshEpoch.Load(), fresh)
+	if !committed || displaced != nil {
+		t.Fatal("failed to fill entry removed during foreground lookup")
+	}
+	c.adoptExistingActiveRefreshReplay(k, fresh.item, nil, displaced, time.Now(), fresh.msg)
+	c.activeMu.RLock()
+	_, retained := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if retained {
+		t.Fatal("unrelated orphan replay was adopted by an absent foreground fill")
+	}
+	if old.item.activeMeta.Load() != nil || fresh.item.activeMeta.Load() != nil {
+		t.Fatal("orphan cleanup left a generation handle attached")
+	}
+	if originalReplay == nil {
+		t.Fatal("test did not start with an orphan replay")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshReplayAdoptionAfterObservedEntryRemoval(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "snapshot-observed-removal.example.", time.Minute, 0)
+	c.activeMu.RLock()
+	originalReplay := c.activeMeta[k].replay
+	c.activeMu.RUnlock()
+	c.backend.Flush()
+	fresh := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	committed, displaced := c.commitPreparedForegroundWithDisplaced(k, old.item, c.refreshEpoch.Load(), fresh)
+	if !committed || displaced != nil {
+		t.Fatal("failed to fill an observed entry removed during lookup")
+	}
+	c.adoptExistingActiveRefreshReplay(k, fresh.item, old.item, displaced, time.Now(), fresh.msg)
+	c.activeMu.RLock()
+	handedOff := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if handedOff == nil || handedOff.expected != fresh.item || handedOff.replay != originalReplay || handedOff.task == nil {
+		t.Fatalf("observed removed replay was not adopted: %#v", handedOff)
+	}
+	if old.item.activeMeta.Load() != nil || fresh.item.activeMeta.Load() != handedOff {
+		t.Fatal("observed removed generation handle was not transferred")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshReplayAdoptionFromTrackedTransient(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	qCtx := newTestQuery("snapshot-transient.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	transientCtx := qCtx.CopyWithoutResponse()
+	servfail := new(dns.Msg)
+	servfail.SetRcode(qCtx.Q(), dns.RcodeServerFailure)
+	transientCtx.SetResponse(servfail)
+	transient, ok := c.prepareCacheEntry(transientCtx, true)
+	if !ok || !transient.item.isTransient {
+		t.Fatal("failed to prepare tracked transient entry")
+	}
+	epoch := c.refreshEpoch.Load()
+	committed, displaced := c.commitPreparedForegroundWithDisplaced(k, nil, epoch, transient)
+	if !committed || displaced != nil {
+		t.Fatal("failed to commit initial transient entry")
+	}
+	c.trackActiveRefresh(k, transient.item, qCtx, sequence.ChainWalker{}, time.Now(), transient.msg)
+	c.activeMu.RLock()
+	transientMeta := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if transientMeta == nil || transientMeta.expected != transient.item || transientMeta.replay == nil {
+		t.Fatalf("transient entry was not tracked: %#v", transientMeta)
+	}
+	transientReplay := transientMeta.replay
+
+	healthy := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	committed, displaced = c.commitPreparedForegroundWithDisplaced(k, nil, epoch, healthy)
+	if !committed || displaced != transient.item {
+		t.Fatal("healthy foreground answer did not displace transient")
+	}
+	c.adoptExistingActiveRefreshReplay(k, healthy.item, nil, displaced, time.Now(), healthy.msg)
+	c.activeMu.RLock()
+	handedOff := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if handedOff == nil || handedOff.expected != healthy.item || handedOff.replay != transientReplay || handedOff.task == nil {
+		t.Fatalf("tracked transient replay was not adopted exactly: %#v", handedOff)
+	}
+	if transient.item.activeMeta.Load() != nil || healthy.item.activeMeta.Load() != handedOff {
+		t.Fatal("transient generation handle was not transferred")
+	}
+	if got := healthy.item.refreshSuccess.Load(); got != 0 {
+		t.Fatalf("healthy foreground entry inherited refresh-success count %d", got)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshReplayAdoptionIgnoresSupersededCommit(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer c.Close()
+
+	k, qCtx, old := seedTrackedEntry(t, c, "snapshot-superseded.example.", time.Minute, 0)
+	epoch := c.refreshEpoch.Load()
+	foreground := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
+	committed, displaced := c.commitPreparedForegroundWithDisplaced(k, old.item, epoch, foreground)
+	if !committed || displaced != old.item {
+		t.Fatal("failed to commit foreground generation")
+	}
+	newer := testPreparedA(t, qCtx.Q(), "192.0.2.3", 3*time.Minute)
+	if !c.commitPrepared(k, foreground.item, epoch, newer) {
+		t.Fatal("failed to supersede foreground generation")
+	}
+	c.trackActiveRefresh(k, newer.item, qCtx, sequence.ChainWalker{}, time.Now(), newer.msg)
+	c.activeMu.RLock()
+	newMeta := c.activeMeta[k]
+	newReplay := newMeta.replay
+	newTask := newMeta.task
+	c.activeMu.RUnlock()
+
+	c.adoptExistingActiveRefreshReplay(k, foreground.item, old.item, displaced, time.Now(), foreground.msg)
+	c.activeMu.RLock()
+	after := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if after != newMeta || after.expected != newer.item || after.replay != newReplay || after.task != newTask {
+		t.Fatalf("superseded adoption touched the current generation: %#v", after)
+	}
+	if newer.item.activeMeta.Load() != newMeta {
+		t.Fatal("superseded adoption detached the current handle")
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshHandoffReusesPristineReplaySnapshot(t *testing.T) {
+	mutationKey := query_context.RegKey()
+	var c *Cache
+	exec := sequence.ExecutableFunc(func(_ context.Context, qCtx *query_context.Context) error {
+		qCtx.StoreValue(mutationKey, "worker mutation")
+		qCtx.SetMark(999)
+		// Simulate the rare commit-handoff recovery path by removing the
+		// metadata container while this worker owns the dispatched task.
+		c.activeMu.Lock()
+		if meta := c.activeMeta[testCacheKey(t, qCtx)]; meta != nil {
+			c.removeActiveMetaLocked(meta.k, meta)
+		}
+		c.activeMu.Unlock()
+		qCtx.SetResponse(testAResponse(t, qCtx.Q(), "192.0.2.2", 60))
+		return nil
+	})
+	c = newDormantActiveCache(t, &Args{Size: 16}, Opts{ActiveRefreshExec: exec})
+	defer c.Close()
+
+	k, _, old := seedTrackedEntry(t, c, "pristine-handoff.example.", 30*time.Second, 22*time.Second)
+	c.activeMu.RLock()
+	task := c.activeMeta[k].task
+	replay := c.activeMeta[k].replay
+	nextBase := c.activeMeta[k].next
+	c.activeMu.RUnlock()
+	qCtx, err := replay.ContextForReplay()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.runActiveRefreshTask(&activeRefreshWork{
+		task: task, replay: replay, qCtx: qCtx, nextBase: nextBase,
+		expected: old.item, epoch: c.refreshEpoch.Load(),
+		flight: refreshFlightKey{k: k, generation: old.item.generation},
+	})
+
+	c.activeMu.RLock()
+	recovered := c.activeMeta[k]
+	c.activeMu.RUnlock()
+	if recovered == nil || recovered.replay != replay || recovered.expected == old.item {
+		t.Fatalf("active refresh did not take over the pristine snapshot: %#v", recovered)
+	}
+	replayed := replayContextForTest(t, recovered)
+	if replayed.IsCacheRefresh() || replayed.HasMark(999) {
+		t.Fatal("worker-only marks leaked into the reusable replay template")
+	}
+	if value, ok := replayed.GetValue(mutationKey); ok || value != nil {
+		t.Fatalf("worker-only value leaked into replay template: %#v, %v", value, ok)
 	}
 }
 
@@ -832,7 +1473,7 @@ func TestExcludedRealHitStillUpdatesPersistedActivity(t *testing.T) {
 }
 
 func TestMaxTasksPerBatchLimitsEachDueTransfer(t *testing.T) {
-	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{
+	c := newDormantActiveCache(t, &Args{Size: 4096, ActiveRefresh: ActiveRefreshArgs{
 		MaxTasksPerBatch: 2, MaxPendingTasks: 16,
 	}}, Opts{})
 	defer c.Close()
@@ -1221,7 +1862,7 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	if got := time.Unix(0, meta.expected.lastRealAccess.Load()); time.Since(got) < 50*time.Second || time.Since(got) > 70*time.Second {
 		t.Fatalf("restored last access = %s", got)
 	}
-	replayCtx := meta.qCtx.CopyWithoutResponse()
+	replayCtx := replayContextForTest(t, meta)
 	replayNext := meta.next.Fork()
 	if err := replayNext.ExecNext(context.Background(), replayCtx); err != nil {
 		t.Fatal(err)

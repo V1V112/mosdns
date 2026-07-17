@@ -373,6 +373,7 @@ func (a *FallbackProbeArgs) init() {
 type lazyTask struct {
 	k        key
 	qCtx     *query_context.Context
+	nextBase sequence.ChainWalker
 	next     sequence.ChainWalker
 	expected *item
 	epoch    uint64
@@ -443,12 +444,15 @@ type Cache struct {
 
 	// 异步更新架构优化
 	refreshInFlight   sync.Map       // active/lazy 共用的按 key、generation 去重字典
+	activeRemoved     sync.Map       // backend removal hints, drained under activeMu
 	lazyTaskChan      chan *lazyTask // 工作队列
+	lazyQueueSlots    chan struct{}  // copying starts only after one slot is reserved
 	lazyWorkers       sync.WaitGroup // 优雅退出等待控制
 	activeMu          sync.RWMutex
 	activeMeta        map[key]*activeRefreshMeta
 	activeSchedule    activeScheduleHeap
 	activePending     activePendingHeap
+	activeEviction    activeEvictionHeap
 	activeWake        chan struct{}
 	activeWorkerReady chan chan *activeRefreshWork
 	activeWorkers     sync.WaitGroup
@@ -604,6 +608,9 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 		if cause != cache.RemovalCauseFlushed && p != nil {
 			p.removeL1IfSource(k, old)
 		}
+		if p != nil && (cause == cache.RemovalCauseExpired || cause == cache.RemovalCauseCapacity) {
+			p.noteActiveBackendRemoval(k, old)
+		}
 	})
 	lb := map[string]string{"tag": opts.MetricsTag}
 	p = &Cache{
@@ -621,6 +628,7 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 		activeRefreshExec:          activeRefreshExec,
 		activeProbe:                probeCachedIP,
 		lazyTaskChan:               make(chan *lazyTask, lazyTaskQueueCapacity),
+		lazyQueueSlots:             make(chan struct{}, lazyTaskQueueCapacity),
 		activeMeta:                 make(map[key]*activeRefreshMeta),
 		activeWake:                 make(chan struct{}, 1),
 		activeRestore:              make(map[key]decodedDumpEntry),
@@ -968,15 +976,20 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		recordRealCacheAccess(cachedItem, now)
 	}
 
-	var refreshCtx *query_context.Context
+	var refreshReplay *query_context.ReplaySnapshot
 	var refreshNext sequence.ChainWalker
 	if c.activeRefreshEnabled() {
-		refreshCtx = qCtx.CopyWithoutResponse()
-		refreshNext = next.Fork()
-		if cachedItem != nil {
+		var snapshotErr error
+		refreshReplay, snapshotErr = qCtx.SnapshotForReplay()
+		if snapshotErr != nil {
+			c.logger.Debug("failed to capture foreground active refresh replay", qCtx.InfoField(), zap.Error(snapshotErr))
+		} else {
+			refreshNext = next.Fork()
+		}
+		if cachedItem != nil && refreshReplay != nil {
 			retainedMsg := new(dns.Msg)
 			if retainedMsg.Unpack(cachedItem.resp) == nil {
-				c.trackActiveRefresh(kReal, cachedItem, refreshCtx, refreshNext, now, retainedMsg)
+				c.trackActiveRefreshReplay(kReal, cachedItem, refreshReplay, refreshNext, now, retainedMsg)
 			}
 		}
 	}
@@ -990,9 +1003,18 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		// replace it, and only commit a healthy foreground result if the cache is
 		// still absent or still contains the version this miss observed.
 		allowTransientFailure := cachedItem == nil
-		if prepared, ok := c.prepareCacheEntry(qCtx, allowTransientFailure); ok && c.commitPreparedForeground(kReal, cachedItem, observedEpoch, prepared) {
-			if refreshCtx != nil {
-				c.trackActiveRefresh(kReal, prepared.item, refreshCtx, refreshNext, time.Now(), prepared.msg)
+		if prepared, ok := c.prepareCacheEntry(qCtx, allowTransientFailure); ok {
+			if committed, displaced := c.commitPreparedForegroundWithDisplaced(kReal, cachedItem, observedEpoch, prepared); committed {
+				if refreshReplay != nil {
+					c.trackActiveRefreshReplay(kReal, prepared.item, refreshReplay, refreshNext, time.Now(), prepared.msg)
+				} else {
+					// Snapshot packing can fail for a malformed request even though
+					// the upstream response is cacheable. Reuse metadata only when it
+					// is proven to share the observed/displaced generation lineage.
+					c.adoptExistingActiveRefreshReplay(
+						kReal, prepared.item, cachedItem, displaced, time.Now(), prepared.msg,
+					)
+				}
 			}
 		}
 	}
@@ -1011,16 +1033,27 @@ func (c *Cache) doLazyUpdate(k key, expected *item, qCtx *query_context.Context,
 	if _, loaded := c.refreshInFlight.LoadOrStore(flight, struct{}{}); loaded {
 		return
 	}
+	// Reserve queue capacity before copying Context or forking walkers. The
+	// reservation counts builders plus queued tasks, so the subsequent send is
+	// guaranteed to fit unless shutdown wins the select.
+	select {
+	case c.lazyQueueSlots <- struct{}{}:
+	default:
+		c.lazyDropTotal.Inc()
+		c.releaseRefreshFlight(k, expected, flight)
+		return
+	}
+	nextBase := next.Fork()
 	task := &lazyTask{
 		k: k, expected: expected,
-		qCtx: qCtx.CopyWithoutResponse(), next: next.Fork(), epoch: epoch, flight: flight,
+		qCtx: qCtx.CopyWithoutResponse(), nextBase: nextBase, next: nextBase.Fork(), epoch: epoch, flight: flight,
 	}
 
 	select {
 	case c.lazyTaskChan <- task:
-	default:
-		c.lazyDropTotal.Inc() // 队列满则丢弃，保障主干 CPU 平滑
-		c.refreshInFlight.Delete(flight)
+	case <-c.closeNotify:
+		<-c.lazyQueueSlots
+		c.releaseRefreshFlight(k, expected, flight)
 	}
 }
 
@@ -1048,6 +1081,7 @@ func (c *Cache) startWorkerPool() {
 				case <-c.closeNotify:
 					return
 				case task := <-c.lazyTaskChan:
+					<-c.lazyQueueSlots
 					if task != nil {
 						c.runLazyUpdateTask(task)
 					}
@@ -1058,14 +1092,16 @@ func (c *Cache) startWorkerPool() {
 }
 
 func (c *Cache) runLazyUpdateTask(task *lazyTask) {
-	defer func() {
-		c.refreshInFlight.Delete(task.flight)
-		c.notifyActiveScheduler()
-	}()
+	defer c.finishLazyUpdateTask(task)
 	if c.lifecycleCtx.Err() != nil || task.epoch != c.refreshEpoch.Load() {
 		return
 	}
-	if current, _, ok := c.backend.Get(task.k); !ok || current != task.expected {
+	current, _, ok := c.backend.Get(task.k)
+	if !ok {
+		c.removeActiveMetaIfExpected(task.k, task.expected)
+		return
+	}
+	if current != task.expected {
 		return
 	}
 	task.qCtx.RenewTrace()
@@ -1088,7 +1124,23 @@ func (c *Cache) runLazyUpdateTask(task *lazyTask) {
 	if !ok || !c.commitPrepared(task.k, task.expected, task.epoch, prepared) {
 		return
 	}
-	c.updateActiveRefreshAfterCommit(task.k, task.expected, prepared.item, time.Now(), prepared.msg, false, task.qCtx, task.next)
+	c.updateActiveRefreshAfterCommit(task.k, task.expected, prepared.item, time.Now(), prepared.msg, false, task.qCtx, task.nextBase)
+}
+
+func (c *Cache) finishLazyUpdateTask(task *lazyTask) {
+	if task == nil {
+		return
+	}
+	c.releaseRefreshFlight(task.k, task.expected, task.flight)
+}
+
+func (c *Cache) releaseRefreshFlight(k key, expected *item, flight refreshFlightKey) {
+	c.refreshInFlight.Delete(flight)
+	// Capacity/expiry hint cleanup deliberately skips inflight owners. Whether
+	// this owner executed, was queue-rejected or failed midway, it therefore
+	// performs one final exact-generation cleanup after releasing the claim.
+	c.removeActiveMetaIfBackendMissing(k, expected)
+	c.notifyActiveScheduler()
 }
 
 func (c *Cache) prepareStaleEntry(old *item, msg *dns.Msg, now time.Time) (*preparedCacheEntry, bool) {
@@ -1157,6 +1209,7 @@ func (c *Cache) Close() error {
 	c.drainPendingRefreshTasks()
 	c.clearActiveRefreshState()
 	c.refreshInFlight.Clear()
+	c.activeRemoved.Clear()
 	if err := c.dumpCache(); err != nil {
 		c.logger.Error("failed to dump cache", zap.Error(err))
 	}
@@ -1170,7 +1223,9 @@ func (c *Cache) clearActiveRefreshState() {
 	}
 	c.activeSchedule = nil
 	c.activePending = nil
+	c.activeEviction = nil
 	c.activeMu.Unlock()
+	c.activeRemoved.Clear()
 
 	c.activeRestoreMu.Lock()
 	clear(c.activeRestore)
@@ -1183,6 +1238,7 @@ func (c *Cache) drainPendingRefreshTasks() {
 	for {
 		select {
 		case <-c.lazyTaskChan:
+			<-c.lazyQueueSlots
 			continue
 		default:
 			return
@@ -1442,7 +1498,9 @@ func (c *Cache) clearRuntimeViews() {
 	}
 	c.activeSchedule = nil
 	c.activePending = nil
+	c.activeEviction = nil
 	c.activeMu.Unlock()
+	c.activeRemoved.Clear()
 
 	c.activeRestoreMu.Lock()
 	clear(c.activeRestore)
@@ -2314,21 +2372,42 @@ func (c *Cache) promoteL1IfCurrent(k key, expected *item, epoch uint64, msg *dns
 }
 
 func (c *Cache) commitPreparedForeground(k key, observed *item, epoch uint64, prepared *preparedCacheEntry) bool {
-	return c.commitPreparedMatching(k, epoch, true, func(current *item, ok bool) bool {
+	committed, _ := c.commitPreparedForegroundWithDisplaced(k, observed, epoch, prepared)
+	return committed
+}
+
+func (c *Cache) commitPreparedForegroundWithDisplaced(
+	k key,
+	observed *item,
+	epoch uint64,
+	prepared *preparedCacheEntry,
+) (bool, *item) {
+	var displaced *item
+	committed := c.commitPreparedMatching(k, epoch, true, func(current *item, ok bool) bool {
+		allowed := false
 		if observed == nil {
 			// The first healthy answer wins an absent-miss race, but a healthy
 			// answer may heal a short-lived SERVFAIL inserted by an earlier peer.
-			return !ok || (current != nil && current.isTransient && !prepared.item.isTransient)
+			allowed = !ok || (current != nil && current.isTransient && !prepared.item.isTransient)
+		} else {
+			// Eviction or expiry can legitimately remove the observed retained item
+			// while the upstream query is running. Epoch protects flush/load, so an
+			// absent current value is still safe to fill. A fallback probe may also
+			// replace the observed item with a short stale derivative while this real
+			// query is in flight; a healthy foreground answer must win that race.
+			allowed = !ok || current == observed ||
+				(!prepared.item.isTransient && current != nil && current.isStale &&
+					current.staleSourceGeneration == observed.generation)
 		}
-		// Eviction or expiry can legitimately remove the observed retained item
-		// while the upstream query is running. Epoch protects flush/load, so an
-		// absent current value is still safe to fill. A fallback probe may also
-		// replace the observed item with a short stale derivative while this real
-		// query is in flight; a healthy foreground answer must win that race.
-		return !ok || current == observed ||
-			(!prepared.item.isTransient && current != nil && current.isStale &&
-				current.staleSourceGeneration == observed.generation)
+		if allowed && ok {
+			displaced = current
+		}
+		return allowed
 	}, prepared)
+	if !committed {
+		return false, nil
+	}
+	return true, displaced
 }
 
 func (c *Cache) commitPreparedMatching(k key, epoch uint64, checkEpoch bool, match func(current *item, ok bool) bool, prepared *preparedCacheEntry) bool {
