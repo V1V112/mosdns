@@ -10,6 +10,7 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -38,6 +39,7 @@ import (
 
 //go:embed combined.o
 var ebpfProg []byte
+
 //go:embed xdp_dns.o
 var xdpEbpfProg []byte
 
@@ -94,8 +96,8 @@ type NftConfig struct {
 	Table        string `yaml:"table_name"`
 	SetV4        string `yaml:"set_v4"`
 	SetV6        string `yaml:"set_v6"`
-	MihomoSetV4    string `yaml:"mihomo_set_v4"` 
-	MihomoSetV6    string `yaml:"mihomo_set_v6"`
+	MihomoSetV4  string `yaml:"mihomo_set_v4"`
+	MihomoSetV6  string `yaml:"mihomo_set_v6"`
 	FixIPFile    string `yaml:"fixip"`
 	NftConfFile  string `yaml:"nftfile"`
 	PureNftFile  string `yaml:"purenft"`
@@ -107,11 +109,11 @@ type NftConfig struct {
 	MihomoFakeIPv4 string `yaml:"mihomo_fakeip_v4"`
 	MihomoFakeIPv6 string `yaml:"mihomo_fakeip_v6"`
 
-	DnsHijack  string `yaml:"dns_hijack"`
-	HijackDip4 string `yaml:"hjack_dip4"`
-	HijackDip6 string `yaml:"hjack_dip6"`
-        EbpfXdp        string `yaml:"xdp_enable"`
-                EbpfXdpIface   string `yaml:"xdp_iface"`
+	DnsHijack    string `yaml:"dns_hijack"`
+	HijackDip4   string `yaml:"hjack_dip4"`
+	HijackDip6   string `yaml:"hjack_dip6"`
+	EbpfXdp      string `yaml:"xdp_enable"`
+	EbpfXdpIface string `yaml:"xdp_iface"`
 }
 
 type RuleSource struct {
@@ -138,10 +140,61 @@ type NftAdd struct {
 	cancel          context.CancelFunc
 
 	startupDone  atomic.Bool
-	ebpfLinks    []link.Link
-	ebpfMap      *ebpf.Map
-	ebpfPrograms []*ebpf.Program
-    xdpLink      link.Link
+	ruleApplyMu  sync.Mutex
+	ruleApplyGen atomic.Uint64
+	ebpfMu       sync.Mutex
+	ebpfRT       *nftEbpfRuntime
+	closing      atomic.Bool
+	closeOnce    sync.Once
+}
+
+type combinedObjects struct {
+	IngressL2     *ebpf.Program `ebpf:"tc_ingress_l2"`
+	DnsHandler    *ebpf.Program `ebpf:"tc_dns_handler"`
+	RouteRules    *ebpf.Map     `ebpf:"route_rules"`
+	JmpDNS        *ebpf.Map     `ebpf:"jmp_dns"`
+	FastDnsCache  *ebpf.Map     `ebpf:"fast_dns_cache"`
+	RingbufEvents *ebpf.Map     `ebpf:"ringbuf_events"`
+}
+
+type nftEbpfRuntime struct {
+	objs    combinedObjects
+	tcxLink link.Link
+	xdpLink link.Link
+	xdpColl *ebpf.Collection
+	pins    []string
+}
+
+func (rt *nftEbpfRuntime) Close() error {
+	if rt == nil {
+		return nil
+	}
+	var errs []error
+	if rt.xdpLink != nil {
+		errs = append(errs, rt.xdpLink.Close())
+	}
+	if rt.tcxLink != nil {
+		errs = append(errs, rt.tcxLink.Close())
+	}
+	for i := len(rt.pins) - 1; i >= 0; i-- {
+		if err := os.Remove(rt.pins[i]); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove eBPF pin %s: %w", rt.pins[i], err))
+		}
+	}
+	if rt.xdpColl != nil {
+		rt.xdpColl.Close()
+	}
+	for _, prog := range []*ebpf.Program{rt.objs.IngressL2, rt.objs.DnsHandler} {
+		if prog != nil {
+			errs = append(errs, prog.Close())
+		}
+	}
+	for _, m := range []*ebpf.Map{rt.objs.JmpDNS, rt.objs.FastDnsCache, rt.objs.RingbufEvents, rt.objs.RouteRules} {
+		if m != nil {
+			errs = append(errs, m.Close())
+		}
+	}
+	return errors.Join(errs...)
 }
 
 var _ data_provider.IPMatcherProvider = (*NftAdd)(nil)
@@ -185,12 +238,12 @@ func newNftAdd(bp *coremain.BP, args any) (any, error) {
 		ctx:             ctx,
 		cancel:          cancel,
 	}
-    if p.nftArgs.MihomoSetV4 == "" {
-        p.nftArgs.MihomoSetV4 = "mihomo_ipv4"
-    }
-    if p.nftArgs.MihomoSetV6 == "" {
-        p.nftArgs.MihomoSetV6 = "mihomo_ipv6"
-    }
+	if p.nftArgs.MihomoSetV4 == "" {
+		p.nftArgs.MihomoSetV4 = "mihomo_ipv4"
+	}
+	if p.nftArgs.MihomoSetV6 == "" {
+		p.nftArgs.MihomoSetV6 = "mihomo_ipv6"
+	}
 	p.matcher.Store(netlist.NewList())
 
 	if err := p.loadConfig(); err != nil {
@@ -219,27 +272,28 @@ func (p *NftAdd) GetIPMatcher() netlist.Matcher {
 }
 
 func (p *NftAdd) Close() error {
-	log.Printf("[%s] closing...", PluginType)
-	p.cancel()
+	var closeErr error
+	p.closeOnce.Do(func() {
+		log.Printf("[%s] closing...", PluginType)
+		p.closing.Store(true)
+		p.cancel()
 
-	if p.xdpLink != nil {
-		p.xdpLink.Close()
-	}
+		p.ruleApplyMu.Lock()
+		p.ebpfMu.Lock()
+		rt := p.ebpfRT
+		p.ebpfRT = nil
+		if rt != nil {
+			closeErr = rt.Close()
+		}
+		if err := os.Remove("/sys/fs/bpf/mosdns_dns_jmp"); err != nil && !os.IsNotExist(err) {
+			closeErr = errors.Join(closeErr, err)
+		}
+		p.ebpfMu.Unlock()
 
-	for _, l := range p.ebpfLinks {
-		l.Close()
-	}
-	for _, prg := range p.ebpfPrograms {
-		prg.Close()
-	}
-
-	os.Remove("/sys/fs/bpf/mosdns_fast_cache")
-	os.Remove("/sys/fs/bpf/mosdns_ringbuf")
-	os.Remove("/sys/fs/bpf/mosdns_jmp_dns")
-	os.Remove("/sys/fs/bpf/mosdns_dns_jmp")
-	
-	p.cleanupRouting()
-	return nil
+		p.cleanupRouting()
+		p.ruleApplyMu.Unlock()
+	})
+	return closeErr
 }
 
 func (p *NftAdd) startupNftRoutine() {
@@ -256,12 +310,29 @@ func (p *NftAdd) startupNftRoutine() {
 	}
 
 	log.Printf("[%s] Phase 1: Preparing IP data (Streaming Mode)...", PluginType)
-	ipSet, err := p.buildFullIPSet()
-	if err != nil {
-		log.Printf("[%s] FATAL: Startup aborted. Failed to build IP set: %v", PluginType, err)
-		return
+	var ipSet *netipx.IPSet
+	var appliedGeneration uint64
+	for {
+		generation := p.ruleApplyGen.Load()
+		var err error
+		ipSet, err = p.buildFullIPSet()
+		if err != nil {
+			log.Printf("[%s] FATAL: Startup aborted. Failed to build IP set: %v", PluginType, err)
+			return
+		}
+		p.ruleApplyMu.Lock()
+		if p.closing.Load() || p.ctx.Err() != nil {
+			p.ruleApplyMu.Unlock()
+			return
+		}
+		if generation == p.ruleApplyGen.Load() {
+			appliedGeneration = generation
+			break
+		}
+		p.ruleApplyMu.Unlock()
+		log.Printf("[%s] Rules changed during startup preparation; rebuilding latest IP set", PluginType)
 	}
-
+	defer p.ruleApplyMu.Unlock()
 	if p.nftArgs.Enable == "nft_true" {
 		log.Printf("[%s] Phase 2: Resetting firewall table '%s'...", PluginType, p.nftArgs.Table)
 		exec.Command("nft", "delete", "table", p.nftArgs.TableFamily, p.nftArgs.Table).Run()
@@ -297,7 +368,12 @@ func (p *NftAdd) startupNftRoutine() {
 		coremain.ManualGC()
 	}
 
+	// Base nft state now exists. Updates that happened before this store did
+	// not queue a worker, so explicitly schedule the newest generation below.
 	p.startupDone.Store(true)
+	if latestGeneration := p.ruleApplyGen.Load(); latestGeneration != appliedGeneration {
+		p.scheduleRuleApply(latestGeneration)
+	}
 	log.Printf("[%s] Startup sequence completed.", PluginType)
 	coremain.ManualGC()
 }
@@ -360,15 +436,15 @@ func (p *NftAdd) flushAndFillSets(ipSet *netipx.IPSet) error {
 			script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.SetV6, strings.Join(v6List, ", ")))
 		}
 	}
-    if p.nftArgs.MihomoFakeIPv4 != "" {
-        script.WriteString(fmt.Sprintf("flush set %s %s %s\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV4))
-        script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV4, p.nftArgs.MihomoFakeIPv4))
-    }
+	if p.nftArgs.MihomoFakeIPv4 != "" {
+		script.WriteString(fmt.Sprintf("flush set %s %s %s\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV4))
+		script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV4, p.nftArgs.MihomoFakeIPv4))
+	}
 
-    if p.nftArgs.MihomoFakeIPv6 != "" {
-        script.WriteString(fmt.Sprintf("flush set %s %s %s\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV6))
-        script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV6, p.nftArgs.MihomoFakeIPv6))
-    }
+	if p.nftArgs.MihomoFakeIPv6 != "" {
+		script.WriteString(fmt.Sprintf("flush set %s %s %s\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV6))
+		script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", p.nftArgs.TableFamily, p.nftArgs.Table, p.nftArgs.MihomoSetV6, p.nftArgs.MihomoFakeIPv6))
+	}
 	if script.Len() == 0 {
 		return nil
 	}
@@ -449,26 +525,44 @@ func (p *NftAdd) packLpmKey(prefix netip.Prefix) []byte {
 }
 
 func (p *NftAdd) setupEbpf(ipSet *netipx.IPSet) error {
+	p.ebpfMu.Lock()
+	defer p.ebpfMu.Unlock()
+
+	if p.closing.Load() || p.ctx.Err() != nil {
+		return context.Canceled
+	}
+	if p.ebpfRT != nil {
+		return p.syncEbpfMap(p.ebpfRT.objs.RouteRules, ipSet)
+	}
+
+	rt, err := p.buildEbpfRuntime(ipSet)
+	if err != nil {
+		return err
+	}
+	if p.closing.Load() || p.ctx.Err() != nil {
+		return errors.Join(context.Canceled, rt.Close())
+	}
+	p.ebpfRT = rt
+	return nil
+}
+
+func (p *NftAdd) buildEbpfRuntime(ipSet *netipx.IPSet) (_ *nftEbpfRuntime, retErr error) {
 	p.setupRouting()
-	os.MkdirAll("/sys/fs/bpf", 0755)
+	if err := os.MkdirAll("/sys/fs/bpf", 0755); err != nil {
+		p.cleanupRouting()
+		return nil, fmt.Errorf("create bpffs directory: %w", err)
+	}
 
 	lan, err := net.InterfaceByName(p.nftArgs.EbpfIface)
 	if err != nil {
-		return fmt.Errorf("failed to find main interface %s: %w", p.nftArgs.EbpfIface, err)
-	}
-
-	xdpIfaceName := p.nftArgs.EbpfXdpIface
-	if xdpIfaceName == "" {
-		xdpIfaceName = p.nftArgs.EbpfIface
-	}
-	xdpLan, err := net.InterfaceByName(xdpIfaceName)
-	if err != nil {
-		return fmt.Errorf("failed to find xdp interface %s: %w", xdpIfaceName, err)
+		p.cleanupRouting()
+		return nil, fmt.Errorf("failed to find main interface %s: %w", p.nftArgs.EbpfIface, err)
 	}
 
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(ebpfProg))
 	if err != nil {
-		return err
+		p.cleanupRouting()
+		return nil, err
 	}
 
 	for _, prog := range spec.Programs {
@@ -483,7 +577,7 @@ func (p *NftAdd) setupEbpf(ipSet *netipx.IPSet) error {
 	if p.nftArgs.SingboxPort != 0 {
 		ebpfConsts["singbox_port"] = p.nftArgs.SingboxPort
 	}
-	
+
 	if p.nftArgs.EbpfEnable == "ebpf_true" && p.nftArgs.DnsHijack == "ebpf_hijack" {
 		ebpfConsts["enable_dns_hijack"] = uint8(1)
 		if addr, err := netip.ParseAddr(p.nftArgs.HijackDip4); err == nil && addr.Is4() {
@@ -494,116 +588,218 @@ func (p *NftAdd) setupEbpf(ipSet *netipx.IPSet) error {
 			ebpfConsts["hjack_dip6"] = addr.As16()
 		}
 	}
-	
+
 	if len(ebpfConsts) > 0 {
 		for k, v := range ebpfConsts {
 			if variable, ok := spec.Variables[k]; ok {
 				if err := variable.Set(v); err != nil {
-					return fmt.Errorf("rewrite constants error: %w", err)
+					p.cleanupRouting()
+					return nil, fmt.Errorf("rewrite constants error: %w", err)
 				}
 			}
 		}
 	}
 
-	var objs struct {
-		IngressL2     *ebpf.Program `ebpf:"tc_ingress_l2"`
-		DnsHandler    *ebpf.Program `ebpf:"tc_dns_handler"`
-		RouteRules    *ebpf.Map     `ebpf:"route_rules"`
-		JmpDNS        *ebpf.Map     `ebpf:"jmp_dns"`
-		FastDnsCache  *ebpf.Map     `ebpf:"fast_dns_cache"`
-		RingbufEvents *ebpf.Map     `ebpf:"ringbuf_events"`
-	}
-	
+	var objs combinedObjects
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		return fmt.Errorf("load combined ebpf error: %w", err)
+		p.cleanupRouting()
+		return nil, fmt.Errorf("load combined ebpf error: %w", err)
+	}
+	rt := &nftEbpfRuntime{objs: objs}
+	committed := false
+	defer func() {
+		if !committed {
+			if err := rt.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("rollback eBPF runtime: %w", err))
+			}
+			p.cleanupRouting()
+		}
+	}()
+
+	key0 := uint32(0)
+	valHandler := uint32(objs.DnsHandler.FD())
+	if err := objs.JmpDNS.Update(&key0, &valHandler, ebpf.UpdateAny); err != nil {
+		return nil, fmt.Errorf("failed to link main proxy to dns module: %w", err)
+	}
+
+	const (
+		fastCachePin = "/sys/fs/bpf/mosdns_fast_cache"
+		ringbufPin   = "/sys/fs/bpf/mosdns_ringbuf"
+		jmpDNSPin    = "/sys/fs/bpf/mosdns_jmp_dns"
+	)
+	for _, pin := range []string{fastCachePin, ringbufPin, jmpDNSPin, "/sys/fs/bpf/mosdns_dns_jmp"} {
+		if err := os.Remove(pin); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("remove stale eBPF pin %s: %w", pin, err)
+		}
+	}
+	if err := objs.FastDnsCache.Pin(fastCachePin); err != nil {
+		return nil, fmt.Errorf("pin fast DNS cache: %w", err)
+	}
+	rt.pins = append(rt.pins, fastCachePin)
+	if err := objs.RingbufEvents.Pin(ringbufPin); err != nil {
+		return nil, fmt.Errorf("pin DNS ring buffer: %w", err)
+	}
+	rt.pins = append(rt.pins, ringbufPin)
+	if err := objs.JmpDNS.Pin(jmpDNSPin); err != nil {
+		return nil, fmt.Errorf("pin DNS jump map: %w", err)
+	}
+	rt.pins = append(rt.pins, jmpDNSPin)
+
+	if err := p.syncEbpfMap(objs.RouteRules, ipSet); err != nil {
+		return nil, err
 	}
 
 	if p.nftArgs.EbpfXdp == "xdp_true" {
+		xdpIfaceName := p.nftArgs.EbpfXdpIface
+		if xdpIfaceName == "" {
+			xdpIfaceName = p.nftArgs.EbpfIface
+		}
+		xdpLan, err := net.InterfaceByName(xdpIfaceName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find xdp interface %s: %w", xdpIfaceName, err)
+		}
 		specXDP, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(xdpEbpfProg))
-		if err == nil {
-			xdpVarsOk := true
+		if err != nil {
+			log.Printf("[%s] XDP SPEC ERROR: %v", PluginType, err)
+		} else {
+			xdpVarsOK := true
 			for k, v := range ebpfConsts {
 				if variable, ok := specXDP.Variables[k]; ok {
 					if err := variable.Set(v); err != nil {
-						xdpVarsOk = false
+						log.Printf("[%s] XDP CONSTANT ERROR: %v", PluginType, err)
+						xdpVarsOK = false
 						break
 					}
 				}
 			}
-			if xdpVarsOk {
+			if xdpVarsOK {
 				collXDP, err := ebpf.NewCollectionWithOptions(specXDP, ebpf.CollectionOptions{
 					MapReplacements: map[string]*ebpf.Map{
 						"fast_dns_cache": objs.FastDnsCache,
 						"ringbuf_events": objs.RingbufEvents,
 					},
 				})
-				if err == nil {
-					l, err := link.AttachXDP(link.XDPOptions{
+				if err != nil {
+					log.Printf("[%s] XDP LOAD ERROR: %v", PluginType, err)
+				} else {
+					xdpLink, err := link.AttachXDP(link.XDPOptions{
 						Interface: xdpLan.Index,
 						Program:   collXDP.Programs["xdp_dns_cache_entry"],
 					})
-					if err == nil {
-						p.xdpLink = l
-						log.Printf("[%s] XDP SUCCESS: DNS acceleration active on %s (Native Mode)", PluginType, xdpIfaceName)
-					} else {
+					if err != nil {
+						collXDP.Close()
 						log.Printf("[%s] XDP ATTACH ERROR on %s: %v", PluginType, xdpIfaceName, err)
+					} else {
+						rt.xdpColl = collXDP
+						rt.xdpLink = xdpLink
+						log.Printf("[%s] XDP SUCCESS: DNS acceleration active on %s (Native Mode)", PluginType, xdpIfaceName)
 					}
-				} else {
-					log.Printf("[%s] XDP LOAD ERROR: %v", PluginType, err)
 				}
 			}
-		} else {
-			log.Printf("[%s] XDP SPEC ERROR: %v", PluginType, err)
 		}
 	}
 
-	p.ebpfPrograms = append(p.ebpfPrograms, objs.IngressL2, objs.DnsHandler)
-	p.ebpfMap = objs.RouteRules
-
-	key0 := uint32(0)
-	valHandler := uint32(objs.DnsHandler.FD())
-	if err := objs.JmpDNS.Update(&key0, &valHandler, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("failed to link main proxy to dns module: %w", err)
-	}
-
-	_ = objs.FastDnsCache.Pin("/sys/fs/bpf/mosdns_fast_cache")
-	_ = objs.RingbufEvents.Pin("/sys/fs/bpf/mosdns_ringbuf")
-	os.Remove("/sys/fs/bpf/mosdns_jmp_dns")
-	_ = objs.JmpDNS.Pin("/sys/fs/bpf/mosdns_jmp_dns")
-	os.Remove("/sys/fs/bpf/mosdns_dns_jmp")
-
-	l, err := link.AttachTCX(link.TCXOptions{
+	tcxLink, err := link.AttachTCX(link.TCXOptions{
 		Interface: lan.Index,
 		Program:   objs.IngressL2,
 		Attach:    ebpf.AttachTCXIngress,
 	})
 	if err != nil {
-		return fmt.Errorf("attach tcx error: %w", err)
+		return nil, fmt.Errorf("attach tcx error: %w", err)
 	}
-	p.ebpfLinks = append(p.ebpfLinks, l)
-
-	return p.syncEbpfMap(ipSet)
+	rt.tcxLink = tcxLink
+	committed = true
+	return rt, nil
 }
 
-func (p *NftAdd) syncEbpfMap(ipSet *netipx.IPSet) error {
-	if p.ebpfMap == nil {
-		return nil
+func (p *NftAdd) syncEbpfMap(routeRules *ebpf.Map, ipSet *netipx.IPSet) error {
+	if ipSet == nil {
+		return fmt.Errorf("route IP set is nil")
+	}
+	if routeRules == nil || routeRules.Type() != ebpf.LPMTrie || routeRules.KeySize() != 20 {
+		return fmt.Errorf("unexpected route map")
 	}
 
-	mark2 := uint32(2)
+	desired := make(map[[20]byte]uint32)
+	addDesired := func(prefix netip.Prefix, mark uint32) {
+		var key [20]byte
+		copy(key[:], p.packLpmKey(prefix))
+		desired[key] = mark
+	}
+
 	fakeIPs := []string{p.nftArgs.MihomoFakeIPv4, p.nftArgs.MihomoFakeIPv6}
 	for _, cidr := range fakeIPs {
 		if cidr == "" {
 			continue
 		}
-		if prefix, err := netip.ParsePrefix(cidr); err == nil {
-			p.ebpfMap.Update(p.packLpmKey(prefix), &mark2, ebpf.UpdateAny)
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return fmt.Errorf("invalid fake IP prefix %q: %w", cidr, err)
 		}
+		addDesired(prefix, 2)
 	}
 
-	mark1 := uint32(1)
 	for _, pfx := range ipSet.Prefixes() {
-		p.ebpfMap.Update(p.packLpmKey(pfx), &mark1, ebpf.UpdateAny)
+		addDesired(pfx, 1)
+	}
+	if uint64(len(desired)) > uint64(routeRules.MaxEntries()) {
+		return fmt.Errorf("route entry count %d exceeds map capacity %d", len(desired), routeRules.MaxEntries())
+	}
+
+	current := make(map[[20]byte]uint32)
+	iterator := routeRules.Iterate()
+	var currentKey [20]byte
+	var currentMark uint32
+	for iterator.Next(&currentKey, &currentMark) {
+		current[currentKey] = currentMark
+	}
+	if err := iterator.Err(); err != nil {
+		return fmt.Errorf("list current routes: %w", err)
+	}
+
+	stale := make([][20]byte, 0)
+	for key := range current {
+		if _, keep := desired[key]; !keep {
+			stale = append(stale, key)
+		}
+	}
+	additions := 0
+	for key := range desired {
+		if _, exists := current[key]; !exists {
+			additions++
+		}
+	}
+	freeSlots := int(routeRules.MaxEntries()) - len(current)
+	preDelete := additions - freeSlots
+	if preDelete < 0 {
+		preDelete = 0
+	}
+	if preDelete > len(stale) {
+		return fmt.Errorf("route reconciliation needs %d free slots but only %d stale entries exist", preDelete, len(stale))
+	}
+	deleteRoute := func(key [20]byte) error {
+		if err := routeRules.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("delete stale route key %x: %w", key, err)
+		}
+		return nil
+	}
+	for _, key := range stale[:preDelete] {
+		if err := deleteRoute(key); err != nil {
+			return err
+		}
+	}
+	for key, mark := range desired {
+		if currentMark, exists := current[key]; exists && currentMark == mark {
+			continue
+		}
+		if err := routeRules.Update(&key, &mark, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update route key %x: %w", key, err)
+		}
+	}
+	for _, key := range stale[preDelete:] {
+		if err := deleteRoute(key); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -833,20 +1029,45 @@ func (p *NftAdd) reloadAllRules() error {
 		p.saveConfig()
 	}
 
-	if p.startupDone.Load() && p.nftArgs.Enable == "nft_true" {
-		go func() {
-			ipSet, err := p.buildFullIPSet()
-			if err != nil {
-				return
-			}
-			p.flushAndFillSets(ipSet)
-			if p.nftArgs.EbpfEnable == "ebpf_true" {
-				p.setupEbpf(ipSet)
-			}
-			coremain.ManualGC()
-		}()
+	generation := p.ruleApplyGen.Add(1)
+	if p.startupDone.Load() && (p.nftArgs.Enable == "nft_true" || p.nftArgs.EbpfEnable == "ebpf_true") {
+		p.scheduleRuleApply(generation)
 	}
 	return nil
+}
+
+func (p *NftAdd) scheduleRuleApply(generation uint64) {
+	if p.closing.Load() {
+		return
+	}
+	go func() {
+		p.ruleApplyMu.Lock()
+		defer p.ruleApplyMu.Unlock()
+		if p.closing.Load() || generation != p.ruleApplyGen.Load() {
+			return
+		}
+		ipSet, err := p.buildFullIPSet()
+		if err != nil {
+			return
+		}
+		if p.closing.Load() || generation != p.ruleApplyGen.Load() {
+			return
+		}
+		if p.nftArgs.Enable == "nft_true" {
+			if err := p.flushAndFillSets(ipSet); err != nil {
+				log.Printf("[%s] ERROR: failed to refresh nft sets: %v", PluginType, err)
+			}
+		}
+		if p.nftArgs.EbpfEnable == "ebpf_true" {
+			// Programs, links and Fast DNS maps are process-lifetime resources.
+			// Rule refreshes only update the route map. If initial setup failed,
+			// setupEbpf retries the full transactional build instead.
+			if err := p.setupEbpf(ipSet); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("[%s] ERROR: failed to refresh eBPF routes: %v", PluginType, err)
+			}
+		}
+		coremain.ManualGC()
+	}()
 }
 
 func (p *NftAdd) downloadAndUpdateLocalFile(ctx context.Context, sourceName string) error {

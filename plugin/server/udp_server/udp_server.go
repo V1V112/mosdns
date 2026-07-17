@@ -3,15 +3,18 @@ package udp_server
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"hash/maphash"
 	"net"
 	"net/netip"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/server"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
@@ -24,39 +27,52 @@ import (
 
 const (
 	PluginType       = "udp_server"
-	cacheSize        = 4194304 
-	assoc            = 4
-	groupCount       = cacheSize / assoc
-	groupMask        = groupCount - 1
-
-	internalTTL      = 5
-	clientTTL        = 10
 	asyncRefreshMark = 1 << 60
 )
-
-var maphashSeed = maphash.MakeSeed()
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
 }
 
 type Args struct {
-	Entry       string `yaml:"entry"`
-	Listen      string `yaml:"listen"`
-	EnableAudit bool   `yaml:"enable_audit"`
+	Entry       string         `yaml:"entry"`
+	Listen      string         `yaml:"listen"`
+	EnableAudit bool           `yaml:"enable_audit"`
+	FastCache   *FastCacheArgs `yaml:"fast_cache"`
 }
 
-func (a *Args) init() {
+func (a *Args) init() (resolvedFastCacheMode, error) {
 	utils.SetDefaultString(&a.Listen, "127.0.0.1:53")
+	return normalizeFastCacheArgs(a.FastCache)
 }
 
 type UdpServer struct {
-	args *Args
-	c    net.PacketConn
+	args      *Args
+	c         net.PacketConn
+	cancel    context.CancelFunc
+	fastCache *fastCache
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 func (s *UdpServer) Close() error {
-	return s.c.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.fastCache != nil {
+			s.fastCache.stop()
+		}
+		if s.c != nil {
+			err = s.c.Close()
+		}
+		s.wg.Wait()
+		if s.fastCache != nil {
+			s.fastCache.Close()
+		}
+	})
+	return err
 }
 
 type SwitchPlugin interface{ GetValue() string }
@@ -66,195 +82,12 @@ type DomainMapperPlugin interface {
 }
 type IPSetPlugin interface{ Match(addr netip.Addr) bool }
 
-type eBpfCacheVal struct {
-	ExpireNs uint64
-	Updating uint32
-	Len      uint16
-	Pad      uint16
-	Data     [512]byte
-}
-
-type fastCacheItem struct {
-	hash      uint32 
-	expire    int64
-	resp      []byte
-	updating  uint32
-	domainSet string
-}
-
-type fastCache struct {
-	m       [groupCount][assoc]atomic.Pointer[fastCacheItem]
-	ebpfMap *ebpf.Map
-	ebpfMu  sync.Mutex
-}
-
-func newFastCache() *fastCache {
-	fc := &fastCache{}
-	if m, err := ebpf.LoadPinnedMap("/sys/fs/bpf/mosdns_fast_cache", nil); err == nil {
-		fc.ebpfMap = m
-	}
-	return fc
-}
-
-func (fc *fastCache) getEbpfMap() *ebpf.Map {
-	if fc.ebpfMap != nil {
-		return fc.ebpfMap
-	}
-	fc.ebpfMu.Lock()
-	defer fc.ebpfMu.Unlock()
-	if fc.ebpfMap != nil {
-		return fc.ebpfMap
-	}
-	if m, err := ebpf.LoadPinnedMap("/sys/fs/bpf/mosdns_fast_cache", nil); err == nil {
-		fc.ebpfMap = m
-	}
-	return fc.ebpfMap
-}
-
-func calcFNV1a(data []byte) uint32 {
-	h := uint32(0x811c9dc5)
-	n := len(data)
-	for i, b := range data {
-		if i < n-4 && b >= 'A' && b <= 'Z' {
-			b += 32
-		}
-		h ^= uint32(b)
-		h *= 0x01000193
-	}
-	return h
-}
-
-func (fc *fastCache) GetOrUpdating(hash uint64, reqLen int, buf []byte) (int, int, uint64, string) {
-	groupIdx := hash & uint64(groupMask)
-	group := &fc.m[groupIdx]
-
-	var ptr *fastCacheItem
-	for i := 0; i < assoc; i++ {
-		item := group[i].Load()
-		if item != nil && item.hash == uint32(hash) {
-			ptr = item
-			break
-		}
-	}
-
-	if ptr == nil {
-		return server.FastActionContinue, 0, 0, ""
-	}
-
-	now := time.Now().Unix()
-	if now > atomic.LoadInt64(&ptr.expire) {
-		if atomic.CompareAndSwapUint32(&ptr.updating, 0, 1) {
-			return server.FastActionContinue, 0, 0, ""
-		}
-	}
-
-	if ptr.resp != nil {
-		respLen := len(ptr.resp)
-		txid0, txid1 := buf[0], buf[1]
-		copy(buf, ptr.resp)
-		buf[0], buf[1] = txid0, txid1
-		return server.FastActionReply, respLen, 0, ptr.domainSet
-	}
-	return server.FastActionContinue, 0, 0, ""
-}
-
-func (fc *fastCache) Store(resp []byte, dset string) {
-	bakedResp := make([]byte, len(resp))
-	copy(bakedResp, resp)
-	offsets := findTTLOffsets(bakedResp)
-	for _, off := range offsets {
-		if off+4 <= len(bakedResp) {
-			binary.BigEndian.PutUint32(bakedResp[off:off+4], uint32(clientTTL))
-		}
-	}
-
-	if len(bakedResp) <= 16 || len(bakedResp) > 512 {
-		return
-	}
-
-	qdcount := binary.BigEndian.Uint16(bakedResp[4:6])
-	if qdcount == 1 {
-		q_off := 12
-		for q_off < len(bakedResp) {
-			l := int(bakedResp[q_off])
-			if l == 0 {
-				q_off++
-				break
-			}
-			if l&0xC0 == 0xC0 {
-				q_off += 2
-				break
-			}
-			q_off += (l & 0x3F) + 1
-		}
-		q_off += 4
-
-		if q_off <= len(bakedResp) && q_off <= 256 {
-			rawQuestion := bakedResp[12:q_off]
-			hash := calcFNV1a(rawQuestion)
-
-			em := fc.getEbpfMap()
-			if em != nil {
-				nowNs := getBootTimeNano()
-				expireNs := nowNs + uint64(internalTTL)*1e9
-
-				val := eBpfCacheVal{
-					ExpireNs: expireNs,
-					Updating: 0,
-					Len:      uint16(len(bakedResp)),
-				}
-				copy(val.Data[:], bakedResp)
-				em.Put(&hash, &val)
-			}
-
-			newItem := &fastCacheItem{
-				hash:      hash,
-				resp:      bakedResp,
-				expire:    time.Now().Add(internalTTL * time.Second).Unix(),
-				updating:  0,
-				domainSet: dset,
-			}
-
-			groupIdx := uint64(hash) & uint64(groupMask)
-			group := &fc.m[groupIdx]
-
-			for i := 0; i < assoc; i++ {
-				old := group[i].Load()
-				if old != nil && old.hash == hash {
-					group[i].Store(newItem)
-					return
-				}
-			}
-
-			for i := 0; i < assoc; i++ {
-				if group[i].Load() == nil {
-					if group[i].CompareAndSwap(nil, newItem) {
-						return
-					}
-				}
-			}
-
-			oldestIdx := 0
-			var minExpire int64 = 1<<63 - 1 
-			
-			for i := 0; i < assoc; i++ {
-			    item := group[i].Load()
-			    if item == nil { continue } 
-			    if exp := atomic.LoadInt64(&item.expire); exp < minExpire {
-			        minExpire = exp
-			        oldestIdx = i
-			    }
-			}
-			group[oldestIdx].Store(newItem)
-		}
-	}
-}
-
 type fastHandler struct {
-	next server.Handler
-	fc   *fastCache
-	dm   DomainMapperPlugin
-	sw   SwitchPlugin
+	next             server.Handler
+	fc               *fastCache
+	sw               SwitchPlugin
+	legacySwitchGate bool
+	releasePayload   func(*[]byte)
 }
 
 func (h *fastHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryMeta, pack func(*dns.Msg) (*[]byte, error)) *[]byte {
@@ -263,78 +96,136 @@ func (h *fastHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryM
 
 	if (meta.PreFastFlags & asyncRefreshMark) != 0 {
 		if payload != nil && q.Opcode == dns.OpcodeQuery && len(q.Question) > 0 {
-			var dsetName string
-			if h.dm != nil {
-				_, dsetName, _ = h.dm.FastMatch(q.Question[0].Name)
-			}
-			h.fc.Store(*payload, dsetName)
+			h.fc.Store(*payload, true)
+		}
+		if payload != nil && h.releasePayload != nil {
+			h.releasePayload(payload)
 		}
 		return nil
 	}
 
-	if h.sw != nil && h.sw.GetValue() != "A" {
+	if h.legacySwitchGate && h.sw != nil && h.sw.GetValue() != "A" {
 		return payload
 	}
 
 	if payload != nil && (meta.PreFastFlags&(1<<30)) == 0 && q.Opcode == dns.OpcodeQuery && len(q.Question) > 0 {
-		var dsetName string
-		if h.dm != nil {
-			_, dsetName, _ = h.dm.FastMatch(q.Question[0].Name)
-		}
-		h.fc.Store(*payload, dsetName)
+		h.fc.Store(*payload, false)
 	}
 	return payload
 }
 
-func startRingbufListener(bp *coremain.BP, h *fastHandler, rd *ringbuf.Reader) {
-	for {
-		rec, err := rd.Read()
-		if err != nil {
-			return
-		}
-		if len(rec.RawSample) < 280 {
-			continue
-		}
+const (
+	fastRefreshWorkers = 4
+	fastRefreshQueue   = 1024
+	fastRefreshTimeout = 2 * time.Second
+	fastRingReopen     = 3 * time.Second
+)
 
-		isV6 := binary.LittleEndian.Uint16(rec.RawSample[0:2])
-		dnsLen := binary.LittleEndian.Uint16(rec.RawSample[4:6])
-		if dnsLen == 0 || dnsLen > 256 {
-			continue
-		}
+type fastRefreshEvent struct {
+	msg  *dns.Msg
+	meta server.QueryMeta
+}
 
-		msg := new(dns.Msg)
-		if err := msg.Unpack(rec.RawSample[24 : 24+int(dnsLen)]); err != nil {
-			continue
-		}
+func decodeFastRefreshEvent(sample []byte) (fastRefreshEvent, bool) {
+	if len(sample) < 280 {
+		return fastRefreshEvent{}, false
+	}
+	isV6 := binary.LittleEndian.Uint16(sample[0:2])
+	dnsLen := int(binary.LittleEndian.Uint16(sample[4:6]))
+	if dnsLen == 0 || dnsLen > 256 || 24+dnsLen > len(sample) {
+		return fastRefreshEvent{}, false
+	}
 
-		var clientIP netip.Addr
-		if isV6 == 0 {
-			clientIP = netip.AddrFrom4(*(*[4]byte)(rec.RawSample[8:12]))
-		} else {
-			clientIP = netip.AddrFrom16(*(*[16]byte)(rec.RawSample[8:24]))
-		}
+	msg := new(dns.Msg)
+	if err := msg.Unpack(sample[24 : 24+dnsLen]); err != nil {
+		return fastRefreshEvent{}, false
+	}
 
-		meta := server.QueryMeta{
+	var clientIP netip.Addr
+	switch isV6 {
+	case 0:
+		clientIP = netip.AddrFrom4(*(*[4]byte)(sample[8:12]))
+	case 1:
+		clientIP = netip.AddrFrom16(*(*[16]byte)(sample[8:24]))
+	default:
+		return fastRefreshEvent{}, false
+	}
+	return fastRefreshEvent{
+		msg: msg,
+		meta: server.QueryMeta{
 			ClientAddr:   clientIP,
 			PreFastFlags: asyncRefreshMark,
-		}
+		},
+	}, true
+}
 
-		packFunc := func(m *dns.Msg) (*[]byte, error) {
-			b, err := m.Pack()
-			return &b, err
+func startFastRefreshWorker(ctx context.Context, h *fastHandler, queue <-chan fastRefreshEvent) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-queue:
+			refreshCtx, cancel := context.WithTimeout(ctx, fastRefreshTimeout)
+			payload := h.Handle(refreshCtx, event.msg, event.meta, pool.PackBuffer)
+			cancel()
+			// asyncRefreshMark normally makes fastHandler consume the payload and
+			// return nil. Keep this defensive release for alternate handlers.
+			if payload != nil {
+				pool.ReleaseBuf(payload)
+			}
+		}
+	}
+}
 
-		h.Handle(context.Background(), msg, meta, packFunc)
+func startRingbufListener(ctx context.Context, rd *ringbuf.Reader, queue chan<- fastRefreshEvent) error {
+	started := time.Now()
+	var rec ringbuf.Record
+	for {
+		rd.SetDeadline(time.Now().Add(time.Second))
+		err := rd.ReadInto(&rec)
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				// Periodically reopen the pinned map. This makes the consumer move
+				// to a new map generation after nft_add replaces stale bpffs pins.
+				if time.Since(started) >= fastRingReopen {
+					return nil
+				}
+				continue
+			}
+			return err
+		}
+		event, ok := decodeFastRefreshEvent(rec.RawSample)
+		if !ok {
+			continue
+		}
+		select {
+		case queue <- event:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
-	a := args.(*Args)
-	a.init()
-	return StartServer(bp, a)
+	return StartServer(bp, args.(*Args))
 }
 
 func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
+	if args == nil {
+		return nil, fmt.Errorf("udp_server args must not be nil")
+	}
+	mode, err := args.init()
+	if err != nil {
+		return nil, err
+	}
 	dh, err := server_utils.NewHandler(bp, args.Entry, args.EnableAudit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init dns handler, %w", err)
@@ -349,6 +240,12 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create socket, %w", err)
 	}
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = c.Close()
+		}
+	}()
 
 	isEbpfPort := false
 	if udpAddr, ok := c.LocalAddr().(*net.UDPAddr); ok {
@@ -357,51 +254,103 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 		}
 	}
 
-	var wrappedHandler server.Handler = dh
-	var fastBypass func(int,[]byte, netip.AddrPort) (int, int, uint64, string)
-
-	if isEbpfPort {
-		var dm DomainMapperPlugin
-		if p := bp.M().GetPlugin("unified_matcher1"); p != nil {
-			dm, _ = p.(DomainMapperPlugin)
+	if mode.legacy && !isEbpfPort {
+		mode = resolvedFastCacheMode{}
+	}
+	if mode.kernel && !isEbpfPort {
+		return nil, fmt.Errorf("fast_cache kernel mode requires UDP port 53")
+	}
+	if mode.kernel && runtime.GOOS != "linux" {
+		if !mode.legacy {
+			return nil, fmt.Errorf("fast_cache kernel mode is only supported on Linux")
 		}
-
-		var sw15 SwitchPlugin
-		if p := bp.M().GetPlugin("switch15"); p != nil {
-			sw15, _ = p.(SwitchPlugin)
-		}
-
-		fc := newFastCache()
-		wrappedFastHandler := &fastHandler{next: dh, fc: fc, dm: dm, sw: sw15}
-		wrappedHandler = wrappedFastHandler
-
-		go func() {
-			for {
-				rm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/mosdns_ringbuf", nil)
-				if err != nil {
-					time.Sleep(3 * time.Second)
-					continue
-				}
-				rd, err := ringbuf.NewReader(rm)
-				if err != nil {
-					rm.Close()
-					time.Sleep(3 * time.Second)
-					continue
-				}
-				startRingbufListener(bp, wrappedFastHandler, rd)
-				rd.Close()
-				rm.Close()
-				time.Sleep(3 * time.Second)
-			}
-		}()
-
-		fastBypass = buildFastBypass(bp, fc, c.(*net.UDPConn))
-		bp.L().Info("udp server started with eBPF fast-path", zap.Stringer("addr", c.LocalAddr()))
-	} else {
-		bp.L().Info("udp server started normally (no eBPF fast-path)", zap.Stringer("addr", c.LocalAddr()))
+		mode.kernel = false
 	}
 
+	var sw15 SwitchPlugin
+	if p := bp.M().GetPlugin("switch15"); p != nil {
+		sw15, _ = p.(SwitchPlugin)
+	}
+	if mode.legacy && sw15 != nil {
+		mode.userspace = true
+	}
+
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	s := &UdpServer{args: args, c: c, cancel: cancel}
+	var wrappedHandler server.Handler = dh
+	var wrappedFastHandler *fastHandler
+	if mode.kernel || mode.userspace || mode.legacy {
+		fc, err := newFastCache(mode, bp.L())
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		s.fastCache = fc
+		wrappedFastHandler = &fastHandler{
+			next:             dh,
+			fc:               fc,
+			sw:               sw15,
+			legacySwitchGate: mode.legacy && sw15 != nil,
+			releasePayload:   pool.ReleaseBuf,
+		}
+		wrappedHandler = wrappedFastHandler
+	}
+
+	// Keep the policy pre-fast stage independent from cache storage. switch15
+	// users retain their early marks/reject behavior even in off/kernel mode.
+	var fastBypass func(int, []byte, netip.AddrPort) (int, int, uint64, string)
+	if isEbpfPort || (mode.userspace && !mode.legacy) {
+		fastBypass = buildFastBypass(
+			bp,
+			s.fastCache,
+			c.(*net.UDPConn),
+			mode.userspace && !mode.legacy,
+			mode.legacy,
+		)
+	}
+
+	if mode.kernel && wrappedFastHandler != nil {
+		queue := make(chan fastRefreshEvent, fastRefreshQueue)
+		for i := 0; i < fastRefreshWorkers; i++ {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				startFastRefreshWorker(runtimeCtx, wrappedFastHandler, queue)
+			}()
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			runFastRingbuf(runtimeCtx, s.fastCache, queue)
+		}()
+	}
+
+	resolvedMode := "off"
+	switch {
+	case mode.kernel && mode.userspace:
+		resolvedMode = "both"
+	case mode.kernel:
+		resolvedMode = "kernel"
+	case mode.userspace:
+		resolvedMode = "userspace"
+	}
+	if mode.legacy {
+		resolvedMode = "legacy/" + resolvedMode
+	}
+	bp.L().Info("udp server fast cache configured",
+		zap.String("mode", resolvedMode),
+		zap.Int("userspace_capacity", func() int {
+			if s.fastCache == nil {
+				return 0
+			}
+			return s.fastCache.localCapacity()
+		}()),
+		zap.Stringer("addr", c.LocalAddr()))
+
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
+		defer cancel()
 		defer c.Close()
 		err := server.ServeUDP(c.(*net.UDPConn), wrappedHandler, server.UDPServerOpts{
 			Logger:     bp.L(),
@@ -409,203 +358,283 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 		})
 		bp.M().GetSafeClose().SendCloseSignal(err)
 	}()
-	return &UdpServer{args: args, c: c}, nil
+	closeOnError = false
+	return s, nil
 }
 
-func buildFastBypass(bp *coremain.BP, fc *fastCache, conn *net.UDPConn) func(int,[]byte, netip.AddrPort) (int, int, uint64, string) {
-	var once sync.Once
+func waitFastCacheRetry(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func runFastRingbuf(ctx context.Context, fc *fastCache, queue chan<- fastRefreshEvent) {
+	var lastID ebpf.MapID
+	var haveLastID bool
+	for ctx.Err() == nil {
+		rm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/mosdns_ringbuf", nil)
+		if err != nil {
+			if !waitFastCacheRetry(ctx, fastCacheKernelRetryDelay) {
+				return
+			}
+			continue
+		}
+		if rm.Type() != ebpf.RingBuf {
+			_ = rm.Close()
+			if !waitFastCacheRetry(ctx, fastCacheKernelRetryDelay) {
+				return
+			}
+			continue
+		}
+		if info, infoErr := rm.Info(); infoErr == nil {
+			if id, ok := info.ID(); ok && (!haveLastID || id != lastID) {
+				lastID, haveLastID = id, true
+				fc.requestKernelReload()
+			}
+		}
+		rd, err := ringbuf.NewReader(rm)
+		if err != nil {
+			_ = rm.Close()
+			if !waitFastCacheRetry(ctx, fastCacheKernelRetryDelay) {
+				return
+			}
+			continue
+		}
+		listenErr := startRingbufListener(ctx, rd, queue)
+		_ = rd.Close()
+		_ = rm.Close()
+		if listenErr != nil && ctx.Err() == nil {
+			if !waitFastCacheRetry(ctx, fastCacheKernelRetryDelay) {
+				return
+			}
+		}
+	}
+}
+
+func buildFastBypass(
+	bp *coremain.BP,
+	fc *fastCache,
+	conn *net.UDPConn,
+	explicitUserspace bool,
+	legacy bool,
+) func(int, []byte, netip.AddrPort) (int, int, uint64, string) {
 	var sw15 SwitchPlugin
 	var dm DomainMapperPlugin
 	var ipSet IPSetPlugin
+	dependenciesResolved := false
 
 	return func(reqLen int, buf []byte, remoteAddr netip.AddrPort) (int, int, uint64, string) {
-		once.Do(func() {
-			if p := bp.M().GetPlugin("switch15"); p != nil {
-				sw15, _ = p.(SwitchPlugin)
-			}
-			if p := bp.M().GetPlugin("unified_matcher1"); p != nil {
-				dm, _ = p.(DomainMapperPlugin)
-			}
-			if p := bp.M().GetPlugin("client_ip"); p != nil {
-				ipSet, _ = p.(IPSetPlugin)
-			}
-		})
-
-		var marks uint64 = query_context.GlobalSwitchMask.Load()
-
-		if sw15 == nil || (marks&(1<<46)) == 0 {
-			return server.FastActionContinue, 0, 0, ""
-		}
-		if reqLen < 12 {
-			return server.FastActionContinue, 0, 0, ""
-		}
-
-		qtypeOff := 12
-		for qtypeOff < reqLen {
-			l := int(buf[qtypeOff])
-			if l == 0 {
-				qtypeOff++
-				break
-			}
-			if l&0xC0 == 0xC0 {
-				qtypeOff += 2
-				break
-			}
-			qtypeOff += l + 1
-		}
-		if qtypeOff+2 > reqLen {
-			return server.FastActionContinue, 0, 0, ""
-		}
-		qtype := binary.BigEndian.Uint16(buf[qtypeOff : qtypeOff+2])
-
-		if qtype == 6 || qtype == 12 || qtype == 65 {
-			if (marks & (1 << 36)) != 0 {
-				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, ""
-			}
-		}
-		if qtype == 28 {
-			if (marks & (1 << 37)) != 0 {
-				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, ""
-			}
-		}
-
-		offset := 12
-		var nameBuf [256]byte
-		nameLen := 0
-		for offset < reqLen {
-			l := int(buf[offset])
-			if l == 0 {
-				offset++
-				if nameLen == 0 {
-					nameBuf[0] = '.'
-					nameLen = 1
+		// Plugins are loaded in configuration order while the UDP listener is
+		// already live. Retry missing dependencies instead of permanently caching
+		// nil from the first packet.
+		if !dependenciesResolved {
+			if sw15 == nil {
+				if p := bp.M().GetPlugin("switch15"); p != nil {
+					sw15, _ = p.(SwitchPlugin)
 				}
-				break
 			}
-			if l&0xC0 == 0xC0 {
-				return server.FastActionContinue, 0, 0, ""
+			if dm == nil {
+				if p := bp.M().GetPlugin("unified_matcher1"); p != nil {
+					dm, _ = p.(DomainMapperPlugin)
+				}
 			}
-			offset++
-			if offset+l > reqLen || nameLen+l+1 > 256 {
-				return server.FastActionContinue, 0, 0, ""
+			if ipSet == nil {
+				if p := bp.M().GetPlugin("client_ip"); p != nil {
+					ipSet, _ = p.(IPSetPlugin)
+				}
 			}
-			copy(nameBuf[nameLen:], buf[offset:offset+l])
-			nameLen += l
-			nameBuf[nameLen] = '.'
-			nameLen++
-			offset += l
+			dependenciesResolved = bp.M().PluginsLoaded()
 		}
 
-		qname := string(nameBuf[:nameLen])
+		switchActive := sw15 != nil && (query_context.GlobalSwitchMask.Load()&(1<<46)) != 0
+		lookupUserspace := explicitUserspace
+		if legacy {
+			if !switchActive {
+				return server.FastActionContinue, 0, 0, ""
+			}
+			if fc != nil && !fc.userspaceEnabled() {
+				// The legacy table is about 32 MiB at its historical size. Ask the
+				// cache maintenance goroutine to allocate it so the UDP read loop
+				// never pauses for a large allocation.
+				fc.requestUserspaceEnable()
+			}
+			lookupUserspace = fc != nil && fc.userspaceEnabled()
+		} else if !lookupUserspace && !switchActive {
+			return server.FastActionContinue, 0, 0, ""
+		}
 
+		var marks uint64
 		var dset string
-		if dm != nil {
-			marks |= (1 << dm.GetRunBit())
-			if mList, dsName, match := dm.FastMatch(qname); match {
-				for _, v := range mList {
-					if v < 64 {
-						marks |= (1 << v)
-					}
-				}
-				dset = dsName
+		if switchActive {
+			action, respLen, policyMarks, policyDset, allowCache := applyFastPolicy(
+				reqLen,
+				buf,
+				remoteAddr,
+				query_context.GlobalSwitchMask.Load(),
+				dm,
+				ipSet,
+			)
+			marks, dset = policyMarks, policyDset
+			if action == server.FastActionReply || !allowCache {
+				return action, respLen, marks, dset
 			}
 		}
 
-		if (marks & (1 << 32)) != 0 {
-			if (marks & (1 << 1)) != 0 {
-				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 3), 0, ""
-			}
-			if (marks & (1 << 2)) != 0 && qtype == 1 {
-				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, ""
-			}
-			if (marks & (1 << 3)) != 0 && qtype == 28 {
-				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, ""
-			}
-		}
-		if (marks & (1 << 38)) != 0 {
-			if (marks & (1 << 5)) != 0 {
-				return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 3), 0, ""
-			}
-		}
-
-		ipMatch := false
-		if ipSet != nil {
-			ipMatch = ipSet.Match(remoteAddr.Addr().Unmap())
-			marks |= (1 << 48)
-		}
-
-		sw2A := (marks & (1 << 33)) != 0
-		sw2B := (marks & (1 << 33)) == 0
-		sw12A := (marks & (1 << 43)) != 0
-		sw12B := (marks & (1 << 43)) == 0
-
-		if (sw2A && sw12B && !ipMatch) || (sw2B && sw12A && ipMatch) {
-			marks |= (1 << 30)
-		}
-
-		if (marks & (1 << 6)) != 0 || (marks & (1 << 30)) != 0 {
+		if !lookupUserspace || fc == nil {
 			return server.FastActionContinue, 0, marks, dset
 		}
-
-		q_end := 12
-		for q_end < reqLen {
-			l := int(buf[q_end])
-			if l == 0 {
-				q_end++
-				break
-			}
-			if l&0xC0 == 0xC0 {
-				q_end += 2
-				break
-			}
-			q_end += (l & 0x3F) + 1
+		qRawBytes, ok := fastQuestionWire(buf[:reqLen])
+		if !ok {
+			return server.FastActionContinue, 0, marks, dset
 		}
-		if q_end+4 > reqLen {
-			return server.FastActionContinue, 0, 0, ""
-		}
-		q_end += 4
-		qRawBytes := buf[12:q_end]
 		hKey := calcFNV1a(qRawBytes)
-
-		groupIdx := uint64(hKey) & uint64(groupMask)
-		group := &fc.m[groupIdx]
-		var ptr *fastCacheItem
-		for i := 0; i < assoc; i++ {
-			item := group[i].Load()
-			if item != nil && item.hash == hKey {
-				ptr = item
-				break
-			}
-		}
+		ptr := fc.lookupLocal(hKey, qRawBytes)
 
 		if ptr != nil {
-			now := time.Now().Unix()
+			now := fc.deps.now().Unix()
 			expireTime := atomic.LoadInt64(&ptr.expire)
 			if now > expireTime {
 				isStuck := now > expireTime+10
-				if atomic.LoadUint32(&ptr.updating) == 0 || isStuck {
-					if atomic.CompareAndSwapUint32(&ptr.updating, 0, 1) || (isStuck && atomic.CompareAndSwapUint32(&ptr.updating, 1, 1)) {
-						atomic.StoreInt64(&ptr.expire, now+5)
+				if isStuck {
+					atomic.CompareAndSwapUint32(&ptr.updating, 1, 0)
+				}
+				if atomic.CompareAndSwapUint32(&ptr.updating, 0, 1) {
+					atomic.StoreInt64(&ptr.expire, now+fastCacheInternalTTL)
 
-						respLen := len(ptr.resp)
-						bakedStale := make([]byte, respLen)
-						copy(bakedStale, ptr.resp)
-						bakedStale[0], bakedStale[1] = buf[0], buf[1]
+					bakedStale := append([]byte(nil), ptr.resp...)
+					bakedStale[0], bakedStale[1] = buf[0], buf[1]
+					copy(bakedStale[12:12+len(qRawBytes)], qRawBytes)
 
-						_, _ = conn.WriteToUDPAddrPort(bakedStale, remoteAddr)
+					_, _ = conn.WriteToUDPAddrPort(bakedStale, remoteAddr)
 
-						return server.FastActionContinue, 0, marks|asyncRefreshMark, dset
-					}
+					return server.FastActionContinue, 0, marks | asyncRefreshMark, dset
 				}
 			}
 			respLen := len(ptr.resp)
 			txid0, txid1 := buf[0], buf[1]
 			copy(buf, ptr.resp)
 			buf[0], buf[1] = txid0, txid1
-			return server.FastActionReply, respLen, 0, ptr.domainSet
+			copy(buf[12:12+len(qRawBytes)], qRawBytes)
+			return server.FastActionReply, respLen, 0, ""
 		}
 		return server.FastActionContinue, 0, marks, dset
 	}
+}
+
+func applyFastPolicy(
+	reqLen int,
+	buf []byte,
+	remoteAddr netip.AddrPort,
+	marks uint64,
+	dm DomainMapperPlugin,
+	ipSet IPSetPlugin,
+) (action int, respLen int, outMarks uint64, dset string, allowCache bool) {
+	if reqLen < 12 {
+		return server.FastActionContinue, 0, 0, "", false
+	}
+
+	qtypeOff := 12
+	for qtypeOff < reqLen {
+		l := int(buf[qtypeOff])
+		if l == 0 {
+			qtypeOff++
+			break
+		}
+		if l&0xC0 == 0xC0 {
+			qtypeOff += 2
+			break
+		}
+		qtypeOff += l + 1
+	}
+	if qtypeOff+2 > reqLen {
+		return server.FastActionContinue, 0, 0, "", false
+	}
+	qtype := binary.BigEndian.Uint16(buf[qtypeOff : qtypeOff+2])
+
+	if (qtype == 6 || qtype == 12 || qtype == 65) && (marks&(1<<36)) != 0 {
+		return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, "", false
+	}
+	if qtype == 28 && (marks&(1<<37)) != 0 {
+		return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, "", false
+	}
+
+	offset := 12
+	var nameBuf [256]byte
+	nameLen := 0
+	for offset < reqLen {
+		l := int(buf[offset])
+		if l == 0 {
+			offset++
+			if nameLen == 0 {
+				nameBuf[0] = '.'
+				nameLen = 1
+			}
+			break
+		}
+		if l&0xC0 == 0xC0 {
+			return server.FastActionContinue, 0, 0, "", false
+		}
+		offset++
+		if offset+l > reqLen || nameLen+l+1 > len(nameBuf) {
+			return server.FastActionContinue, 0, 0, "", false
+		}
+		copy(nameBuf[nameLen:], buf[offset:offset+l])
+		nameLen += l
+		nameBuf[nameLen] = '.'
+		nameLen++
+		offset += l
+	}
+
+	if dm != nil {
+		marks |= 1 << dm.GetRunBit()
+		if mList, dsName, match := dm.FastMatch(string(nameBuf[:nameLen])); match {
+			for _, v := range mList {
+				if v < 64 {
+					marks |= 1 << v
+				}
+			}
+			dset = dsName
+		}
+	}
+
+	if (marks & (1 << 32)) != 0 {
+		if (marks & (1 << 1)) != 0 {
+			return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 3), 0, "", false
+		}
+		if (marks&(1<<2)) != 0 && qtype == 1 {
+			return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, "", false
+		}
+		if (marks&(1<<3)) != 0 && qtype == 28 {
+			return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 0), 0, "", false
+		}
+	}
+	if (marks&(1<<38)) != 0 && (marks&(1<<5)) != 0 {
+		return server.FastActionReply, makeReject(reqLen, buf, qtypeOff+4, 3), 0, "", false
+	}
+
+	ipMatch := false
+	if ipSet != nil {
+		ipMatch = ipSet.Match(remoteAddr.Addr().Unmap())
+		marks |= 1 << 48
+	}
+
+	sw2A := (marks & (1 << 33)) != 0
+	sw2B := !sw2A
+	sw12A := (marks & (1 << 43)) != 0
+	sw12B := !sw12A
+	if (sw2A && sw12B && !ipMatch) || (sw2B && sw12A && ipMatch) {
+		marks |= 1 << 30
+	}
+
+	if (marks&(1<<6)) != 0 || (marks&(1<<30)) != 0 {
+		return server.FastActionContinue, 0, marks, dset, false
+	}
+	return server.FastActionContinue, 0, marks, dset, true
 }
 
 func makeReject(reqLen int, buf []byte, offset int, rcode byte) int {
@@ -619,55 +648,4 @@ func makeReject(reqLen int, buf []byte, offset int, rcode byte) int {
 	buf[8], buf[9] = 0, 0
 	buf[10], buf[11] = 0, 0
 	return offset
-}
-
-func findTTLOffsets(msg []byte) []int {
-	if len(msg) < 12 {
-		return nil
-	}
-	qdcount := binary.BigEndian.Uint16(msg[4:6])
-	ancount := binary.BigEndian.Uint16(msg[6:8])
-	if ancount == 0 {
-		return nil
-	}
-	offset := 12
-	for i := 0; i < int(qdcount); i++ {
-		for offset < len(msg) {
-			l := int(msg[offset])
-			if l == 0 {
-				offset++
-				break
-			}
-			if l&0xC0 == 0xC0 {
-				offset += 2
-				break
-			}
-			offset += l + 1
-		}
-		offset += 4
-	}
-	var offsets []int
-	for i := 0; i < int(ancount); i++ {
-		for offset < len(msg) {
-			l := int(msg[offset])
-			if l == 0 {
-				offset++
-				break
-			}
-			if l&0xC0 == 0xC0 {
-				offset += 2
-				break
-			}
-			offset += l + 1
-		}
-		if offset+10 > len(msg) {
-			break
-		}
-		offset += 4
-		offsets = append(offsets, offset)
-		offset += 4
-		rdlen := binary.BigEndian.Uint16(msg[offset : offset+2])
-		offset += 2 + int(rdlen)
-	}
-	return offsets
 }

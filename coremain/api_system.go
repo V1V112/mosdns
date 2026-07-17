@@ -48,7 +48,7 @@ func handleSelfRestart(m *Mosdns) http.HandlerFunc {
 
 		go func(delay int) {
 			logger := m.Logger()
-			
+
 			// 2. 等待延迟
 			time.Sleep(time.Duration(delay) * time.Millisecond)
 
@@ -60,8 +60,8 @@ func handleSelfRestart(m *Mosdns) http.HandlerFunc {
 
 			// 3. [核心逻辑] 定向关闭需要保存数据的插件
 			logger.Info("saving data for targeted plugins...")
-			
-			for tag, p := range m.plugins {
+
+			for tag, p := range m.pluginsSnapshot() {
 				// 【新增防御与排查】：拦截 nil 插件并打印日志
 				if p == nil {
 					// 打印出是哪个 tag 的插件变成了 nil
@@ -77,10 +77,10 @@ func handleSelfRestart(m *Mosdns) http.HandlerFunc {
 
 				if isCache || isDomainOutput {
 					if closer, ok := p.(io.Closer); ok {
-						logger.Info("closing plugin to save data", 
-							zap.String("tag", tag), 
+						logger.Info("closing plugin to save data",
+							zap.String("tag", tag),
 							zap.String("type", typeName))
-						
+
 						// 这里会阻塞，直到文件写入操作完成 (Go bufio -> OS Cache)
 						if err := closer.Close(); err != nil {
 							logger.Warn("failed to close plugin", zap.String("tag", tag), zap.Error(err))
@@ -90,7 +90,7 @@ func handleSelfRestart(m *Mosdns) http.HandlerFunc {
 			}
 			logger.Info("targeted data save completed")
 
-			// 4. [已移除] syscall.Sync() 
+			// 4. [已移除] syscall.Sync()
 			// 既然只是进程重启而非系统关机，Close() 将数据写入 OS Cache 已经足够安全且高效。
 			// 移除后也解决了 Windows 编译报错问题。
 
@@ -102,7 +102,7 @@ func handleSelfRestart(m *Mosdns) http.HandlerFunc {
 			env := os.Environ()
 
 			err = syscall.Exec(exe, rawArgs, env)
-			
+
 			if err != nil {
 				fmt.Printf("[FATAL] syscall.Exec failed: %v\n", err)
 				os.Exit(1)

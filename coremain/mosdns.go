@@ -32,6 +32,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/IrineSistiana/mosdns/v5/pkg/safe_close"
@@ -49,8 +51,10 @@ type Mosdns struct {
 	logger *zap.Logger // non-nil logger.
 
 	// Plugins
-	plugins     map[string]any
-	pluginTypes map[string]string
+	pluginsMu     sync.RWMutex
+	plugins       map[string]any
+	pluginTypes   map[string]string
+	pluginsLoaded atomic.Bool
 
 	httpMux         *chi.Mux
 	metricsReg      *prometheus.Registry
@@ -76,12 +80,12 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	GlobalAuditCollector.StartWorker()
 
 	m := &Mosdns{
-		logger:     lg,
+		logger:      lg,
 		plugins:     make(map[string]any),
 		pluginTypes: make(map[string]string),
-		httpMux:    chi.NewRouter(),
-		metricsReg: newMetricsReg(),
-		sc:         safe_close.NewSafeClose(),
+		httpMux:     chi.NewRouter(),
+		metricsReg:  newMetricsReg(),
+		sc:          safe_close.NewSafeClose(),
 	}
 
 	// <<< START OF MODIFICATIONS >>>
@@ -113,14 +117,14 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	m.initHttpMux()
 
 	// Register our new APIs.
-	RegisterCaptureAPI(m.httpMux)    // For process logs
-	RegisterAuditAPI(m.httpMux)      // For audit logs v1
-	RegisterAuditAPIV2(m.httpMux)    // For audit logs v2
+	RegisterCaptureAPI(m.httpMux)      // For process logs
+	RegisterAuditAPI(m.httpMux)        // For audit logs v1
+	RegisterAuditAPIV2(m.httpMux)      // For audit logs v2
 	RegisterOverridesAPI(m.httpMux, m) // <<< MODIFIED: Pass 'm'
 	RegisterConfigManagerAPI(m.httpMux)
-	RegisterUpdateAPI(m.httpMux)     // For binary updates
-	RegisterSystemAPI(m.httpMux, m)     // For self-restart
-        RegisterUpstreamAPI(m.httpMux)
+	RegisterUpdateAPI(m.httpMux)    // For binary updates
+	RegisterSystemAPI(m.httpMux, m) // For self-restart
+	RegisterUpstreamAPI(m.httpMux)
 	RegisterListPluginsAPI(m.httpMux, m)
 
 	// Start http api server
@@ -157,14 +161,14 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 			GlobalAuditCollector.Stop()
 
 			m.logger.Info("starting shutdown sequences")
-			for tag, p := range m.plugins {
+			for tag, p := range m.pluginsSnapshot() {
 				if closer, _ := p.(io.Closer); closer != nil {
 					m.logger.Info("closing plugin", zap.String("tag", tag))
 					_ = closer.Close()
 				}
 			}
 			m.logger.Info("all plugins were closed")
-            GlobalAuditCollector.StopWorker()
+			GlobalAuditCollector.StopWorker()
 		}()
 	})
 
@@ -180,6 +184,7 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 		_ = m.sc.WaitClosed()
 		return nil, err
 	}
+	m.pluginsLoaded.Store(true)
 	m.logger.Info("all plugins are loaded")
 
 	return m, nil
@@ -187,14 +192,16 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 
 // NewTestMosdnsWithPlugins returns a mosdns instance for testing.
 func NewTestMosdnsWithPlugins(p map[string]any) *Mosdns {
-	return &Mosdns{
-		logger:     mlog.Nop(),
-		httpMux:    chi.NewRouter(),
+	m := &Mosdns{
+		logger:      mlog.Nop(),
+		httpMux:     chi.NewRouter(),
 		plugins:     p,
 		pluginTypes: make(map[string]string),
-		metricsReg: newMetricsReg(),
-		sc:         safe_close.NewSafeClose(),
+		metricsReg:  newMetricsReg(),
+		sc:          safe_close.NewSafeClose(),
 	}
+	m.pluginsLoaded.Store(true)
+	return m
 }
 
 func (m *Mosdns) GetSafeClose() *safe_close.SafeClose {
@@ -213,7 +220,34 @@ func (m *Mosdns) Logger() *zap.Logger {
 
 // GetPlugin returns a plugin.
 func (m *Mosdns) GetPlugin(tag string) any {
+	m.pluginsMu.RLock()
+	defer m.pluginsMu.RUnlock()
 	return m.plugins[tag]
+}
+
+// PluginsLoaded reports whether configuration-driven plugin initialization is complete.
+func (m *Mosdns) PluginsLoaded() bool {
+	return m.pluginsLoaded.Load()
+}
+
+func (m *Mosdns) pluginsSnapshot() map[string]any {
+	m.pluginsMu.RLock()
+	defer m.pluginsMu.RUnlock()
+	plugins := make(map[string]any, len(m.plugins))
+	for tag, plugin := range m.plugins {
+		plugins[tag] = plugin
+	}
+	return plugins
+}
+
+func (m *Mosdns) pluginTypesSnapshot() map[string]string {
+	m.pluginsMu.RLock()
+	defer m.pluginsMu.RUnlock()
+	types := make(map[string]string, len(m.pluginTypes))
+	for tag, pluginType := range m.pluginTypes {
+		types[tag] = pluginType
+	}
+	return types
 }
 
 // GetMetricsReg returns a prometheus.Registerer with a prefix of "mosdns_"
@@ -439,10 +473,12 @@ func (m *Mosdns) loadPresetPlugins() error {
 		if err != nil {
 			return fmt.Errorf("failed to init preset plugin %s, %w", tag, err)
 		}
+		m.pluginsMu.Lock()
 		m.plugins[tag] = p
 		// Preset plugins expose their registered kind so callers can discover
 		// them even when an instance tag is renamed.
 		m.pluginTypes[tag] = tag
+		m.pluginsMu.Unlock()
 	}
 	return nil
 }
