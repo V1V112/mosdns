@@ -133,8 +133,13 @@ func cloneItemForTest(src *item) *item {
 		upstreamOpt: copyOPT(src.upstreamOpt), staleDeadline: src.staleDeadline,
 		isStale: src.isStale, isTransient: src.isTransient,
 	}
-	dst.lastRealAccess.Store(src.lastRealAccess.Load())
-	dst.refreshSuccess.Store(src.refreshSuccess.Load())
+	srcActivity := src.activityState()
+	dstActivity := new(activeActivity)
+	dstActivity.lastRealAccess.Store(srcActivity.lastRealAccess.Load())
+	dstActivity.realAccessCount.Store(srcActivity.realAccessCount.Load())
+	dstActivity.admissionState.Store(srcActivity.admissionState.Load())
+	dstActivity.refreshState.Store(srcActivity.refreshState.Load())
+	dst.activity.Store(dstActivity)
 	return dst
 }
 
@@ -200,6 +205,12 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 			"max_retry_times":     0,
 			"max_refresh_times":   0,
 			"max_idle_time":       3600,
+			"max_tracked_entries": 512,
+			"admission_hits":      2,
+			"admission_window":    300,
+			"heat_half_life":      900,
+			"protected_ratio":     75,
+			"eviction_scan_limit": 32,
 			"exclude_ip": map[string]any{
 				"cidrs":   []any{"198.18.0.0/15"},
 				"ip_sets": []any{"geoip:cloudflare"},
@@ -231,6 +242,9 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 	if !ar.Enabled {
 		t.Fatal("active refresh should be enabled")
 	}
+	if !ar.trackingPolicyConfigured {
+		t.Fatal("active refresh tracking policy should be enabled when all six fields are configured")
+	}
 	if !ar.RestoreOnStartup {
 		t.Fatal("restore on startup should be enabled")
 	}
@@ -239,6 +253,10 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 	}
 	if ar.MaxRetryTimes != 0 || ar.MaxRefreshTimes != 0 {
 		t.Fatalf("retry/refresh limits = %d/%d, want 0/0", ar.MaxRetryTimes, ar.MaxRefreshTimes)
+	}
+	if ar.MaxTrackedEntries != 512 || ar.AdmissionHits != 2 || ar.AdmissionWindow != 300 ||
+		ar.HeatHalfLife != 900 || ar.ProtectedRatio != 75 || ar.EvictionScanLimit != 32 {
+		t.Fatalf("active admission/heat settings mismatch: %#v", ar)
 	}
 	exclude, err := normalizeActiveRefreshExcludeIP(ar.ExcludeIP)
 	if err != nil {
@@ -324,6 +342,224 @@ func TestActiveRefreshArgsRejectNonPositiveLimits(t *testing.T) {
 				t.Fatalf("error = %v", err)
 			}
 		})
+	}
+}
+
+func validActiveRefreshTrackingPolicyMap() map[string]any {
+	return map[string]any{
+		"max_tracked_entries": 512,
+		"admission_hits":      2,
+		"admission_window":    300,
+		"heat_half_life":      900,
+		"protected_ratio":     75,
+		"eviction_scan_limit": 32,
+	}
+}
+
+func validActiveRefreshTrackingPolicyArgs() ActiveRefreshArgs {
+	return ActiveRefreshArgs{
+		MaxTrackedEntries: 512,
+		AdmissionHits:     2,
+		AdmissionWindow:   300,
+		HeatHalfLife:      900,
+		ProtectedRatio:    75,
+		EvictionScanLimit: 32,
+	}
+}
+
+func assertActiveRefreshTrackingPolicyOmitted(t *testing.T, a ActiveRefreshArgs) {
+	t.Helper()
+	if a.trackingPolicyConfigured {
+		t.Fatal("tracking policy unexpectedly enabled")
+	}
+	if a.MaxTrackedEntries != 0 || a.AdmissionHits != 0 || a.AdmissionWindow != 0 ||
+		a.HeatHalfLife != 0 || a.ProtectedRatio != 0 || a.EvictionScanLimit != 0 {
+		t.Fatalf("omitted tracking policy fields must remain zero: %#v", a)
+	}
+}
+
+func assertActiveRefreshTrackingPolicyConfigured(t *testing.T, a ActiveRefreshArgs) {
+	t.Helper()
+	if !a.trackingPolicyConfigured {
+		t.Fatal("tracking policy was not enabled")
+	}
+	if a.MaxTrackedEntries != 512 || a.AdmissionHits != 2 || a.AdmissionWindow != 300 ||
+		a.HeatHalfLife != 900 || a.ProtectedRatio != 75 || a.EvictionScanLimit != 32 {
+		t.Fatalf("tracking policy values mismatch: %#v", a)
+	}
+}
+
+func TestActiveRefreshTrackingPolicyWeakDecodePresence(t *testing.T) {
+	t.Run("omitted_is_disabled_and_stays_zero", func(t *testing.T) {
+		var args Args
+		if err := utils.WeakDecode(map[string]any{
+			"size":           1024,
+			"active_refresh": map[string]any{"enabled": true},
+		}, &args); err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		assertActiveRefreshTrackingPolicyOmitted(t, args.ActiveRefresh)
+	})
+
+	t.Run("all_fields_enable_policy", func(t *testing.T) {
+		var args Args
+		if err := utils.WeakDecode(map[string]any{
+			"size":           1024,
+			"active_refresh": validActiveRefreshTrackingPolicyMap(),
+		}, &args); err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		assertActiveRefreshTrackingPolicyConfigured(t, args.ActiveRefresh)
+	})
+
+	t.Run("partial_group_is_rejected", func(t *testing.T) {
+		var args Args
+		err := utils.WeakDecode(map[string]any{
+			"active_refresh": map[string]any{
+				"max_tracked_entries": 512,
+				"admission_hits":      2,
+			},
+		}, &args)
+		if err == nil || !strings.Contains(err.Error(), "configured together") ||
+			!strings.Contains(err.Error(), "active_refresh.admission_window") {
+			t.Fatalf("partial tracking policy error = %v", err)
+		}
+	})
+}
+
+func TestActiveRefreshTrackingPolicyExplicitZero(t *testing.T) {
+	for _, field := range activeRefreshTrackingPolicyFields {
+		t.Run(field+"_weak_decode", func(t *testing.T) {
+			policy := validActiveRefreshTrackingPolicyMap()
+			policy[field] = 0
+			var args Args
+			err := utils.WeakDecode(map[string]any{"active_refresh": policy}, &args)
+			want := "active_refresh." + field + " must be greater than 0"
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestActiveRefreshTrackingPolicyProgrammaticPresence(t *testing.T) {
+	t.Run("none", func(t *testing.T) {
+		args := &Args{Size: 1024}
+		c, err := NewCacheWithError(args, Opts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		assertActiveRefreshTrackingPolicyOmitted(t, args.ActiveRefresh)
+		if c.activeRefreshTrackingPolicyEnabled() {
+			t.Fatal("runtime tracking policy unexpectedly enabled")
+		}
+	})
+
+	t.Run("all", func(t *testing.T) {
+		args := &Args{Size: 1024, ActiveRefresh: validActiveRefreshTrackingPolicyArgs()}
+		c, err := NewCacheWithError(args, Opts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		assertActiveRefreshTrackingPolicyConfigured(t, args.ActiveRefresh)
+		if !c.activeRefreshTrackingPolicyEnabled() {
+			t.Fatal("runtime tracking policy was not enabled")
+		}
+	})
+
+	t.Run("partial", func(t *testing.T) {
+		_, err := NewCacheWithError(&Args{
+			Size: 1024,
+			ActiveRefresh: ActiveRefreshArgs{
+				MaxTrackedEntries: 512,
+				AdmissionHits:     2,
+			},
+		}, Opts{})
+		if err == nil || !strings.Contains(err.Error(), "configured together") ||
+			!strings.Contains(err.Error(), "active_refresh.admission_window") {
+			t.Fatalf("partial tracking policy error = %v", err)
+		}
+	})
+}
+
+func TestActiveRefreshTrackingPolicyYAMLPresence(t *testing.T) {
+	t.Run("none", func(t *testing.T) {
+		var args Args
+		if err := yaml.Unmarshal([]byte("active_refresh:\n  enabled: true\n"), &args); err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		assertActiveRefreshTrackingPolicyOmitted(t, args.ActiveRefresh)
+	})
+
+	const fullPolicy = `active_refresh:
+  max_tracked_entries: 512
+  admission_hits: 2
+  admission_window: 300
+  heat_half_life: 900
+  protected_ratio: 75
+  eviction_scan_limit: 32
+`
+	t.Run("all", func(t *testing.T) {
+		var args Args
+		if err := yaml.Unmarshal([]byte(fullPolicy), &args); err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		assertActiveRefreshTrackingPolicyConfigured(t, args.ActiveRefresh)
+	})
+
+	t.Run("partial", func(t *testing.T) {
+		var args Args
+		err := yaml.Unmarshal([]byte(`active_refresh:
+  max_tracked_entries: 512
+  admission_hits: 2
+`), &args)
+		if err == nil || !strings.Contains(err.Error(), "configured together") ||
+			!strings.Contains(err.Error(), "active_refresh.admission_window") {
+			t.Fatalf("partial tracking policy error = %v", err)
+		}
+	})
+
+	t.Run("merge_alias_counts_as_present", func(t *testing.T) {
+		var args Args
+		err := yaml.Unmarshal([]byte(`tracking_defaults: &tracking_defaults
+  max_tracked_entries: 512
+  admission_hits: 2
+  admission_window: 300
+  heat_half_life: 900
+  protected_ratio: 75
+  eviction_scan_limit: 32
+active_refresh:
+  <<: *tracking_defaults
+  enabled: true
+`), &args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		args.init()
+		assertActiveRefreshTrackingPolicyConfigured(t, args.ActiveRefresh)
+	})
+}
+
+func TestActiveRefreshTrackingCapValidation(t *testing.T) {
+	oversized := validActiveRefreshTrackingPolicyArgs()
+	oversized.MaxTrackedEntries = 9
+	if _, err := NewCacheWithError(&Args{Size: 8, ActiveRefresh: oversized}, Opts{}); err == nil ||
+		!strings.Contains(err.Error(), "must not exceed cache size") {
+		t.Fatalf("oversized tracking cap error = %v", err)
+	}
+
+	policy := validActiveRefreshTrackingPolicyMap()
+	policy["protected_ratio"] = 101
+	var decoded Args
+	err := utils.WeakDecode(map[string]any{"active_refresh": policy}, &decoded)
+	if err == nil || !strings.Contains(err.Error(), "must not exceed 100") {
+		t.Fatalf("protected ratio error = %v", err)
 	}
 }
 
@@ -494,12 +730,12 @@ func TestActiveRefresh_MaxRefreshTimesCountsSuccesses(t *testing.T) {
 	if meta == nil {
 		t.Fatal("active refresh metadata was not tracked")
 	}
-	prepared.item.refreshSuccess.Store(1)
+	prepared.item.activityState().storeRefreshSuccesses(1)
 	meta.stopped.Store(true)
 
 	c.observeActiveRefresh(k, prepared.item, qCtx, sequence.ChainWalker{}, now.Add(time.Second), prepared.msg)
 	c.activeMu.RLock()
-	refreshCount := prepared.item.refreshSuccess.Load()
+	refreshCount := prepared.item.activityState().refreshSuccesses()
 	stopped := meta.stopped.Load()
 	task := meta.task
 	c.activeMu.RUnlock()
@@ -545,7 +781,7 @@ func TestActiveRefresh_TransientResponseDoesNotReplaceHealthyEntry(t *testing.T)
 			}
 			c.runActiveRefreshTask(&activeRefreshWork{
 				task: task, qCtx: qCtx, next: sequence.ChainWalker{},
-				expected: healthy.item, epoch: epoch, flight: flight,
+				expected: healthy.item, epoch: epoch, activityEpoch: healthy.item.activityState().refreshEpoch(), flight: flight,
 			})
 
 			got, _, ok := c.backend.Get(k)
@@ -822,7 +1058,7 @@ func TestLazyRefreshMarkerAndEpochFastReject(t *testing.T) {
 			key: k, expireAt: seeded.item.expirationTime,
 			refreshWindow: 20 * time.Second, generation: seeded.item.generation,
 		},
-		qCtx: activeCtx, expected: seeded.item, epoch: epoch,
+		qCtx: activeCtx, expected: seeded.item, epoch: epoch, activityEpoch: seeded.item.activityState().refreshEpoch(),
 		flight: refreshFlightKey{k: k, generation: seeded.item.generation},
 	})
 	if !activeCtx.IsCacheRefresh() {

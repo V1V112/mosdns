@@ -28,6 +28,13 @@ import (
 const (
 	PluginType       = "udp_server"
 	asyncRefreshMark = 1 << 60
+
+	fastRefreshEventBaseSize               = 280
+	fastRefreshEventV1Size                 = 296
+	fastRefreshEventMagicOffset            = 280
+	fastRefreshEventHitCountOffset         = 284
+	fastRefreshEventLastHitNSOffset        = 288
+	fastRefreshEventMagicV1         uint32 = 0x31484346 // "FCH1" in little endian.
 )
 
 func init() {
@@ -127,7 +134,7 @@ type fastRefreshEvent struct {
 }
 
 func decodeFastRefreshEvent(sample []byte) (fastRefreshEvent, bool) {
-	if len(sample) < 280 {
+	if len(sample) < fastRefreshEventBaseSize {
 		return fastRefreshEvent{}, false
 	}
 	isV6 := binary.LittleEndian.Uint16(sample[0:2])
@@ -150,11 +157,24 @@ func decodeFastRefreshEvent(sample []byte) (fastRefreshEvent, bool) {
 	default:
 		return fastRefreshEvent{}, false
 	}
+	hits := uint32(1)
+	// The currently shipped eBPF objects emit the historical 280-byte event and
+	// can only prove that at least one client query triggered this refresh. A
+	// future source-built object may append the v1 telemetry trailer without
+	// changing the compatible prefix. Until then kernel mode reports weight 1.
+	if len(sample) >= fastRefreshEventV1Size &&
+		binary.LittleEndian.Uint32(sample[fastRefreshEventMagicOffset:fastRefreshEventHitCountOffset]) == fastRefreshEventMagicV1 {
+		if reported := binary.LittleEndian.Uint32(sample[fastRefreshEventHitCountOffset:fastRefreshEventLastHitNSOffset]); reported > 0 {
+			hits = reported
+		}
+	}
 	return fastRefreshEvent{
 		msg: msg,
 		meta: server.QueryMeta{
-			ClientAddr:   clientIP,
-			PreFastFlags: asyncRefreshMark,
+			ClientAddr:    clientIP,
+			FromUDP:       true,
+			PreFastFlags:  asyncRefreshMark,
+			FastCacheHits: hits,
 		},
 	}, true
 }
@@ -298,7 +318,7 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 
 	// Keep the policy pre-fast stage independent from cache storage. switch15
 	// users retain their early marks/reject behavior even in off/kernel mode.
-	var fastBypass func(int, []byte, netip.AddrPort) (int, int, uint64, string)
+	var fastBypass func(int, []byte, netip.AddrPort) (int, int, uint64, string, uint32)
 	if isEbpfPort || (mode.userspace && !mode.legacy) {
 		fastBypass = buildFastBypass(
 			bp,
@@ -353,8 +373,8 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 		defer cancel()
 		defer c.Close()
 		err := server.ServeUDP(c.(*net.UDPConn), wrappedHandler, server.UDPServerOpts{
-			Logger:     bp.L(),
-			FastBypass: fastBypass,
+			Logger:                  bp.L(),
+			FastBypassWithTelemetry: fastBypass,
 		})
 		bp.M().GetSafeClose().SendCloseSignal(err)
 	}()
@@ -422,13 +442,13 @@ func buildFastBypass(
 	conn *net.UDPConn,
 	explicitUserspace bool,
 	legacy bool,
-) func(int, []byte, netip.AddrPort) (int, int, uint64, string) {
+) func(int, []byte, netip.AddrPort) (int, int, uint64, string, uint32) {
 	var sw15 SwitchPlugin
 	var dm DomainMapperPlugin
 	var ipSet IPSetPlugin
 	dependenciesResolved := false
 
-	return func(reqLen int, buf []byte, remoteAddr netip.AddrPort) (int, int, uint64, string) {
+	return func(reqLen int, buf []byte, remoteAddr netip.AddrPort) (int, int, uint64, string, uint32) {
 		// Plugins are loaded in configuration order while the UDP listener is
 		// already live. Retry missing dependencies instead of permanently caching
 		// nil from the first packet.
@@ -455,7 +475,7 @@ func buildFastBypass(
 		lookupUserspace := explicitUserspace
 		if legacy {
 			if !switchActive {
-				return server.FastActionContinue, 0, 0, ""
+				return server.FastActionContinue, 0, 0, "", 0
 			}
 			if fc != nil && !fc.userspaceEnabled() {
 				// The legacy table is about 32 MiB at its historical size. Ask the
@@ -465,7 +485,7 @@ func buildFastBypass(
 			}
 			lookupUserspace = fc != nil && fc.userspaceEnabled()
 		} else if !lookupUserspace && !switchActive {
-			return server.FastActionContinue, 0, 0, ""
+			return server.FastActionContinue, 0, 0, "", 0
 		}
 
 		var marks uint64
@@ -481,21 +501,22 @@ func buildFastBypass(
 			)
 			marks, dset = policyMarks, policyDset
 			if action == server.FastActionReply || !allowCache {
-				return action, respLen, marks, dset
+				return action, respLen, marks, dset, 0
 			}
 		}
 
 		if !lookupUserspace || fc == nil {
-			return server.FastActionContinue, 0, marks, dset
+			return server.FastActionContinue, 0, marks, dset, 0
 		}
 		qRawBytes, ok := fastQuestionWire(buf[:reqLen])
 		if !ok {
-			return server.FastActionContinue, 0, marks, dset
+			return server.FastActionContinue, 0, marks, dset, 0
 		}
 		hKey := calcFNV1a(qRawBytes)
 		ptr := fc.lookupLocal(hKey, qRawBytes)
 
 		if ptr != nil {
+			ptr.activity.addHit()
 			now := fc.deps.now().Unix()
 			expireTime := atomic.LoadInt64(&ptr.expire)
 			if now > expireTime {
@@ -512,7 +533,11 @@ func buildFastBypass(
 
 					_, _ = conn.WriteToUDPAddrPort(bakedStale, remoteAddr)
 
-					return server.FastActionContinue, 0, marks | asyncRefreshMark, dset
+					hits := ptr.activity.takeHits()
+					if hits == 0 {
+						hits = 1
+					}
+					return server.FastActionContinue, 0, marks | asyncRefreshMark, dset, hits
 				}
 			}
 			respLen := len(ptr.resp)
@@ -520,9 +545,9 @@ func buildFastBypass(
 			copy(buf, ptr.resp)
 			buf[0], buf[1] = txid0, txid1
 			copy(buf[12:12+len(qRawBytes)], qRawBytes)
-			return server.FastActionReply, respLen, 0, ""
+			return server.FastActionReply, respLen, 0, "", 0
 		}
-		return server.FastActionContinue, 0, marks, dset
+		return server.FastActionContinue, 0, marks, dset, 0
 	}
 }
 

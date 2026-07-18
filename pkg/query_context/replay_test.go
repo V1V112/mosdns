@@ -19,6 +19,7 @@ func TestReplaySnapshotRoundTripAndIsolation(t *testing.T) {
 	q.Extra = append(q.Extra, clientOpt)
 
 	ctx := NewContext(q)
+	ctx.SetFastCacheHits(23)
 	ctx.ServerMeta = ServerMeta{
 		FromUDP:          true,
 		ClientAddr:       netip.MustParseAddr("192.0.2.10"),
@@ -26,6 +27,7 @@ func TestReplaySnapshotRoundTripAndIsolation(t *testing.T) {
 		UrlPath:          "/dns-query",
 		PreFastFlags:     1 << 17,
 		PreFastDomainSet: "snapshot-set",
+		FastCacheHits:    23,
 	}
 	ctx.QOpt().SetUDPSize(1232)
 	ctx.QOpt().Option = append(ctx.QOpt().Option, &dns.EDNS0_LOCAL{Code: 65002, Data: []byte{4, 5, 6}})
@@ -57,6 +59,12 @@ func TestReplaySnapshotRoundTripAndIsolation(t *testing.T) {
 	first, err := snapshot.ContextForReplay()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := first.ConsumeFastCacheHits(); got != 0 {
+		t.Fatalf("replay retained one-shot fast-cache sample %d", got)
+	}
+	if first.ServerMeta.FastCacheHits != 0 {
+		t.Fatalf("replay server metadata retained fast-cache hits %d", first.ServerMeta.FastCacheHits)
 	}
 	if first.TraceID != "" || first.Id() != 0 || !first.StartTime().IsZero() {
 		t.Fatal("client trace identity was retained in compact replay state")

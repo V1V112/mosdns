@@ -3,9 +3,11 @@ package udp_server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +19,30 @@ import (
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
+
+func TestDecodeFastRefreshEventTelemetryCompatibility(t *testing.T) {
+	q := new(dns.Msg)
+	q.SetQuestion("kernel-telemetry.example.", dns.TypeA)
+	wire, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sample := make([]byte, fastRefreshEventV1Size)
+	binary.LittleEndian.PutUint16(sample[4:6], uint16(len(wire)))
+	copy(sample[8:12], netip.MustParseAddr("192.0.2.9").AsSlice())
+	copy(sample[24:], wire)
+
+	legacy, ok := decodeFastRefreshEvent(sample[:fastRefreshEventBaseSize])
+	if !ok || legacy.meta.FastCacheHits != 1 || !legacy.meta.FromUDP {
+		t.Fatalf("legacy event = %#v, ok=%v; want UDP metadata and one compatibility hit", legacy.meta, ok)
+	}
+	binary.LittleEndian.PutUint32(sample[fastRefreshEventMagicOffset:fastRefreshEventHitCountOffset], fastRefreshEventMagicV1)
+	binary.LittleEndian.PutUint32(sample[fastRefreshEventHitCountOffset:fastRefreshEventLastHitNSOffset], 37)
+	v1, ok := decodeFastRefreshEvent(sample)
+	if !ok || v1.meta.FastCacheHits != 37 || !v1.meta.FromUDP {
+		t.Fatalf("v1 event = %#v, ok=%v; want UDP metadata and 37 hits", v1.meta, ok)
+	}
+}
 
 type testHandlerFunc func(context.Context, *dns.Msg, server.QueryMeta, func(*dns.Msg) (*[]byte, error)) *[]byte
 
@@ -292,12 +318,180 @@ func TestExplicitUserspaceDoesNotEnableSwitchPolicy(t *testing.T) {
 		true,
 		false,
 	)
-	action, _, marks, dset := bypass(len(wire), wire, netip.MustParseAddrPort("127.0.0.1:53000"))
+	action, _, marks, dset, _ := bypass(len(wire), wire, netip.MustParseAddrPort("127.0.0.1:53000"))
 	if action != server.FastActionContinue || marks != 0 || dset != "" {
 		t.Fatalf("unexpected policy result without switch15: action=%d marks=%x dset=%q", action, marks, dset)
 	}
 	if !bytes.Equal(wire, original) {
 		t.Fatal("explicit userspace mode applied switch policy and rewrote the query")
+	}
+}
+
+func TestUserspaceFastCacheAggregatesHitsAcrossRefreshReplacement(t *testing.T) {
+	now := time.Unix(1000, 0)
+	deps := testFastCacheDeps(now)
+	deps.now = func() time.Time { return now }
+	fc, err := newFastCacheWithDeps(
+		resolvedFastCacheMode{userspace: true, userspaceSize: 8},
+		zap.NewNop(),
+		deps,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fc.Close()
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	bypass := buildFastBypass(
+		coremain.NewBP("test", coremain.NewTestMosdnsWithPlugins(map[string]any{})),
+		fc,
+		conn,
+		true,
+		false,
+	)
+	query := func() (int, uint32) {
+		q := new(dns.Msg)
+		q.SetQuestion("aggregate.example.", dns.TypeA)
+		wire, packErr := q.Pack()
+		if packErr != nil {
+			t.Fatal(packErr)
+		}
+		action, _, _, _, hits := bypass(
+			len(wire), wire, netip.MustParseAddrPort("127.0.0.1:53001"),
+		)
+		return action, hits
+	}
+
+	response, _ := testFastCacheResponse(t, 1, "aggregate.example.", 60)
+	fc.Store(response, false)
+	for i := 0; i < 3; i++ {
+		if action, hits := query(); action != server.FastActionReply || hits != 0 {
+			t.Fatalf("fresh hit %d returned action=%d hits=%d", i, action, hits)
+		}
+	}
+	now = now.Add(6 * time.Second)
+	if action, hits := query(); action != server.FastActionContinue || hits != 4 {
+		t.Fatalf("first refresh sample action=%d hits=%d, want continue/4", action, hits)
+	}
+
+	updated, _ := testFastCacheResponse(t, 2, "aggregate.example.", 60)
+	fc.Store(updated, true)
+	for i := 0; i < 2; i++ {
+		if action, _ := query(); action != server.FastActionReply {
+			t.Fatalf("post-refresh hit %d returned action=%d", i, action)
+		}
+	}
+	now = now.Add(6 * time.Second)
+	if action, hits := query(); action != server.FastActionContinue || hits != 3 {
+		t.Fatalf("replacement sample action=%d hits=%d, want continue/3", action, hits)
+	}
+}
+
+func TestStoreLocalConcurrentSameQuestionUsesOneWay(t *testing.T) {
+	wire, _ := testFastCacheResponse(t, 1, "concurrent-store.example.", 60)
+	question, ok := fastQuestionWire(wire)
+	if !ok {
+		t.Fatal("test response has no fast-cache question")
+	}
+	hash := calcFNV1a(question)
+
+	fc := &fastCache{}
+	table, err := newFastCacheTable(fastCacheAssoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc.local.Store(table)
+	const writers = 64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for range writers {
+		go func() {
+			defer wg.Done()
+			<-start
+			fc.storeLocal(&fastCacheItem{
+				hash: hash, question: question, resp: wire, expire: 100,
+			}, 1, false)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	group := &table.groups[uint64(hash)&table.mask]
+	matches := 0
+	var shared *fastCacheActivity
+	for i := 0; i < fastCacheAssoc; i++ {
+		stored := group[i].Load()
+		if stored != nil && stored.hash == hash && equalFastQuestion(stored.question, question) {
+			matches++
+			shared = stored.activity
+		}
+	}
+	if matches != 1 || shared == nil {
+		t.Fatalf("same question occupied %d ways, activity=%p; want one shared way", matches, shared)
+	}
+
+	// A later generation must inherit the exact accumulator rather than split
+	// activity while concurrent refills race.
+	start = make(chan struct{})
+	wg.Add(writers)
+	for range writers {
+		go func() {
+			defer wg.Done()
+			<-start
+			fc.storeLocal(&fastCacheItem{
+				hash: hash, question: question, resp: wire, expire: 200,
+			}, 2, false)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	matches = 0
+	for i := 0; i < fastCacheAssoc; i++ {
+		stored := group[i].Load()
+		if stored != nil && stored.hash == hash && equalFastQuestion(stored.question, question) {
+			matches++
+			if stored.activity != shared {
+				t.Fatalf("replacement changed activity pointer: got=%p want=%p", stored.activity, shared)
+			}
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("replacement occupied %d ways, want one", matches)
+	}
+}
+
+func TestPriorityUserspaceWriteWaitsPastOrdinaryGuardBudget(t *testing.T) {
+	var guard atomic.Uint32
+	guard.Store(1)
+
+	ordinaryYields := 0
+	if acquireFastCacheWriteGuardWithYield(&guard, false, func() { ordinaryYields++ }) {
+		t.Fatal("ordinary write unexpectedly acquired a continuously held guard")
+	}
+	if ordinaryYields != fastCacheWriteGuardAttempts/8 {
+		t.Fatalf("ordinary write yielded %d times, want %d", ordinaryYields, fastCacheWriteGuardAttempts/8)
+	}
+
+	// Release only after five yields (40 failed CAS attempts), beyond the
+	// ordinary 32-attempt budget. This is synchronous and deterministic: a
+	// priority acquisition can succeed only if it continues waiting.
+	priorityYields := 0
+	if !acquireFastCacheWriteGuardWithYield(&guard, true, func() {
+		priorityYields++
+		if priorityYields == 5 {
+			guard.Store(0)
+		}
+	}) {
+		t.Fatal("priority write gave up before the held guard was released")
+	}
+	defer guard.Store(0)
+	if priorityYields != 5 {
+		t.Fatalf("priority write yielded %d times, want 5", priorityYields)
 	}
 }
 

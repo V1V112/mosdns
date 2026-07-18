@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,13 +116,42 @@ type fastCacheItem struct {
 	resp     []byte
 	question []byte
 	updating uint32
+	activity *fastCacheActivity
+}
+
+// fastCacheActivity survives replacement of a userspace cache generation.
+// Hits that arrive while an async refresh is running therefore remain in the
+// same accumulator and will be reported by the next refresh sample instead of
+// being lost with the old item.
+type fastCacheActivity struct {
+	hits atomic.Uint32
+}
+
+func (a *fastCacheActivity) addHit() {
+	if a == nil {
+		return
+	}
+	for current := a.hits.Load(); current != ^uint32(0); current = a.hits.Load() {
+		if a.hits.CompareAndSwap(current, current+1) {
+			return
+		}
+	}
+}
+
+func (a *fastCacheActivity) takeHits() uint32 {
+	if a == nil {
+		return 0
+	}
+	return a.hits.Swap(0)
 }
 
 type fastCacheGroup [fastCacheAssoc]atomic.Pointer[fastCacheItem]
 
 type fastCacheTable struct {
-	groups []fastCacheGroup
-	mask   uint64
+	groups      []fastCacheGroup
+	mask        uint64
+	writeGuards []atomic.Uint32
+	guardMask   uint64
 }
 
 func newFastCacheTable(size int) (*fastCacheTable, error) {
@@ -129,9 +159,12 @@ func newFastCacheTable(size int) (*fastCacheTable, error) {
 		return nil, err
 	}
 	groupCount := size / fastCacheAssoc
+	guardCount := min(groupCount, 4096)
 	return &fastCacheTable{
-		groups: make([]fastCacheGroup, groupCount),
-		mask:   uint64(groupCount - 1),
+		groups:      make([]fastCacheGroup, groupCount),
+		mask:        uint64(groupCount - 1),
+		writeGuards: make([]atomic.Uint32, guardCount),
+		guardMask:   uint64(guardCount - 1),
 	}, nil
 }
 
@@ -490,18 +523,38 @@ func (fc *fastCache) lookupLocal(hash uint32, question []byte) *fastCacheItem {
 	return nil
 }
 
-func (fc *fastCache) storeLocal(item *fastCacheItem, now int64) {
+func (fc *fastCache) storeLocal(item *fastCacheItem, now int64, priority bool) {
 	t := fc.local.Load()
 	if t == nil || item == nil {
 		return
 	}
-	group := &t.groups[uint64(item.hash)&t.mask]
+	groupIndex := uint64(item.hash) & t.mask
+	guard := &t.writeGuards[groupIndex&t.guardMask]
+	if !acquireFastCacheWriteGuard(guard, priority) {
+		// The fast cache is best-effort. Avoid stalling a DNS handler behind an
+		// unusually contended ordinary fill; the ordinary cache still owns
+		// correctness. Priority refresh replacements wait until they can publish.
+		return
+	}
+	defer guard.Store(0)
+	group := &t.groups[groupIndex]
 	for i := 0; i < fastCacheAssoc; i++ {
 		old := group[i].Load()
 		if old != nil && old.hash == item.hash && equalFastQuestion(old.question, item.question) {
+			if old.activity != nil {
+				item.activity = old.activity
+			} else if item.activity == nil {
+				item.activity = new(fastCacheActivity)
+			}
 			group[i].Store(item)
 			return
 		}
+	}
+	// Allocate only after ruling out an existing generation whose accumulator
+	// can be reused. Hot entries are replaced frequently, so eager allocation
+	// here would create one immediately-dead object on every refill.
+	if item.activity == nil {
+		item.activity = new(fastCacheActivity)
 	}
 	for i := 0; i < fastCacheAssoc; i++ {
 		if group[i].CompareAndSwap(nil, item) {
@@ -527,6 +580,29 @@ func (fc *fastCache) storeLocal(item *fastCacheItem, now int64) {
 		}
 	}
 	group[oldest].Store(item)
+}
+
+const fastCacheWriteGuardAttempts = 32
+
+func acquireFastCacheWriteGuard(guard *atomic.Uint32, priority bool) bool {
+	return acquireFastCacheWriteGuardWithYield(guard, priority, runtime.Gosched)
+}
+
+func acquireFastCacheWriteGuardWithYield(guard *atomic.Uint32, priority bool, yield func()) bool {
+	if guard == nil {
+		return false
+	}
+	for attempt := 0; ; attempt++ {
+		if guard.CompareAndSwap(0, 1) {
+			return true
+		}
+		if attempt&7 == 7 {
+			yield()
+		}
+		if !priority && attempt+1 >= fastCacheWriteGuardAttempts {
+			return false
+		}
+	}
 }
 
 func (fc *fastCache) Store(resp []byte, priority bool) {
@@ -579,7 +655,7 @@ func (fc *fastCache) Store(resp []byte, priority bool) {
 			resp:     bakedResp,
 			question: question,
 			expire:   now.Add(fastCacheInternalTTL * time.Second).Unix(),
-		}, now.Unix())
+		}, now.Unix(), priority)
 		fc.localHasEntries.Store(true)
 	}
 }

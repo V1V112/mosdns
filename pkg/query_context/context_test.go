@@ -30,6 +30,62 @@ func TestRenewTrace(t *testing.T) {
 	}
 }
 
+func TestFastCacheHitsAreOneShotAcrossCopies(t *testing.T) {
+	q := new(dns.Msg)
+	q.SetQuestion("fast-cache.example.", dns.TypeA)
+	ctx := NewContext(q)
+	ctx.SetFastCacheHits(17)
+
+	first := ctx.Copy()
+	second := ctx.Copy()
+	got := first.ConsumeFastCacheHits() + second.ConsumeFastCacheHits() + ctx.ConsumeFastCacheHits()
+	if got != 17 {
+		t.Fatalf("shared fast-cache sample total = %d, want 17", got)
+	}
+	if hits, present := second.TakeFastCacheHits(); hits != 0 || !present {
+		t.Fatalf("consumed shared token = (%d, %v), want (0, true)", hits, present)
+	}
+
+	ctx.SetFastCacheHits(9)
+	if got := ctx.CopyWithoutResponse().ConsumeFastCacheHits(); got != 0 {
+		t.Fatalf("lazy-refresh copy retained fast-cache sample %d", got)
+	}
+	if got := ctx.ConsumeFastCacheHits(); got != 9 {
+		t.Fatalf("source sample = %d, want 9", got)
+	}
+}
+
+func TestPeekFastCacheHitsDoesNotConsume(t *testing.T) {
+	q := new(dns.Msg)
+	q.SetQuestion("peek-fast-cache.example.", dns.TypeA)
+	ctx := NewContext(q)
+	ctx.SetFastCacheHits(23)
+
+	copyCtx := ctx.Copy()
+	if hits, present := ctx.PeekFastCacheHits(); hits != 23 || !present {
+		t.Fatalf("source peek = (%d, %v), want (23, true)", hits, present)
+	}
+	if hits, present := copyCtx.PeekFastCacheHits(); hits != 23 || !present {
+		t.Fatalf("copy peek = (%d, %v), want (23, true)", hits, present)
+	}
+	if hits, present := ctx.PeekFastCacheHits(); hits != 23 || !present {
+		t.Fatalf("second source peek = (%d, %v), want (23, true)", hits, present)
+	}
+
+	if got := copyCtx.ConsumeFastCacheHits(); got != 23 {
+		t.Fatalf("consume after peeks = %d, want 23", got)
+	}
+	if hits, present := ctx.PeekFastCacheHits(); hits != 0 || !present {
+		t.Fatalf("source peek after shared consume = (%d, %v), want (0, true)", hits, present)
+	}
+	if hits, present := copyCtx.PeekFastCacheHits(); hits != 0 || !present {
+		t.Fatalf("copy peek after shared consume = (%d, %v), want (0, true)", hits, present)
+	}
+	if hits, present := (*Context)(nil).PeekFastCacheHits(); hits != 0 || present {
+		t.Fatalf("nil Context peek = (%d, %v), want (0, false)", hits, present)
+	}
+}
+
 func TestCopyWithoutResponse(t *testing.T) {
 	q := new(dns.Msg)
 	q.SetQuestion("example.org.", dns.TypeA)

@@ -98,7 +98,10 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 	defer cancel()
 
 	qCtx := query_context.NewContext(q)
+	fastCacheHits := serverMeta.FastCacheHits
+	serverMeta.FastCacheHits = 0
 	qCtx.ServerMeta = serverMeta
+	qCtx.SetFastCacheHits(fastCacheHits)
 	qCtx.ApplyFastFlags(serverMeta.PreFastFlags)
 	if serverMeta.PreFastDomainSet != "" {
 		qCtx.StoreValue(query_context.KeyDomainSet, serverMeta.PreFastDomainSet)
@@ -122,7 +125,7 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 		// 如果错误是 sequence.ErrExit，说明是插件主动要求退出（任务完成或拦截）
 		// 我们将其视为“无错误”，继续向下执行，尝试返回 qCtx.R()
 		if err == sequence.ErrExit {
-			err = nil 
+			err = nil
 		} else {
 			// 只有真正的错误才记录日志并返回 SERVFAIL
 			h.opts.Logger.Warn("entry err", qCtx.InfoField(), zap.Error(err))
@@ -131,8 +134,8 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 			resp.Rcode = dns.RcodeServerFailure
 		}
 		// [修改结束]
-	} 
-	
+	}
+
 	// 注意：上面的 if err != nil 块如果被 ErrExit 绕过了（err被置为nil），
 	// 这里 resp 依然是 nil，需要从 qCtx 获取
 	if resp == nil {

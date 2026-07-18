@@ -119,25 +119,141 @@ type item struct {
 	staleSourceGeneration uint64
 	activeMeta            atomic.Pointer[activeRefreshMeta]
 	backendRemoved        atomic.Bool
-	lastRealAccess        atomic.Int64
-	refreshSuccess        atomic.Int64
-	resp                  []byte
-	storedTime            time.Time
-	expirationTime        time.Time
-	lazyDeadline          time.Time
-	domainSet             string
-	upstreamOpt           *dns.OPT
-	staleDeadline         time.Time
-	isStale               bool
-	isTransient           bool
+	// activity is shared by every physical cache generation in one key lineage.
+	// A real hit that already passed the old L1 pointer check therefore remains
+	// visible after a concurrent active/lazy generation handoff. The pointer is
+	// installed before backend publication and never replaced afterwards.
+	activity atomic.Pointer[activeActivity]
+	// admissionCapture is deliberately generation-local. Sharing this gate with
+	// activity would let an old snapshot owner block, or accidentally release,
+	// the owner for a newly published generation.
+	admissionCapture atomic.Bool
+	resp             []byte
+	storedTime       time.Time
+	expirationTime   time.Time
+	lazyDeadline     time.Time
+	domainSet        string
+	upstreamOpt      *dns.OPT
+	staleDeadline    time.Time
+	isStale          bool
+	isTransient      bool
+}
+
+// activeActivity is the lock-free popularity and idle state shared across a
+// cache key's physical generations. admissionState packs the admission-window
+// start Unix second in the high 32 bits and the saturating hit count in the low
+// 32 bits. refreshState packs a real-access epoch in the high 32 bits and the
+// consecutive successful refresh count in the low 32 bits. Keeping those two
+// values in one CAS prevents a hit racing a refresh completion from being
+// overwritten by a later Add(1).
+type activeActivity struct {
+	// admissionMu is used only while a lineage is not yet tracked. It publishes
+	// lifetime count, idle state and admission-window state as one observation
+	// to a concurrent metadata installer or foreground generation handoff. Once
+	// activeMeta is bound, real hits stay on the atomic writer-pin fast path.
+	admissionMu     sync.Mutex
+	lastRealAccess  atomic.Int64
+	realAccessCount atomic.Uint64
+	admissionState  atomic.Uint64
+	refreshState    atomic.Uint64
+}
+
+func (v *item) activityState() *activeActivity {
+	if v == nil {
+		return nil
+	}
+	if activity := v.activity.Load(); activity != nil {
+		return activity
+	}
+	activity := new(activeActivity)
+	if v.activity.CompareAndSwap(nil, activity) {
+		return activity
+	}
+	return v.activity.Load()
+}
+
+func newActiveActivity(lastRealAccess time.Time) *activeActivity {
+	activity := new(activeActivity)
+	if !lastRealAccess.IsZero() {
+		activity.lastRealAccess.Store(lastRealAccess.UnixNano())
+	}
+	return activity
+}
+
+// inheritActiveRefreshActivity must only be called before dst is published to
+// the backend. Published generations keep an immutable activity pointer.
+func inheritActiveRefreshActivity(dst, src *item) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.activity.Store(src.activityState())
+}
+
+func (a *activeActivity) refreshEpoch() uint32 {
+	if a == nil {
+		return 0
+	}
+	return uint32(a.refreshState.Load() >> 32)
+}
+
+func (a *activeActivity) refreshSuccesses() uint32 {
+	if a == nil {
+		return 0
+	}
+	return uint32(a.refreshState.Load())
+}
+
+func (a *activeActivity) storeRefreshSuccesses(successes uint32) {
+	if a == nil {
+		return
+	}
+	for state := a.refreshState.Load(); ; state = a.refreshState.Load() {
+		updated := state&0xffffffff00000000 | uint64(successes)
+		if a.refreshState.CompareAndSwap(state, updated) {
+			return
+		}
+	}
+}
+
+func (a *activeActivity) recordRealAccess(now time.Time) {
+	if a == nil {
+		return
+	}
+	storeActiveRefreshAccessMax(&a.lastRealAccess, now.UnixNano())
+	for state := a.refreshState.Load(); ; state = a.refreshState.Load() {
+		nextEpoch := uint32(state>>32) + 1
+		if a.refreshState.CompareAndSwap(state, uint64(nextEpoch)<<32) {
+			return
+		}
+	}
+}
+
+// addRefreshSuccess records one successful active refresh only if no real hit
+// changed the captured epoch while the upstream query was running.
+func (a *activeActivity) addRefreshSuccess(epoch uint32) bool {
+	if a == nil {
+		return false
+	}
+	for state := a.refreshState.Load(); ; state = a.refreshState.Load() {
+		if uint32(state>>32) != epoch {
+			return false
+		}
+		successes := uint32(state)
+		if successes == ^uint32(0) {
+			return true
+		}
+		updated := state&0xffffffff00000000 | uint64(successes+1)
+		if a.refreshState.CompareAndSwap(state, updated) {
+			return true
+		}
+	}
 }
 
 func recordRealCacheAccess(v *item, now time.Time) {
 	if v == nil {
 		return
 	}
-	v.lastRealAccess.Store(now.UnixNano())
-	v.refreshSuccess.Store(0)
+	v.activityState().recordRealAccess(now)
 }
 
 type l1Item struct {
@@ -208,45 +324,70 @@ func (a *FallbackProbeArgs) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type ActiveRefreshArgs struct {
-	Enabled          bool                    `yaml:"enabled"`
-	RestoreOnStartup bool                    `yaml:"restore_on_startup"`
-	Threshold        int                     `yaml:"threshold"`
-	RequeryTimeoutMS int                     `yaml:"requery_timeout_ms"`
-	Workers          int                     `yaml:"workers"`
-	MaxRefreshQPS    float64                 `yaml:"max_refresh_qps"`
-	RefreshBurst     int                     `yaml:"refresh_burst"`
-	MaxTasksPerBatch int                     `yaml:"max_tasks_per_batch"`
-	MaxPendingTasks  int                     `yaml:"max_pending_tasks"`
-	MaxRetryTimes    int                     `yaml:"max_retry_times"`
-	MaxRefreshTimes  int                     `yaml:"max_refresh_times"`
-	MaxIdleTime      int                     `yaml:"max_idle_time"`
-	ExcludeIP        any                     `yaml:"exclude_ip"`
-	ExcludeDomain    ActiveRefreshDomainArgs `yaml:"exclude_domain"`
-	FallbackProbe    FallbackProbeArgs       `yaml:"fallback_probe"`
+	Enabled          bool    `yaml:"enabled"`
+	RestoreOnStartup bool    `yaml:"restore_on_startup"`
+	Threshold        int     `yaml:"threshold"`
+	RequeryTimeoutMS int     `yaml:"requery_timeout_ms"`
+	Workers          int     `yaml:"workers"`
+	MaxRefreshQPS    float64 `yaml:"max_refresh_qps"`
+	RefreshBurst     int     `yaml:"refresh_burst"`
+	MaxTasksPerBatch int     `yaml:"max_tasks_per_batch"`
+	MaxPendingTasks  int     `yaml:"max_pending_tasks"`
+	MaxRetryTimes    int     `yaml:"max_retry_times"`
+	MaxRefreshTimes  int     `yaml:"max_refresh_times"`
+	MaxIdleTime      int     `yaml:"max_idle_time"`
+	// These six fields form one explicit opt-in tracking policy. When all are
+	// omitted, active refresh keeps its historical immediate-admission and
+	// least-urgent eviction behaviour. Partial groups are rejected.
+	MaxTrackedEntries int `yaml:"max_tracked_entries,omitempty"`
+	// AdmissionHits real client accesses must occur inside AdmissionWindow
+	// before a previously untracked entry gets replay state and a refresh task.
+	AdmissionHits     int                     `yaml:"admission_hits,omitempty"`
+	AdmissionWindow   int                     `yaml:"admission_window,omitempty"`
+	HeatHalfLife      int                     `yaml:"heat_half_life,omitempty"`
+	ProtectedRatio    int                     `yaml:"protected_ratio,omitempty"`
+	EvictionScanLimit int                     `yaml:"eviction_scan_limit,omitempty"`
+	ExcludeIP         any                     `yaml:"exclude_ip"`
+	ExcludeDomain     ActiveRefreshDomainArgs `yaml:"exclude_domain"`
+	FallbackProbe     FallbackProbeArgs       `yaml:"fallback_probe"`
 
-	maxRetryTimesConfigured bool
-	maxIdleTimeConfigured   bool
+	maxRetryTimesConfigured  bool
+	maxIdleTimeConfigured    bool
+	trackingPolicyConfigured bool
 }
 
 type activeRefreshArgsRaw struct {
-	Enabled          bool                    `yaml:"enabled"`
-	RestoreOnStartup bool                    `yaml:"restore_on_startup"`
-	Threshold        int                     `yaml:"threshold"`
-	RequeryTimeoutMS int                     `yaml:"requery_timeout_ms"`
-	Workers          int                     `yaml:"workers"`
-	MaxRefreshQPS    float64                 `yaml:"max_refresh_qps"`
-	RefreshBurst     int                     `yaml:"refresh_burst"`
-	MaxTasksPerBatch int                     `yaml:"max_tasks_per_batch"`
-	MaxPendingTasks  int                     `yaml:"max_pending_tasks"`
-	MaxRetryTimes    int                     `yaml:"max_retry_times"`
-	MaxRefreshTimes  int                     `yaml:"max_refresh_times"`
-	MaxIdleTime      int                     `yaml:"max_idle_time"`
-	ExcludeIP        any                     `yaml:"exclude_ip"`
-	ExcludeDomain    ActiveRefreshDomainArgs `yaml:"exclude_domain"`
-	FallbackProbe    FallbackProbeArgs       `yaml:"fallback_probe"`
+	Enabled           bool                    `yaml:"enabled"`
+	RestoreOnStartup  bool                    `yaml:"restore_on_startup"`
+	Threshold         int                     `yaml:"threshold"`
+	RequeryTimeoutMS  int                     `yaml:"requery_timeout_ms"`
+	Workers           int                     `yaml:"workers"`
+	MaxRefreshQPS     float64                 `yaml:"max_refresh_qps"`
+	RefreshBurst      int                     `yaml:"refresh_burst"`
+	MaxTasksPerBatch  int                     `yaml:"max_tasks_per_batch"`
+	MaxPendingTasks   int                     `yaml:"max_pending_tasks"`
+	MaxRetryTimes     int                     `yaml:"max_retry_times"`
+	MaxRefreshTimes   int                     `yaml:"max_refresh_times"`
+	MaxIdleTime       int                     `yaml:"max_idle_time"`
+	MaxTrackedEntries int                     `yaml:"max_tracked_entries"`
+	AdmissionHits     int                     `yaml:"admission_hits"`
+	AdmissionWindow   int                     `yaml:"admission_window"`
+	HeatHalfLife      int                     `yaml:"heat_half_life"`
+	ProtectedRatio    int                     `yaml:"protected_ratio"`
+	EvictionScanLimit int                     `yaml:"eviction_scan_limit"`
+	ExcludeIP         any                     `yaml:"exclude_ip"`
+	ExcludeDomain     ActiveRefreshDomainArgs `yaml:"exclude_domain"`
+	FallbackProbe     FallbackProbeArgs       `yaml:"fallback_probe"`
 }
 
 func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
+	*a = ActiveRefreshArgs{}
+	for node != nil && node.Kind == yaml.AliasNode && node.Alias != nil {
+		node = node.Alias
+	}
+	if node == nil {
+		return nil
+	}
 	if node.Kind == yaml.ScalarNode {
 		var enabled bool
 		if err := node.Decode(&enabled); err != nil {
@@ -255,7 +396,7 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 		a.Enabled = enabled
 		return nil
 	}
-	maxRetryConfigured, maxIdleConfigured, err := validateActiveRefreshYAMLNode(node)
+	maxRetryConfigured, maxIdleConfigured, trackingConfigured, err := validateActiveRefreshYAMLNode(node)
 	if err != nil {
 		return err
 	}
@@ -278,6 +419,13 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 	a.MaxRefreshTimes = raw.MaxRefreshTimes
 	a.MaxIdleTime = raw.MaxIdleTime
 	a.maxIdleTimeConfigured = maxIdleConfigured
+	a.trackingPolicyConfigured = trackingConfigured
+	a.MaxTrackedEntries = raw.MaxTrackedEntries
+	a.AdmissionHits = raw.AdmissionHits
+	a.AdmissionWindow = raw.AdmissionWindow
+	a.HeatHalfLife = raw.HeatHalfLife
+	a.ProtectedRatio = raw.ProtectedRatio
+	a.EvictionScanLimit = raw.EvictionScanLimit
 	a.ExcludeIP = raw.ExcludeIP
 	a.ExcludeDomain = raw.ExcludeDomain
 	a.FallbackProbe = raw.FallbackProbe
@@ -340,10 +488,10 @@ func (a *Args) UnmarshalYAML(node *yaml.Node) error {
 func (a *Args) init() {
 	utils.SetDefaultUnsignNum(&a.Size, 1024)
 	utils.SetDefaultUnsignNum(&a.DumpInterval, 600)
-	a.ActiveRefresh.init()
+	a.ActiveRefresh.init(a.Size)
 }
 
-func (a *ActiveRefreshArgs) init() {
+func (a *ActiveRefreshArgs) init(_ int) {
 	utils.SetDefaultUnsignNum(&a.Threshold, defaultActiveRefreshThreshold)
 	utils.SetDefaultUnsignNum(&a.RequeryTimeoutMS, defaultActiveRefreshRequeryTimeout)
 	utils.SetDefaultUnsignNum(&a.Workers, defaultActiveRefreshWorkers)
@@ -453,6 +601,8 @@ type Cache struct {
 	activeSchedule    activeScheduleHeap
 	activePending     activePendingHeap
 	activeEviction    activeEvictionHeap
+	activeProtected   int
+	activeClockTicket uint64
 	activeWake        chan struct{}
 	activeWorkerReady chan chan *activeRefreshWork
 	activeWorkers     sync.WaitGroup
@@ -528,6 +678,9 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 	args.init()
 	if err := validateActiveRefreshArgs(&args.ActiveRefresh); err != nil {
 		return nil, err
+	}
+	if args.ActiveRefresh.trackingPolicyConfigured && args.ActiveRefresh.MaxTrackedEntries > args.Size {
+		return nil, fmt.Errorf("active_refresh.max_tracked_entries must not exceed cache size %d", args.Size)
 	}
 	logger := opts.Logger
 	if logger == nil {
@@ -893,9 +1046,130 @@ func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
 	return nil
 }
 
+// previewActiveRefreshHitWeight decides whether an uncommitted cache miss is
+// worth capturing without claiming the Context's one-shot fast-cache sample.
+// Only the foreground branch that actually commits may consume that sample.
+func previewActiveRefreshHitWeight(qCtx *query_context.Context) uint32 {
+	if qCtx == nil || qCtx.IsCacheRefresh() {
+		return 0
+	}
+	if hits, sampled := qCtx.PeekFastCacheHits(); sampled {
+		return hits
+	}
+	return 1
+}
+
+// inheritedForegroundActiveRefreshReady recognizes the narrow handoff where
+// two foreground branches both observed an absent key, the branch that
+// returned SERVFAIL consumed the shared fast-cache sample, and a later healthy
+// branch replaced that transient generation. commitPreparedForegroundWithDisplaced
+// has already made both generations share one activity object, so the healthy
+// branch must inherit readiness without recording a synthetic extra hit.
+func (c *Cache) inheritedForegroundActiveRefreshReady(updated, displaced *item, now time.Time) bool {
+	if !c.activeRefreshEnabled() || updated == nil || displaced == nil ||
+		updated.isTransient || !displaced.isTransient {
+		return false
+	}
+	updatedActivity := updated.activityState()
+	displacedActivity := displaced.activityState()
+	if updatedActivity == nil || updatedActivity != displacedActivity {
+		return false
+	}
+	if boundActiveRefreshMeta(displaced) != nil {
+		return true
+	}
+	accessCount, state := snapshotActiveAdmissionState(displaced)
+	if !c.activeRefreshTrackingPolicyEnabled() {
+		return accessCount > 0
+	}
+	if uint64(uint32(state)) < uint64(c.args.ActiveRefresh.AdmissionHits) {
+		return false
+	}
+	window := time.Duration(c.args.ActiveRefresh.AdmissionWindow) * time.Second
+	start := int64(uint32(state >> 32))
+	if start == 0 || window <= 0 {
+		return false
+	}
+	nowSecond := now.Unix()
+	return nowSecond < start || nowSecond-start < int64(window/time.Second)
+}
+
+func (c *Cache) reconcileForegroundActiveRefresh(
+	k key,
+	updated *item,
+	observed *item,
+	displaced *item,
+	ready bool,
+	replay *query_context.ReplaySnapshot,
+	next sequence.ChainWalker,
+	now time.Time,
+	response *dns.Msg,
+) {
+	if ready && replay != nil {
+		c.installActiveRefreshEntry(k, updated, replay, next, now, response)
+		return
+	}
+	if ready {
+		// Snapshot packing can fail for a malformed request even though the
+		// upstream response is cacheable. Reuse metadata only when it is proven
+		// to share the observed/displaced generation lineage.
+		c.adoptExistingActiveRefreshReplay(k, updated, observed, displaced, now, response)
+		return
+	}
+
+	// A below-threshold foreground replacement intentionally remains
+	// untracked. Remove metadata still owned by either replaced lineage so a
+	// stopped old generation cannot pin a tracking slot forever. Exact pointer
+	// checks keep a concurrent handoff to updated (or a newer item) intact.
+	if observed != nil {
+		c.removeActiveMetaIfExpected(k, observed)
+	}
+	if displaced != nil && displaced != observed {
+		c.removeActiveMetaIfExpected(k, displaced)
+	}
+	c.removeSupersededActiveMetaAfterForegroundCommit(k, updated)
+}
+
+// removeSupersededActiveMetaAfterForegroundCommit covers the absent-lookup
+// case: an expired/capacity-evicted backend entry may already be gone while its
+// asynchronous removal hint and active metadata still exist. In that case both
+// observed and displaced are nil. Stabilize the just-committed generation with
+// the normal commit lock, then remove only metadata whose owner is explicitly
+// marked as no longer resident. A concurrent handoff already bound to updated
+// is preserved.
+func (c *Cache) removeSupersededActiveMetaAfterForegroundCommit(k key, updated *item) {
+	if !c.activeRefreshEnabled() || updated == nil {
+		return
+	}
+	c.flushMu.RLock()
+	commitMu := &c.commitLocks[k.Sum()%shardCount]
+	commitMu.Lock()
+	current, _, present := c.backend.Get(k)
+	if !present || current != updated {
+		commitMu.Unlock()
+		c.flushMu.RUnlock()
+		return
+	}
+
+	removed := false
+	c.activeMu.Lock()
+	if meta := c.activeMeta[k]; meta != nil && meta.expected != nil &&
+		meta.expected != updated && meta.expected.backendRemoved.Load() {
+		c.removeActiveMetaLocked(k, meta)
+		removed = true
+	}
+	c.activeMu.Unlock()
+	commitMu.Unlock()
+	c.flushMu.RUnlock()
+	if removed {
+		c.notifyActiveScheduler()
+	}
+}
+
 func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	c.queryTotal.Inc()
-	if c.activeRefreshEnabled() {
+	activeRefresh := c.activeRefreshEnabled()
+	if activeRefresh {
 		c.bindActiveRefreshReplay(next)
 	}
 	q := qCtx.Q()
@@ -920,8 +1194,11 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	now := time.Now()
 	if ok1 && v1.source != nil && !v1.source.backendRemoved.Load() && now.Before(v1.expirationTime) {
 		c.hitTotal.Inc()
-		recordRealCacheAccess(v1.source, now)
-		c.observeActiveRefresh(k, v1.source, qCtx, next, now, v1.msg)
+		if activeRefresh {
+			c.observeActiveRefresh(k, v1.source, qCtx, next, now, v1.msg)
+		} else {
+			recordRealCacheAccess(v1.source, now)
+		}
 		r := v1.msg.Copy() // 从 L1 提取时执行 Copy，保护缓存稳定
 		dnsutils.SubtractTTL(r, uint32(now.Sub(v1.storedTime).Seconds()))
 		r.Id = q.Id
@@ -950,8 +1227,11 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 	c.flushMu.RUnlock()
 	if cachedResp != nil {
 		c.hitTotal.Inc()
-		recordRealCacheAccess(cachedItem, now)
-		c.observeActiveRefresh(kReal, cachedItem, qCtx, next, now, cachedResp)
+		if activeRefresh {
+			c.observeActiveRefresh(kReal, cachedItem, qCtx, next, now, cachedResp)
+		} else {
+			recordRealCacheAccess(cachedItem, now)
+		}
 		if lazyHit {
 			c.lazyHitTotal.Inc()
 			c.doLazyUpdate(kReal, cachedItem, qCtx, next)
@@ -970,27 +1250,51 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		}
 		return nil
 	}
-	if cachedItem != nil {
-		// A real query for a privately retained expired entry is still client
-		// activity even though the old bytes are not directly served.
+	if cachedItem != nil && !activeRefresh {
 		recordRealCacheAccess(cachedItem, now)
 	}
-
 	var refreshReplay *query_context.ReplaySnapshot
 	var refreshNext sequence.ChainWalker
-	if c.activeRefreshEnabled() {
-		var snapshotErr error
-		refreshReplay, snapshotErr = qCtx.SnapshotForReplay()
-		if snapshotErr != nil {
-			c.logger.Debug("failed to capture foreground active refresh replay", qCtx.InfoField(), zap.Error(snapshotErr))
+	var activityWeight uint32
+	activityReady := false
+	activityCaptureClaimed := false
+	if activeRefresh {
+		if cachedItem == nil {
+			// Looking up a missing key is not yet a successful cache observation.
+			// Peek so a failing parallel branch cannot steal the shared sample.
+			activityWeight = previewActiveRefreshHitWeight(qCtx)
 		} else {
-			refreshNext = next.Fork()
+			// A real query for a privately retained expired entry is still client
+			// activity even though the old bytes are not directly served.
+			activityReady, activityWeight = c.recordActiveRefreshContextActivity(cachedItem, qCtx, now)
 		}
-		if cachedItem != nil && refreshReplay != nil {
+		shouldCapture := activityReady ||
+			(cachedItem == nil && (!c.activeRefreshTrackingPolicyEnabled() ||
+				uint64(activityWeight) >= uint64(c.args.ActiveRefresh.AdmissionHits)))
+		if shouldCapture && cachedItem != nil {
+			activityCaptureClaimed = beginActiveRefreshCapture(cachedItem)
+			shouldCapture = activityCaptureClaimed
+			if !shouldCapture {
+				c.activeEvent("admission_capture_deduplicated")
+			}
+		}
+		if shouldCapture {
+			var snapshotErr error
+			refreshReplay, snapshotErr = qCtx.SnapshotForReplay()
+			if snapshotErr != nil {
+				c.logger.Debug("failed to capture foreground active refresh replay", qCtx.InfoField(), zap.Error(snapshotErr))
+			} else {
+				refreshNext = next.Fork()
+			}
+		}
+		if cachedItem != nil && activityReady && refreshReplay != nil {
 			retainedMsg := new(dns.Msg)
 			if retainedMsg.Unpack(cachedItem.resp) == nil {
-				c.trackActiveRefreshReplay(kReal, cachedItem, refreshReplay, refreshNext, now, retainedMsg)
+				c.installActiveRefreshEntry(kReal, cachedItem, refreshReplay, refreshNext, now, retainedMsg)
 			}
+		}
+		if activityCaptureClaimed {
+			endActiveRefreshCapture(cachedItem)
 		}
 	}
 
@@ -1005,16 +1309,26 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		allowTransientFailure := cachedItem == nil
 		if prepared, ok := c.prepareCacheEntry(qCtx, allowTransientFailure); ok {
 			if committed, displaced := c.commitPreparedForegroundWithDisplaced(kReal, cachedItem, observedEpoch, prepared); committed {
-				if refreshReplay != nil {
-					c.trackActiveRefreshReplay(kReal, prepared.item, refreshReplay, refreshNext, time.Now(), prepared.msg)
-				} else {
-					// Snapshot packing can fail for a malformed request even though
-					// the upstream response is cacheable. Reuse metadata only when it
-					// is proven to share the observed/displaced generation lineage.
-					c.adoptExistingActiveRefreshReplay(
-						kReal, prepared.item, cachedItem, displaced, time.Now(), prepared.msg,
-					)
+				committedAt := time.Now()
+				ready := activityReady
+				if cachedItem == nil {
+					// The CAS/commit winner is the only missing-key branch allowed to
+					// claim and attribute the one-shot fast-cache aggregate. The claim
+					// is protected together with admission publication, so a peer cannot
+					// observe a consumed sample and stale admission state.
+					ready, activityWeight = c.recordActiveRefreshContextActivity(prepared.item, qCtx, committedAt)
+					if _, sharedFastCacheSample := qCtx.PeekFastCacheHits(); activityWeight == 0 && sharedFastCacheSample && !qCtx.IsCacheRefresh() {
+						// A peer may have consumed and recorded this one-shot sample
+						// while publishing the transient generation just displaced by
+						// this healthy answer. Inherit that exact shared activity; do
+						// not turn a consumed aggregate into an ordinary +1 hit.
+						ready = c.inheritedForegroundActiveRefreshReady(prepared.item, displaced, committedAt)
+					}
 				}
+				c.reconcileForegroundActiveRefresh(
+					kReal, prepared.item, cachedItem, displaced, ready,
+					refreshReplay, refreshNext, committedAt, prepared.msg,
+				)
 			}
 		}
 	}
@@ -1124,7 +1438,7 @@ func (c *Cache) runLazyUpdateTask(task *lazyTask) {
 	if !ok || !c.commitPrepared(task.k, task.expected, task.epoch, prepared) {
 		return
 	}
-	c.updateActiveRefreshAfterCommit(task.k, task.expected, prepared.item, time.Now(), prepared.msg, false, task.qCtx, task.nextBase)
+	c.updateActiveRefreshAfterCommit(task.k, task.expected, prepared.item, time.Now(), prepared.msg, false, 0, task.qCtx, task.nextBase)
 }
 
 func (c *Cache) finishLazyUpdateTask(task *lazyTask) {
@@ -1187,8 +1501,7 @@ func (c *Cache) prepareStaleEntry(old *item, msg *dns.Msg, now time.Time) (*prep
 	if old.staleSourceGeneration != 0 {
 		newItem.staleSourceGeneration = old.staleSourceGeneration
 	}
-	newItem.lastRealAccess.Store(old.lastRealAccess.Load())
-	newItem.refreshSuccess.Store(old.refreshSuccess.Load())
+	inheritActiveRefreshActivity(newItem, old)
 	// Keep the bytes privately until the absolute stale deadline so a later
 	// active attempt can probe and extend them again. getRespFromCache still
 	// stops serving at expirationTime unless a new probe succeeds.
@@ -1224,6 +1537,8 @@ func (c *Cache) clearActiveRefreshState() {
 	c.activeSchedule = nil
 	c.activePending = nil
 	c.activeEviction = nil
+	c.activeProtected = 0
+	c.activeClockTicket = 0
 	c.activeMu.Unlock()
 	c.activeRemoved.Clear()
 
@@ -1499,6 +1814,8 @@ func (c *Cache) clearRuntimeViews() {
 	c.activeSchedule = nil
 	c.activePending = nil
 	c.activeEviction = nil
+	c.activeProtected = 0
+	c.activeClockTicket = 0
 	c.activeMu.Unlock()
 	c.activeRemoved.Clear()
 
@@ -1613,13 +1930,12 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 		if cacheExpirationTime.Before(now) || v.isStale || v.isTransient {
 			return nil
 		}
-		lastAccess := time.Unix(0, v.lastRealAccess.Load()).Unix()
-		if v.lastRealAccess.Load() <= 0 {
+		activity := v.activityState()
+		lastRealAccess := activity.lastRealAccess.Load()
+		lastAccess := time.Unix(0, lastRealAccess).Unix()
+		if lastRealAccess <= 0 {
 			lastAccess = v.storedTime.Unix()
 		}
-		refreshCount := v.refreshSuccess.Load()
-		refreshCount = max(refreshCount, int64(0))
-		refreshCount = min(refreshCount, int64(^uint32(0)))
 		entries = append(entries, &CachedEntry{
 			Key:                         []byte(k),
 			CacheExpirationTime:         cacheExpirationTime.Unix(),
@@ -1628,7 +1944,7 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 			Msg:                         v.resp,
 			DomainSet:                   v.domainSet,
 			LastRealAccessTime:          lastAccess,
-			ConsecutiveRefreshSuccesses: uint32(refreshCount),
+			ConsecutiveRefreshSuccesses: activity.refreshSuccesses(),
 		})
 		return nil
 	}
@@ -1773,8 +2089,11 @@ func (c *Cache) decodeDump(r io.Reader) ([]decodedDumpEntry, error) {
 				// original store time as a conservative activity fallback.
 				lastRealAccess = storedTime
 			}
-			i.lastRealAccess.Store(lastRealAccess.UnixNano())
-			i.refreshSuccess.Store(int64(entry.GetConsecutiveRefreshSuccesses()))
+			activity := newActiveActivity(lastRealAccess)
+			activity.storeRefreshSuccesses(entry.GetConsecutiveRefreshSuccesses())
+			activity.realAccessCount.Store(1)
+			activity.admissionState.Store(uint64(uint32(lastRealAccess.Unix()))<<32 | 1)
+			i.activity.Store(activity)
 			i.upstreamOpt = copyCacheableUpstreamOPT(restored.IsEdns0())
 			if c.args.LazyCacheTTL > 0 && restored.Rcode == dns.RcodeSuccess {
 				i.lazyDeadline = maxTime(i.expirationTime, storedTime.Add(time.Duration(c.args.LazyCacheTTL)*time.Second))
@@ -2271,7 +2590,7 @@ func (c *Cache) prepareCacheEntry(qCtx *query_context.Context, allowTransientFai
 		upstreamOpt:    upstreamOpt,
 		isTransient:    r.Rcode == dns.RcodeServerFailure,
 	}
-	v.lastRealAccess.Store(now.UnixNano())
+	v.activity.Store(newActiveActivity(now))
 	if c.args.LazyCacheTTL > 0 && r.Rcode == dns.RcodeSuccess {
 		v.lazyDeadline = cacheExpiration
 	}
@@ -2338,8 +2657,7 @@ func negativeResponseTTL(r *dns.Msg) (time.Duration, bool) {
 
 func (c *Cache) commitPrepared(k key, expected *item, epoch uint64, prepared *preparedCacheEntry) bool {
 	if expected != nil && prepared != nil && prepared.item != nil {
-		prepared.item.lastRealAccess.Store(expected.lastRealAccess.Load())
-		prepared.item.refreshSuccess.Store(expected.refreshSuccess.Load())
+		inheritActiveRefreshActivity(prepared.item, expected)
 	}
 	if expected == nil {
 		return c.commitPreparedMatching(k, epoch, false, nil, prepared)
@@ -2382,6 +2700,9 @@ func (c *Cache) commitPreparedForegroundWithDisplaced(
 	epoch uint64,
 	prepared *preparedCacheEntry,
 ) (bool, *item) {
+	if prepared != nil && prepared.item != nil && observed != nil {
+		inheritActiveRefreshActivity(prepared.item, observed)
+	}
 	var displaced *item
 	committed := c.commitPreparedMatching(k, epoch, true, func(current *item, ok bool) bool {
 		allowed := false
@@ -2401,6 +2722,7 @@ func (c *Cache) commitPreparedForegroundWithDisplaced(
 		}
 		if allowed && ok {
 			displaced = current
+			inheritActiveRefreshActivity(prepared.item, current)
 		}
 		return allowed
 	}, prepared)

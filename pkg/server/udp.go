@@ -36,8 +36,12 @@ const (
 )
 
 type UDPServerOpts struct {
-	Logger     *zap.Logger
+	Logger *zap.Logger
+	// FastBypass is the legacy pre-handler contract retained for embedders.
 	FastBypass func(reqLen int, buf []byte, clientAddr netip.AddrPort) (action int, respLen int, preMarks uint64, preDset string)
+	// FastBypassWithTelemetry additionally carries a one-shot fast-cache hit
+	// aggregate. When configured it takes precedence over FastBypass.
+	FastBypassWithTelemetry func(reqLen int, buf []byte, clientAddr netip.AddrPort) (action int, respLen int, preMarks uint64, preDset string, fastCacheHits uint32)
 }
 
 func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
@@ -80,7 +84,23 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 
 		var preMarks uint64
 		var preDset string
-		if opts.FastBypass != nil {
+		var fastCacheHits uint32
+		if opts.FastBypassWithTelemetry != nil {
+			action, respLen, marks, dset, hits := opts.FastBypassWithTelemetry(n, *rb, remoteAddr)
+			if action == FastActionReply {
+				if respLen > 0 {
+					var oob []byte
+					if oobWriter != nil && dstIpFromCm != nil {
+						oob = oobWriter(dstIpFromCm)
+					}
+					_, _, _ = c.WriteMsgUDPAddrPort((*rb)[:respLen], oob, remoteAddr)
+				}
+				continue
+			}
+			preMarks = marks
+			preDset = dset
+			fastCacheHits = hits
+		} else if opts.FastBypass != nil {
 			action, respLen, marks, dset := opts.FastBypass(n, *rb, remoteAddr)
 			if action == FastActionReply {
 				if respLen > 0 {
@@ -108,6 +128,7 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 				FromUDP:          true,
 				PreFastFlags:     preMarks,
 				PreFastDomainSet: preDset,
+				FastCacheHits:    fastCacheHits,
 			}, pool.PackBuffer)
 
 			if payload == nil {

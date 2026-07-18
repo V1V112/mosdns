@@ -64,10 +64,19 @@ type Context struct {
 	kv        map[uint32]any
 	marks     map[uint32]struct{}
 	fastFlags uint64
+	// fastCacheObservation is deliberately separate from kv and ServerMeta.
+	// Ordinary Context copies share the one-shot token, so parallel fallback
+	// branches can consume a fast-cache sample at most once. Background replay
+	// and lazy-refresh copies intentionally do not carry it.
+	fastCacheObservation *fastCacheObservation
 
 	// Extreme Performance Patch: Cache for fast matching
 	FastQName string
 	FastQType uint16
+}
+
+type fastCacheObservation struct {
+	hits atomic.Uint32
 }
 
 var (
@@ -271,12 +280,14 @@ func (ctx *Context) Copy() *Context {
 // As with CopyTo, values stored by StoreValue are not deep-copied, but the
 // values map itself is copied.
 func (ctx *Context) CopyWithoutResponse() *Context {
+	serverMeta := ctx.ServerMeta
+	serverMeta.FastCacheHits = 0
 	d := &Context{
 		TraceID:   ctx.TraceID,
 		id:        ctx.id,
 		startTime: ctx.startTime,
 
-		ServerMeta: ctx.ServerMeta,
+		ServerMeta: serverMeta,
 		query:      ctx.query.Copy(),
 		clientOpt:  copyOpt(ctx.clientOpt),
 
@@ -301,6 +312,7 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	d.startTime = ctx.startTime
 
 	d.ServerMeta = ctx.ServerMeta
+	d.ServerMeta.FastCacheHits = 0
 	d.query = ctx.query.Copy()
 	d.clientOpt = ctx.clientOpt
 
@@ -315,10 +327,53 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	d.kv = copyMap(ctx.kv)
 	d.marks = copyMap(ctx.marks)
 	d.fastFlags = ctx.fastFlags
+	d.fastCacheObservation = ctx.fastCacheObservation
 
 	d.FastQName = ctx.FastQName
 	d.FastQType = ctx.FastQType
 	return d
+}
+
+// SetFastCacheHits installs a one-shot aggregate of real client hits served by
+// fast_cache. It is intentionally not part of ReplaySnapshot.
+func (ctx *Context) SetFastCacheHits(hits uint32) {
+	if ctx == nil || hits == 0 {
+		return
+	}
+	observation := &fastCacheObservation{}
+	observation.hits.Store(hits)
+	ctx.fastCacheObservation = observation
+}
+
+// ConsumeFastCacheHits returns the aggregate once. Context copies used by
+// parallel sequence branches share the same atomic token, preventing double
+// accounting.
+func (ctx *Context) ConsumeFastCacheHits() uint32 {
+	hits, _ := ctx.TakeFastCacheHits()
+	return hits
+}
+
+// PeekFastCacheHits returns the currently unconsumed fast-cache hit aggregate
+// without changing the shared one-shot token. Context copies therefore observe
+// the same value until one branch consumes it. present remains true after
+// consumption so another branch can distinguish a consumed shared sample from
+// an ordinary request with no fast-cache observation.
+func (ctx *Context) PeekFastCacheHits() (hits uint32, present bool) {
+	if ctx == nil || ctx.fastCacheObservation == nil {
+		return 0, false
+	}
+	return ctx.fastCacheObservation.hits.Load(), true
+}
+
+// TakeFastCacheHits also reports whether this Context belongs to a copied
+// fast-cache refresh request. present=true with hits=0 means another parallel
+// branch already consumed the shared sample and this branch must not add an
+// extra ordinary hit.
+func (ctx *Context) TakeFastCacheHits() (hits uint32, present bool) {
+	if ctx == nil || ctx.fastCacheObservation == nil {
+		return 0, false
+	}
+	return ctx.fastCacheObservation.hits.Swap(0), true
 }
 
 // StoreValue stores any v in to this Context

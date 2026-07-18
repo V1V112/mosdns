@@ -71,8 +71,10 @@ func (ctx *Context) SnapshotForReplay() (*ReplaySnapshot, error) {
 		return nil, fmt.Errorf("pack replay response OPT: %w", err)
 	}
 
+	serverMeta := ctx.ServerMeta
+	serverMeta.FastCacheHits = 0
 	s := &ReplaySnapshot{
-		serverMeta: ctx.ServerMeta,
+		serverMeta: serverMeta,
 		queryWire:  queryWire,
 		compress:   ctx.query.Compress,
 		clientOpt:  clientOpt,

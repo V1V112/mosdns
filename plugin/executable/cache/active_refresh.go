@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,15 @@ var activeRefreshEventNames = [...]string{
 	"rate_limited",
 	"queue_dropped",
 	"dump_restored_tasks",
+	"admission_wait",
+	"admission_ready",
+	"admitted",
+	"admission_capacity_rejected",
+	"admission_capture_deduplicated",
+	"clock_promoted",
+	"clock_demoted",
+	"clock_evicted",
+	"fast_cache_hits_merged",
 }
 
 // refreshTask is a versioned scheduling record. Future tasks live in
@@ -67,12 +77,24 @@ type refreshTask struct {
 }
 
 type activeRefreshMeta struct {
-	k             key
-	replay        *query_context.ReplaySnapshot
-	next          sequence.ChainWalker
-	expected      *item
-	task          *refreshTask
-	evictionIndex int
+	k              key
+	replay         *query_context.ReplaySnapshot
+	next           sequence.ChainWalker
+	expected       *item
+	task           *refreshTask
+	evictionIndex  int
+	referenced     atomic.Bool
+	protected      bool
+	heat           float64
+	heatAt         time.Time
+	heatObserved   uint64
+	evictionTicket uint64
+	// accessWriters pins this metadata while a lock-free real hit publishes its
+	// counter, idle timestamp and CLOCK reference bit. Eviction first invalidates
+	// the bound handle and then requires this count to be zero, so a hit that
+	// acquired the handle cannot be mistaken for activity already included in an
+	// eviction sample while it is only partially published.
+	accessWriters atomic.Uint64
 
 	// boundGeneration is the generation for which expected.activeMeta points to
 	// this metadata. Hits use it as a lock-free validation token; all task and
@@ -89,7 +111,11 @@ type activeRefreshWork struct {
 	next     sequence.ChainWalker
 	expected *item
 	epoch    uint64
-	flight   refreshFlightKey
+	// activityEpoch is captured before the upstream refresh starts. A real hit
+	// atomically changes it and clears the consecutive-success count, so commit
+	// can conditionally increment without a Store(0)/Add(1) race.
+	activityEpoch uint32
+	flight        refreshFlightKey
 }
 
 type activeScheduleHeap []*refreshTask
@@ -150,14 +176,18 @@ func (h *activePendingHeap) Pop() any {
 	return t
 }
 
-// activeEvictionHeap is a max-heap ordered by the least urgent refresh. It is
+// activeEvictionHeap is shared by both modes. Explicit popularity policy uses
+// non-zero CLOCK rotation tickets; legacy mode leaves every ticket at zero and
+// therefore falls back to latest-expiration (least urgent) ordering. It is
 // separate from activeSchedule because scheduled, pending, dispatched and
-// stopped metadata all need to remain eligible for capacity cleanup. Hits do
-// not touch this heap, preserving the lock-free active-hit path.
+// stopped metadata all need to remain eligible for capacity cleanup.
 type activeEvictionHeap []*activeRefreshMeta
 
 func (h activeEvictionHeap) Len() int { return len(h) }
 func (h activeEvictionHeap) Less(i, j int) bool {
+	if h[i].evictionTicket != h[j].evictionTicket {
+		return h[i].evictionTicket < h[j].evictionTicket
+	}
 	if h[i].expected == nil || h[j].expected == nil {
 		return h[i].expected == nil && h[j].expected != nil
 	}
@@ -318,6 +348,12 @@ func (c *Cache) activeEvent(name string) {
 	}
 }
 
+func (c *Cache) activeEventAdd(name string, value uint64) {
+	if value > 0 && c.activeRefreshEvents != nil {
+		c.activeRefreshEvents.WithLabelValues(name).Add(float64(value))
+	}
+}
+
 // bindActiveMetaHandleLocked publishes the lock-free hit-path handle only
 // after meta has a live task for expected. The caller must hold activeMu.
 func bindActiveMetaHandleLocked(meta *activeRefreshMeta, expected *item) {
@@ -350,6 +386,256 @@ func clearActiveMetaTaskLocked(meta *activeRefreshMeta) {
 	meta.task = nil
 }
 
+func saturatingAddUint64(dst *atomic.Uint64, delta uint64) uint64 {
+	if dst == nil || delta == 0 {
+		if dst == nil {
+			return 0
+		}
+		return dst.Load()
+	}
+	for current := dst.Load(); ; current = dst.Load() {
+		updated := current + delta
+		if updated < current {
+			updated = ^uint64(0)
+		}
+		if dst.CompareAndSwap(current, updated) {
+			return updated
+		}
+	}
+}
+
+func updateActiveAdmission(v *item, now time.Time, window time.Duration, weight uint32) uint32 {
+	if v == nil || weight == 0 || window <= 0 {
+		return 0
+	}
+	activity := v.activityState()
+	nowSecond := now.Unix()
+	if nowSecond < 1 {
+		nowSecond = 1
+	}
+	for state := activity.admissionState.Load(); ; state = activity.admissionState.Load() {
+		start := int64(uint32(state >> 32))
+		hits := uint32(state)
+		if start == 0 {
+			start = nowSecond
+			hits = 0
+		} else if nowSecond < start {
+			// Request goroutines can reach this CAS out of timestamp order. Keep
+			// the newer window and count this hit in it instead of moving time
+			// backwards and discarding concurrent activity.
+			nowSecond = start
+		} else if nowSecond-start >= int64(window/time.Second) {
+			start = nowSecond
+			hits = 0
+		}
+		updatedHits := hits + weight
+		if updatedHits < hits {
+			updatedHits = ^uint32(0)
+		}
+		updated := uint64(uint32(start))<<32 | uint64(updatedHits)
+		if activity.admissionState.CompareAndSwap(state, updated) {
+			return updatedHits
+		}
+	}
+}
+
+// snapshotActiveAdmissionState observes the lifetime counter and admission
+// window from the same completed untracked-hit publication. The per-lineage
+// lock is not used after metadata is bound on the normal hit path.
+func snapshotActiveAdmissionState(v *item) (accessCount, admissionState uint64) {
+	if v == nil {
+		return 0, 0
+	}
+	activity := v.activityState()
+	activity.admissionMu.Lock()
+	accessCount = activity.realAccessCount.Load()
+	admissionState = activity.admissionState.Load()
+	activity.admissionMu.Unlock()
+	return accessCount, admissionState
+}
+
+type activeRefreshActivityWriter struct {
+	activity        *activeActivity
+	meta            *activeRefreshMeta
+	admissionLocked bool
+}
+
+// acquireActiveRefreshActivityWriter protects the one-shot sample claim and
+// every activity-field write as one publication. Tracked entries use only the
+// metadata writer pin. An untracked lineage uses its own short-lived mutex and
+// rechecks the handle after locking, so metadata installation and a foreground
+// handoff cannot observe a consumed sample before its admission state exists.
+func acquireActiveRefreshActivityWriter(expected *item) activeRefreshActivityWriter {
+	writer := activeRefreshActivityWriter{activity: expected.activityState()}
+	writer.meta = acquireActiveRefreshMetaWriter(expected)
+	if writer.meta != nil {
+		return writer
+	}
+	writer.activity.admissionMu.Lock()
+	writer.admissionLocked = true
+	writer.meta = acquireActiveRefreshMetaWriter(expected)
+	return writer
+}
+
+func (writer *activeRefreshActivityWriter) release() {
+	if writer == nil {
+		return
+	}
+	if writer.meta != nil {
+		releaseActiveRefreshMetaWriter(writer.meta)
+	}
+	if writer.admissionLocked {
+		writer.activity.admissionMu.Unlock()
+	}
+}
+
+func (c *Cache) publishActiveRefreshActivity(
+	expected *item,
+	now time.Time,
+	weight uint32,
+	writer *activeRefreshActivityWriter,
+) bool {
+	if writer == nil || writer.activity == nil || weight == 0 {
+		if writer != nil {
+			writer.release()
+		}
+		return false
+	}
+	saturatingAddUint64(&writer.activity.realAccessCount, uint64(weight))
+	writer.activity.recordRealAccess(now)
+	tracked := writer.meta != nil
+	ready := tracked || !c.activeRefreshTrackingPolicyEnabled()
+	if tracked {
+		if c.activeRefreshTrackingPolicyEnabled() {
+			writer.meta.referenced.Store(true)
+		}
+	} else if c.activeRefreshTrackingPolicyEnabled() {
+		hits := updateActiveAdmission(
+			expected,
+			now,
+			time.Duration(c.args.ActiveRefresh.AdmissionWindow)*time.Second,
+			weight,
+		)
+		ready = uint64(hits) >= uint64(c.args.ActiveRefresh.AdmissionHits)
+	}
+	writer.release()
+
+	if weight > 1 {
+		c.activeEventAdd("fast_cache_hits_merged", uint64(weight))
+	}
+	if !tracked && c.activeRefreshTrackingPolicyEnabled() {
+		if ready {
+			c.activeEvent("admission_ready")
+		} else {
+			c.activeEvent("admission_wait")
+		}
+	}
+	return ready
+}
+
+// recordActiveRefreshActivity publishes an explicit activity weight. It is
+// primarily used by internal handoff/restore paths and deterministic tests.
+func (c *Cache) recordActiveRefreshActivity(expected *item, now time.Time, weight uint32) bool {
+	if !c.activeRefreshEnabled() || expected == nil || weight == 0 {
+		return false
+	}
+	writer := acquireActiveRefreshActivityWriter(expected)
+	return c.publishActiveRefreshActivity(expected, now, weight, &writer)
+}
+
+// recordActiveRefreshContextActivity claims a Context's shared one-shot fast
+// cache sample only after the target lineage is protected. A parallel branch
+// can therefore never see "sample consumed" together with pre-publication
+// admission state.
+func (c *Cache) recordActiveRefreshContextActivity(expected *item, qCtx *query_context.Context, now time.Time) (ready bool, weight uint32) {
+	if !c.activeRefreshEnabled() || expected == nil || qCtx == nil || qCtx.IsCacheRefresh() {
+		return false, 0
+	}
+	writer := acquireActiveRefreshActivityWriter(expected)
+	weight = activeRefreshHitWeight(qCtx)
+	return c.publishActiveRefreshActivity(expected, now, weight, &writer), weight
+}
+
+func activeRefreshHitWeight(qCtx *query_context.Context) uint32 {
+	if qCtx == nil || qCtx.IsCacheRefresh() {
+		return 0
+	}
+	if hits, sampled := qCtx.TakeFastCacheHits(); sampled {
+		return hits
+	}
+	return 1
+}
+
+func boundActiveRefreshMeta(expected *item) *activeRefreshMeta {
+	if expected == nil {
+		return nil
+	}
+	meta := expected.activeMeta.Load()
+	if meta == nil || meta.boundGeneration.Load() != expected.generation || meta.stopped.Load() {
+		return nil
+	}
+	return meta
+}
+
+// acquireActiveRefreshMetaWriter establishes the real-hit side of the
+// hit/eviction linearization protocol. Incrementing before revalidation closes
+// the load-vs-clear race: either eviction observes the writer, or this caller
+// observes the cleared/replaced handle and publishes through the untracked slow
+// path instead. The returned pin must cover every activity field write.
+func acquireActiveRefreshMetaWriter(expected *item) *activeRefreshMeta {
+	if expected == nil {
+		return nil
+	}
+	for {
+		meta := expected.activeMeta.Load()
+		if meta == nil || meta.boundGeneration.Load() != expected.generation || meta.stopped.Load() {
+			return nil
+		}
+		meta.accessWriters.Add(1)
+		if expected.activeMeta.Load() == meta &&
+			meta.boundGeneration.Load() == expected.generation && !meta.stopped.Load() {
+			return meta
+		}
+		meta.accessWriters.Add(^uint64(0))
+		// A generation handoff may have replaced the handle between the two
+		// reads. Retry only when another live handle is already visible.
+		if expected.activeMeta.Load() == nil {
+			return nil
+		}
+	}
+}
+
+func releaseActiveRefreshMetaWriter(meta *activeRefreshMeta) {
+	if meta != nil {
+		meta.accessWriters.Add(^uint64(0))
+	}
+}
+
+// beginActiveRefreshCapture elects one request to build the replay snapshot
+// for an untracked cache generation. Activity accounting remains lock-free for
+// every request, but concurrent threshold crossings no longer duplicate a
+// potentially large Context copy only to race at metadata installation.
+func beginActiveRefreshCapture(expected *item) bool {
+	if expected == nil || boundActiveRefreshMeta(expected) != nil {
+		return false
+	}
+	if !expected.admissionCapture.CompareAndSwap(false, true) {
+		return false
+	}
+	// Metadata may have become visible between the optimistic check and claim.
+	if boundActiveRefreshMeta(expected) != nil {
+		expected.admissionCapture.Store(false)
+		return false
+	}
+	return true
+}
+
+func endActiveRefreshCapture(expected *item) {
+	if expected != nil {
+		expected.admissionCapture.Store(false)
+	}
+}
+
 func (c *Cache) observeActiveRefresh(k key, expected *item, qCtx *query_context.Context, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
 	if !c.activeRefreshEnabled() || expected == nil || qCtx == nil {
 		return
@@ -359,21 +645,54 @@ func (c *Cache) observeActiveRefresh(k key, expected *item, qCtx *query_context.
 	// idle sentinel may wake once at its previous deadline; prepareActiveWork
 	// rechecks lastRealAccess and returns it to the future heap when the hit
 	// extended the idle boundary.
-	recordRealCacheAccess(expected, now)
-	if meta := expected.activeMeta.Load(); meta != nil &&
-		meta.boundGeneration.Load() == expected.generation && !meta.stopped.Load() {
+	if ready, _ := c.recordActiveRefreshContextActivity(expected, qCtx, now); !ready {
 		return
 	}
+	if meta := boundActiveRefreshMeta(expected); meta != nil {
+		if c.activeRefreshTrackingPolicyEnabled() {
+			meta.referenced.Store(true)
+		}
+		return
+	}
+	if !beginActiveRefreshCapture(expected) {
+		c.activeEvent("admission_capture_deduplicated")
+		return
+	}
+	defer endActiveRefreshCapture(expected)
 
 	// k may be a zero-copy view over a pooled request buffer on the L1 path.
 	durableKey := key(strings.Clone(string(k)))
-	c.trackActiveRefresh(durableKey, expected, qCtx, next, now, response)
+	c.captureActiveRefreshReplay(durableKey, expected, qCtx, next, now, response)
 }
 
 func (c *Cache) trackActiveRefresh(k key, expected *item, qCtx *query_context.Context, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
 	if !c.activeRefreshEnabled() || expected == nil || qCtx == nil || !c.activeExcludeDomainValid {
 		return
 	}
+	if ready, _ := c.recordActiveRefreshContextActivity(expected, qCtx, now); !ready {
+		return
+	}
+	if meta := boundActiveRefreshMeta(expected); meta != nil {
+		c.activeMu.Lock()
+		if c.activeMeta[k] == meta && meta.expected == expected && meta.task != nil {
+			c.recalculateScheduledDueLocked(meta, now)
+			if c.activeRefreshTrackingPolicyEnabled() {
+				meta.referenced.Store(true)
+			}
+		}
+		c.activeMu.Unlock()
+		c.notifyActiveScheduler()
+		return
+	}
+	if !beginActiveRefreshCapture(expected) {
+		c.activeEvent("admission_capture_deduplicated")
+		return
+	}
+	defer endActiveRefreshCapture(expected)
+	c.captureActiveRefreshReplay(k, expected, qCtx, next, now, response)
+}
+
+func (c *Cache) captureActiveRefreshReplay(k key, expected *item, qCtx *query_context.Context, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
 	replay, err := qCtx.SnapshotForReplay()
 	if err != nil {
 		c.logger.Debug("failed to capture active refresh replay", qCtx.InfoField(), zap.Error(err))
@@ -382,10 +701,10 @@ func (c *Cache) trackActiveRefresh(k key, expected *item, qCtx *query_context.Co
 	// Snapshot creation and walker forking can allocate. Keep both outside the
 	// cache commit and active scheduler locks; the locked path only validates
 	// the generation, swaps immutable pointers and updates heaps.
-	c.trackActiveRefreshReplay(k, expected, replay, next.Fork(), now, response)
+	c.installActiveRefreshEntry(k, expected, replay, next.Fork(), now, response)
 }
 
-func (c *Cache) trackActiveRefreshReplay(k key, expected *item, replay *query_context.ReplaySnapshot, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
+func (c *Cache) installActiveRefreshEntry(k key, expected *item, replay *query_context.ReplaySnapshot, next sequence.ChainWalker, now time.Time, response *dns.Msg) {
 	if !c.activeRefreshEnabled() || expected == nil || replay == nil || !c.activeExcludeDomainValid {
 		return
 	}
@@ -401,13 +720,6 @@ func (c *Cache) trackActiveRefreshReplay(k key, expected *item, replay *query_co
 		c.flushMu.RUnlock()
 		return
 	}
-	// This is real client activity even when the current answer is excluded
-	// from active refresh. Persist it on the item before applying scheduling
-	// exclusions so a later rule change or dump restore sees the correct idle
-	// and consecutive-success state.
-	storeActiveRefreshAccessMax(&expected.lastRealAccess, now.UnixNano())
-	expected.refreshSuccess.Store(0)
-
 	question, validQuestion := questionFromKey(k)
 	excludedDomain := !validQuestion || c.activeDomainExcluded(question.Name)
 	excludedIP := response != nil && c.containsActiveExcluded(response)
@@ -428,8 +740,21 @@ func (c *Cache) trackActiveRefreshReplay(k key, expected *item, replay *query_co
 		c.notifyActiveScheduler()
 		return
 	}
+	// Another path may have published the same generation while the elected
+	// owner was building its snapshot outside the locks. Keep the already-live
+	// replay/task instead of letting the slower builder overwrite it.
+	if meta != nil && expected.admissionCapture.Load() && meta.expected == expected &&
+		meta.task != nil && boundActiveRefreshMeta(expected) == meta {
+		if c.activeRefreshTrackingPolicyEnabled() {
+			meta.referenced.Store(true)
+		}
+		c.activeMu.Unlock()
+		commitMu.Unlock()
+		c.flushMu.RUnlock()
+		return
+	}
 	if meta == nil {
-		if !c.ensureActiveMetaSlotLocked() {
+		if !c.ensureActiveMetaSlotLocked(expected) {
 			c.activeMu.Unlock()
 			commitMu.Unlock()
 			c.flushMu.RUnlock()
@@ -437,6 +762,9 @@ func (c *Cache) trackActiveRefreshReplay(k key, expected *item, replay *query_co
 		}
 		meta = &activeRefreshMeta{k: k, expected: expected, evictionIndex: -1}
 		c.addActiveMetaLocked(k, meta)
+		if c.activeRefreshTrackingPolicyEnabled() {
+			c.activeEvent("admitted")
+		}
 	}
 	sameGeneration := meta.expected == expected
 	meta.replay = replay
@@ -527,9 +855,6 @@ func (c *Cache) adoptExistingActiveRefreshReplay(
 		c.flushMu.RUnlock()
 		return
 	}
-	// A foreground fill is real client activity. CAS-max cannot overwrite a
-	// newer concurrent hit on the just-published generation.
-	storeActiveRefreshAccessMax(&updated.lastRealAccess, now.UnixNano())
 	question, validQuestion := questionFromKey(k)
 	excludedDomain := !validQuestion || c.activeDomainExcluded(question.Name)
 	excludedIP := response != nil && c.containsActiveExcluded(response)
@@ -564,15 +889,9 @@ func (c *Cache) adoptExistingActiveRefreshReplay(
 		// real hit either visible to these loads or generation-local afterwards.
 		c.removeMetaTaskLocked(meta)
 	}
-	if previous != nil {
-		storeActiveRefreshAccessMax(&updated.lastRealAccess, previous.lastRealAccess.Load())
-	}
-	if observed != nil && observed != previous {
-		storeActiveRefreshAccessMax(&updated.lastRealAccess, observed.lastRealAccess.Load())
-	}
-	if displaced != nil && displaced != previous && displaced != observed {
-		storeActiveRefreshAccessMax(&updated.lastRealAccess, displaced.lastRealAccess.Load())
-	}
+	// commitPreparedForegroundWithDisplaced published updated with the activity
+	// pointer of the exact observed/displaced lineage. Never replace that pointer
+	// after publication; concurrent old/new hits already update the same atomics.
 	if !sameGeneration {
 		c.setActiveMetaExpectedLocked(meta, updated)
 	}
@@ -630,7 +949,7 @@ func (c *Cache) recalculateScheduledDueLocked(meta *activeRefreshMeta, now time.
 	t := meta.task
 	due := t.refreshAt
 	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-		idleAt := time.Unix(0, meta.expected.lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
+		idleAt := time.Unix(0, meta.expected.activityState().lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
 		if idleAt.Before(due) {
 			due = idleAt
 		}
@@ -646,15 +965,76 @@ func (c *Cache) recalculateScheduledDueLocked(meta *activeRefreshMeta, now time.
 	return false
 }
 
+func (c *Cache) activeRefreshCapacity() int {
+	if c == nil || c.args == nil {
+		return 1
+	}
+	if !c.activeRefreshTrackingPolicyEnabled() {
+		return max(c.args.Size, 1)
+	}
+	return max(c.args.ActiveRefresh.MaxTrackedEntries, 1)
+}
+
+func (c *Cache) activeRefreshTrackingPolicyEnabled() bool {
+	return c != nil && c.args != nil && c.args.ActiveRefresh.trackingPolicyConfigured
+}
+
+func (c *Cache) activeRefreshProtectedLimit() int {
+	if !c.activeRefreshTrackingPolicyEnabled() {
+		return 0
+	}
+	capacity := c.activeRefreshCapacity()
+	configured := capacity * c.args.ActiveRefresh.ProtectedRatio / 100
+	// Always leave at least one probationary slot. Otherwise ratio=100 can
+	// protect the entire tracking set and reject every newcomer until a later
+	// pass happens to decay and demote an entry.
+	return min(configured, max(capacity-1, 0))
+}
+
+// refreshActiveHeatLocked folds lock-free real-hit counters into a decaying
+// score only on admission/eviction slow paths. Ordinary hits never take
+// activeMu or repair the indexed heap.
+func (c *Cache) refreshActiveHeatLocked(meta *activeRefreshMeta, now time.Time) float64 {
+	if !c.activeRefreshTrackingPolicyEnabled() || meta == nil || meta.expected == nil {
+		return 0
+	}
+	if meta.heatAt.IsZero() {
+		meta.heatAt = now
+	}
+	if elapsed := now.Sub(meta.heatAt); elapsed > 0 {
+		halfLife := time.Duration(c.args.ActiveRefresh.HeatHalfLife) * time.Second
+		meta.heat *= math.Exp2(-elapsed.Seconds() / halfLife.Seconds())
+	}
+	current := meta.expected.activityState().realAccessCount.Load()
+	if current >= meta.heatObserved {
+		meta.heat += float64(current - meta.heatObserved)
+	} else {
+		// A generation without inherited counters is treated as new activity.
+		meta.heat += float64(current)
+	}
+	meta.heatObserved = current
+	meta.heatAt = now
+	return meta.heat
+}
+
 func (c *Cache) evictLeastUrgentMetaLocked() bool {
-	if len(c.activeMeta) < max(c.args.Size, 1) {
+	if !c.activeRefreshTrackingPolicyEnabled() {
+		return c.evictLegacyActiveMetaLocked()
+	}
+	return c.evictActiveMetaLocked(0, false)
+}
+
+// evictLegacyActiveMetaLocked preserves the pre-policy capacity behaviour:
+// metadata is ordered by latest expiration (least urgent first), at most 64
+// candidates are checked, and the first unpinned entry is removed. The final
+// atomic recheck keeps the newer hit/eviction race fix without introducing
+// popularity, CLOCK or protected-segment decisions.
+func (c *Cache) evictLegacyActiveMetaLocked() bool {
+	if len(c.activeMeta) < c.activeRefreshCapacity() {
 		return true
 	}
-	// Pop from the indexed least-urgent heap instead of scanning activeMeta.
-	// Dispatched, inflight and generation-handoff entries are temporarily
-	// pinned. Probe only a bounded number so an all-pinned cache cannot turn one
-	// admission into an O(N) pause.
-	skipped := make([]*activeRefreshMeta, 0, min(activeRefreshEvictionProbes, len(c.activeEviction)))
+	scanLimit := min(activeRefreshEvictionProbes, len(c.activeEviction))
+	skipped := make([]*activeRefreshMeta, 0, scanLimit)
 	restoreSkipped := func() {
 		for _, meta := range skipped {
 			if meta != nil && c.activeMeta[meta.k] == meta && meta.evictionIndex < 0 {
@@ -662,7 +1042,7 @@ func (c *Cache) evictLeastUrgentMetaLocked() bool {
 			}
 		}
 	}
-	for probes := 0; probes < activeRefreshEvictionProbes && len(c.activeEviction) > 0; probes++ {
+	for probes := 0; probes < scanLimit && len(c.activeEviction) > 0; probes++ {
 		victim := heap.Pop(&c.activeEviction).(*activeRefreshMeta)
 		if victim == nil || c.activeMeta[victim.k] != victim {
 			continue
@@ -672,14 +1052,14 @@ func (c *Cache) evictLeastUrgentMetaLocked() bool {
 			skipped = append(skipped, victim)
 			continue
 		}
-		lastAccess := int64(0)
-		if victim.expected != nil {
-			lastAccess = victim.expected.lastRealAccess.Load()
+		if expected := victim.expected; expected != nil {
+			activity := expected.activityState()
+			sampledCount := activity.realAccessCount.Load()
+			lastAccess := activity.lastRealAccess.Load()
 			clearActiveMetaHandleLocked(victim)
-			if victim.expected.lastRealAccess.Load() != lastAccess {
-				// A real hit overlapped victim selection. Keep this entry and let
-				// the next candidate absorb the metadata pressure.
-				bindActiveMetaHandleLocked(victim, victim.expected)
+			if victim.accessWriters.Load() != 0 ||
+				activity.realAccessCount.Load() != sampledCount || activity.lastRealAccess.Load() != lastAccess {
+				bindActiveMetaHandleLocked(victim, expected)
 				skipped = append(skipped, victim)
 				continue
 			}
@@ -692,11 +1072,165 @@ func (c *Cache) evictLeastUrgentMetaLocked() bool {
 	return false
 }
 
-func (c *Cache) ensureActiveMetaSlotLocked() bool {
-	c.drainActiveBackendRemovalsLocked(activeRefreshEvictionProbes)
-	maxMeta := max(c.args.Size, 1)
+func (c *Cache) evictActiveMetaLocked(incomingHeat float64, compareIncoming bool) bool {
+	if len(c.activeMeta) < c.activeRefreshCapacity() {
+		return true
+	}
+	// Keep the existing indexed heap for O(log N) removal, but apply a bounded
+	// CLOCK-style second chance and a protected segment before choosing the
+	// coldest probationary entry from this scan. No map-wide scan is performed.
+	scanLimit := min(c.args.ActiveRefresh.EvictionScanLimit, len(c.activeEviction))
+	skipped := make([]*activeRefreshMeta, 0, scanLimit)
+	restoreSkipped := func() {
+		for _, meta := range skipped {
+			if meta != nil && c.activeMeta[meta.k] == meta && meta.evictionIndex < 0 {
+				meta.evictionTicket = c.nextActiveClockTicketLocked()
+				heap.Push(&c.activeEviction, meta)
+			}
+		}
+	}
+	now := time.Now()
+	var victim *activeRefreshMeta
+	victimHeat := math.MaxFloat64
+	var victimAccessCount uint64
+	for probes := 0; probes < scanLimit && len(c.activeEviction) > 0; probes++ {
+		candidate := heap.Pop(&c.activeEviction).(*activeRefreshMeta)
+		if candidate == nil || c.activeMeta[candidate.k] != candidate {
+			continue
+		}
+		current, _, present := c.backend.Get(candidate.k)
+		if c.activeMetaPinnedForEviction(candidate, current, present) {
+			skipped = append(skipped, candidate)
+			continue
+		}
+		heat := c.refreshActiveHeatLocked(candidate, now)
+		if candidate.referenced.Swap(false) {
+			if !candidate.protected && c.activeProtected < c.activeRefreshProtectedLimit() {
+				candidate.protected = true
+				c.activeProtected++
+				c.activeEvent("clock_promoted")
+			}
+			skipped = append(skipped, candidate)
+			continue
+		}
+		if candidate.protected {
+			if heat < float64(c.args.ActiveRefresh.AdmissionHits) {
+				candidate.protected = false
+				c.activeProtected--
+				c.activeEvent("clock_demoted")
+			}
+			skipped = append(skipped, candidate)
+			continue
+		}
+		if heat < victimHeat {
+			if victim != nil {
+				skipped = append(skipped, victim)
+			}
+			victim = candidate
+			victimHeat = heat
+			// refreshActiveHeatLocked fixed heatObserved to the exact access
+			// counter folded into heat. Keep that sample with this candidate;
+			// meta.heatObserved may be refreshed only after a detected race.
+			victimAccessCount = candidate.heatObserved
+		} else {
+			skipped = append(skipped, candidate)
+		}
+	}
+	restoreSkipped()
+	if victim == nil {
+		c.activeEvent("admission_capacity_rejected")
+		return false
+	}
+	if compareIncoming && incomingHeat < victimHeat {
+		victim.evictionTicket = c.nextActiveClockTicketLocked()
+		heap.Push(&c.activeEviction, victim)
+		c.activeEvent("admission_capacity_rejected")
+		return false
+	}
+	if !c.finalizeActiveEvictionLocked(victim, victimAccessCount) {
+		return false
+	}
+	c.removeActiveMetaLocked(victim.k, victim)
+	c.activeEvent("clock_evicted")
+	return true
+}
+
+// finalizeActiveEvictionLocked establishes the eviction linearization point.
+// sampledAccessCount is the exact realAccessCount already folded into the
+// victim's heat while it was selected. The caller has removed victim from the
+// eviction heap and must hold activeMu.
+func (c *Cache) finalizeActiveEvictionLocked(victim *activeRefreshMeta, sampledAccessCount uint64) bool {
+	if victim == nil || victim.expected == nil {
+		return true
+	}
+	activity := victim.expected.activityState()
+	lastAccess := activity.lastRealAccess.Load()
+	clearActiveMetaHandleLocked(victim)
+	if victim.accessWriters.Load() != 0 || victim.referenced.Swap(false) ||
+		activity.realAccessCount.Load() != sampledAccessCount ||
+		activity.lastRealAccess.Load() != lastAccess {
+		// A hit overlapped victim selection. Fold the newly observed counter into
+		// heat before rotating the entry, otherwise the next CLOCK pass could
+		// compare it using the same stale score that selected it this time.
+		c.refreshActiveHeatLocked(victim, time.Now())
+		bindActiveMetaHandleLocked(victim, victim.expected)
+		victim.evictionTicket = c.nextActiveClockTicketLocked()
+		heap.Push(&c.activeEviction, victim)
+		c.activeEvent("admission_capacity_rejected")
+		return false
+	}
+	return true
+}
+
+func activeAdmissionHeatFromState(state uint64, now time.Time, window time.Duration) float64 {
+	if window <= 0 {
+		return 0
+	}
+	start := int64(uint32(state >> 32))
+	if start == 0 {
+		return 0
+	}
+	nowSecond := now.Unix()
+	// Out-of-order request timestamps deliberately remain in the newer window,
+	// matching updateActiveAdmission. Otherwise only the still-live admission
+	// window contributes initial heat.
+	if nowSecond >= start && nowSecond-start >= int64(window/time.Second) {
+		return 0
+	}
+	return float64(uint32(state))
+}
+
+func activeAdmissionHeat(v *item, now time.Time, window time.Duration) float64 {
+	if v == nil {
+		return 0
+	}
+	_, state := snapshotActiveAdmissionState(v)
+	return activeAdmissionHeatFromState(state, now, window)
+}
+
+func (c *Cache) ensureActiveMetaSlotLocked(incoming *item) bool {
+	drainLimit := activeRefreshEvictionProbes
+	if c.activeRefreshTrackingPolicyEnabled() {
+		drainLimit = c.args.ActiveRefresh.EvictionScanLimit
+	}
+	c.drainActiveBackendRemovalsLocked(drainLimit)
+	maxMeta := c.activeRefreshCapacity()
+	incomingHeat := 0.0
+	if c.activeRefreshTrackingPolicyEnabled() {
+		incomingHeat = activeAdmissionHeat(
+			incoming,
+			time.Now(),
+			time.Duration(c.args.ActiveRefresh.AdmissionWindow)*time.Second,
+		)
+	}
 	for len(c.activeMeta) >= maxMeta {
-		if !c.evictLeastUrgentMetaLocked() {
+		evicted := false
+		if c.activeRefreshTrackingPolicyEnabled() {
+			evicted = c.evictActiveMetaLocked(incomingHeat, true)
+		} else {
+			evicted = c.evictLegacyActiveMetaLocked()
+		}
+		if !evicted {
 			return false
 		}
 	}
@@ -756,7 +1290,7 @@ func (c *Cache) scheduleEntryLocked(meta *activeRefreshMeta, expected *item, ret
 		meta: meta, dueAt: refreshAt, probeOnly: probeOnly, scheduleIndex: -1, pendingIndex: -1,
 	}
 	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-		idleAt := time.Unix(0, expected.lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
+		idleAt := time.Unix(0, expected.activityState().lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
 		if idleAt.Before(t.dueAt) {
 			t.dueAt = idleAt
 		}
@@ -800,6 +1334,12 @@ func (c *Cache) removeActiveMetaLocked(k key, meta *activeRefreshMeta) {
 	if meta.evictionIndex >= 0 {
 		heap.Remove(&c.activeEviction, meta.evictionIndex)
 	}
+	if meta.protected {
+		meta.protected = false
+		if c.activeProtected > 0 {
+			c.activeProtected--
+		}
+	}
 	delete(c.activeMeta, k)
 }
 
@@ -809,8 +1349,47 @@ func (c *Cache) addActiveMetaLocked(k key, meta *activeRefreshMeta) {
 	}
 	meta.k = k
 	meta.evictionIndex = -1
+	if c.activeRefreshTrackingPolicyEnabled() {
+		meta.evictionTicket = c.nextActiveClockTicketLocked()
+	} else {
+		meta.evictionTicket = 0
+	}
+	meta.protected = false
+	meta.referenced.Store(c.activeRefreshTrackingPolicyEnabled())
+	if c.activeRefreshTrackingPolicyEnabled() {
+		if meta.expected != nil {
+			accessCount, admissionState := snapshotActiveAdmissionState(meta.expected)
+			meta.heatAt = time.Now()
+			meta.heatObserved = accessCount
+			// realAccessCount is lifetime/lineage accounting and is only a
+			// baseline for future deltas. Initial heat is the live admission
+			// window, so old windows and a previously evicted incarnation cannot
+			// regain their full historical score on (re)admission.
+			meta.heat = activeAdmissionHeatFromState(
+				admissionState,
+				meta.heatAt,
+				time.Duration(c.args.ActiveRefresh.AdmissionWindow)*time.Second,
+			)
+		} else {
+			meta.heatAt = time.Now()
+		}
+	} else {
+		meta.heatAt = time.Time{}
+		meta.heatObserved = 0
+		meta.heat = 0
+	}
 	c.activeMeta[k] = meta
 	heap.Push(&c.activeEviction, meta)
+}
+
+func (c *Cache) nextActiveClockTicketLocked() uint64 {
+	c.activeClockTicket++
+	// Wraparound requires centuries even at extreme admission rates. Reserve
+	// zero for uninitialised metadata if it ever occurs.
+	if c.activeClockTicket == 0 {
+		c.activeClockTicket = 1
+	}
+	return c.activeClockTicket
 }
 
 func (c *Cache) setActiveMetaExpectedLocked(meta *activeRefreshMeta, expected *item) {
@@ -1136,7 +1715,8 @@ func (c *Cache) prunePendingLocked(now time.Time) {
 		}
 		inactive := false
 		if !staleMeta && !backendMissing && !backendChanged && !expired && c.args.ActiveRefresh.MaxIdleTime > 0 {
-			last := time.Unix(0, t.meta.expected.lastRealAccess.Load())
+			activity := t.meta.expected.activityState()
+			last := time.Unix(0, activity.lastRealAccess.Load())
 			inactive = now.Sub(last) >= time.Duration(c.args.ActiveRefresh.MaxIdleTime)*time.Second
 			if inactive {
 				// Publish the slow-path state before the final decision. A hit that
@@ -1144,7 +1724,7 @@ func (c *Cache) prunePendingLocked(now time.Time) {
 				// below, or sees the invalid handle and rebuilds after activeMu is
 				// released.
 				clearActiveMetaHandleLocked(t.meta)
-				last = time.Unix(0, t.meta.expected.lastRealAccess.Load())
+				last = time.Unix(0, activity.lastRealAccess.Load())
 				inactive = now.Sub(last) >= time.Duration(c.args.ActiveRefresh.MaxIdleTime)*time.Second
 				if !inactive {
 					bindActiveMetaHandleLocked(t.meta, t.meta.expected)
@@ -1300,10 +1880,11 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 		return nil, false
 	}
 	if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-		lastAccess := time.Unix(0, expected.lastRealAccess.Load())
+		activity := expected.activityState()
+		lastAccess := time.Unix(0, activity.lastRealAccess.Load())
 		if now.Sub(lastAccess) >= time.Duration(maxIdle)*time.Second {
 			clearActiveMetaHandleLocked(meta)
-			lastAccess = time.Unix(0, expected.lastRealAccess.Load())
+			lastAccess = time.Unix(0, activity.lastRealAccess.Load())
 			if now.Sub(lastAccess) >= time.Duration(maxIdle)*time.Second {
 				c.removeActiveMetaLocked(task.key, meta)
 				c.activeMu.Unlock()
@@ -1319,7 +1900,7 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 		// in that case return it to the future heap instead of querying early.
 		task.dueAt = task.refreshAt
 		if maxIdle := c.args.ActiveRefresh.MaxIdleTime; maxIdle > 0 {
-			idleAt := time.Unix(0, expected.lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
+			idleAt := time.Unix(0, expected.activityState().lastRealAccess.Load()).Add(time.Duration(maxIdle) * time.Second)
 			if idleAt.Before(task.dueAt) {
 				task.dueAt = idleAt
 			}
@@ -1332,9 +1913,10 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 		c.notifyActiveScheduler()
 		return nil, false
 	}
-	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && expected.refreshSuccess.Load() >= int64(maxRefresh) {
+	activity := expected.activityState()
+	if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && uint64(activity.refreshSuccesses()) >= uint64(maxRefresh) {
 		clearActiveMetaHandleLocked(meta)
-		if expected.refreshSuccess.Load() >= int64(maxRefresh) {
+		if uint64(activity.refreshSuccesses()) >= uint64(maxRefresh) {
 			clearActiveMetaTaskLocked(meta)
 			meta.stopped.Store(true)
 			c.activeMu.Unlock()
@@ -1385,7 +1967,7 @@ func (c *Cache) prepareActiveWork(task *refreshTask, now time.Time) (*activeRefr
 	epoch := c.refreshEpoch.Load()
 	return &activeRefreshWork{
 		task: task, replay: replay, nextBase: nextBase,
-		expected: current, epoch: epoch,
+		expected: current, epoch: epoch, activityEpoch: current.activityState().refreshEpoch(),
 		flight: refreshFlightKey{k: task.key, generation: task.generation},
 	}, !task.probeOnly
 }
@@ -1555,7 +2137,7 @@ func (c *Cache) runActiveRefreshTask(work *activeRefreshWork) {
 			if prepared, cacheable := c.prepareCacheEntry(work.qCtx, false); cacheable && c.commitPrepared(work.task.key, work.expected, work.epoch, prepared) {
 				c.activeRefreshSuccessTotal.Inc()
 				c.activeEvent("success")
-				c.updateActiveRefreshAfterCommitReplay(work.task.key, work.expected, prepared.item, time.Now(), prepared.msg, true, work.replay, nil, work.nextBase)
+				c.updateActiveRefreshAfterCommitReplay(work.task.key, work.expected, prepared.item, time.Now(), prepared.msg, true, work.activityEpoch, work.replay, nil, work.nextBase)
 				return
 			}
 		}
@@ -1643,7 +2225,7 @@ func (c *Cache) runFallbackProbe(work *activeRefreshWork, expected *item) {
 				if ok && c.commitPrepared(work.task.key, expected, work.epoch, prepared) {
 					c.activeRefreshProbeKeepTotal.Inc()
 					c.activeEvent("probe_success")
-					c.updateActiveRefreshAfterCommitReplay(work.task.key, expected, prepared.item, time.Now(), prepared.msg, false, work.replay, nil, work.nextBase)
+					c.updateActiveRefreshAfterCommitReplay(work.task.key, expected, prepared.item, time.Now(), prepared.msg, false, work.activityEpoch, work.replay, nil, work.nextBase)
 					return
 				}
 			}
@@ -1658,10 +2240,11 @@ func (c *Cache) updateActiveRefreshAfterCommit(
 	now time.Time,
 	response *dns.Msg,
 	activeSuccess bool,
+	activityEpoch uint32,
 	qCtx *query_context.Context,
 	next sequence.ChainWalker,
 ) {
-	c.updateActiveRefreshAfterCommitReplay(k, expected, updated, now, response, activeSuccess, nil, qCtx, next)
+	c.updateActiveRefreshAfterCommitReplay(k, expected, updated, now, response, activeSuccess, activityEpoch, nil, qCtx, next)
 }
 
 func (c *Cache) updateActiveRefreshAfterCommitReplay(
@@ -1670,6 +2253,7 @@ func (c *Cache) updateActiveRefreshAfterCommitReplay(
 	now time.Time,
 	response *dns.Msg,
 	activeSuccess bool,
+	activityEpoch uint32,
 	replay *query_context.ReplaySnapshot,
 	qCtx *query_context.Context,
 	nextBase sequence.ChainWalker,
@@ -1708,7 +2292,7 @@ func (c *Cache) updateActiveRefreshAfterCommitReplay(
 				qCtx = nil
 				continue
 			}
-			if !c.ensureActiveMetaSlotLocked() {
+			if !c.ensureActiveMetaSlotLocked(updated) {
 				c.activeMu.Unlock()
 				return
 			}
@@ -1719,20 +2303,13 @@ func (c *Cache) updateActiveRefreshAfterCommitReplay(
 			return
 		}
 		c.removeMetaTaskLocked(meta)
-		// commitPrepared copied the activity state before publishing updated. A real
-		// hit may have touched the old generation in the short commit-to-metadata
-		// handoff window. The old handle is invalid now, so merge one final snapshot
-		// before installing the new generation. A later stale-L1 hit deliberately
-		// remains generation-local and cannot reset the current entry.
-		lateRealAccess := expected.lastRealAccess.Load()
-		lateRealHit := lateRealAccess > updated.lastRealAccess.Load()
-		if lateRealHit {
-			updated.lastRealAccess.Store(lateRealAccess)
-			updated.refreshSuccess.Store(expected.refreshSuccess.Load())
-		}
+		// commitPrepared published updated with expected's shared activity pointer.
+		// The packed epoch/success CAS makes a real hit on either physical
+		// generation win deterministically over this completion.
+		activity := updated.activityState()
 		c.setActiveMetaExpectedLocked(meta, updated)
-		if activeSuccess && !lateRealHit {
-			updated.refreshSuccess.Add(1)
+		if activeSuccess {
+			activity.addRefreshSuccess(activityEpoch)
 		}
 		question, validQuestion := questionFromKey(k)
 		excludedDomain := !validQuestion || c.activeDomainExcluded(question.Name)
@@ -1748,7 +2325,7 @@ func (c *Cache) updateActiveRefreshAfterCommitReplay(
 			c.notifyActiveScheduler()
 			return
 		}
-		if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && updated.refreshSuccess.Load() >= int64(maxRefresh) {
+		if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && uint64(activity.refreshSuccesses()) >= uint64(maxRefresh) {
 			meta.stopped.Store(true)
 		} else {
 			c.scheduleEntryLocked(meta, updated, 0, false, now, false)
@@ -1818,6 +2395,12 @@ func (c *Cache) queueRestoredActiveRefresh(entries []decodedDumpEntry) {
 func (c *Cache) restoreActiveRefreshEntries(entries []decodedDumpEntry, next sequence.ChainWalker) {
 	now := time.Now()
 	restored := 0
+	// Dump decoding is map-backed and therefore unordered. Restore most-recently
+	// used entries first so an independent tracking cap deterministically keeps
+	// the hottest available candidates after restart.
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].lastRealAccess.After(entries[j].lastRealAccess)
+	})
 	for _, entry := range entries {
 		v := entry.item
 		if v == nil || !now.Before(v.expirationTime) {
@@ -1874,7 +2457,7 @@ func (c *Cache) restoreActiveRefreshEntries(entries []decodedDumpEntry, next seq
 				}
 				c.removeActiveMetaLocked(entry.k, existing)
 			}
-			if !c.ensureActiveMetaSlotLocked() {
+			if !c.ensureActiveMetaSlotLocked(v) {
 				return false
 			}
 

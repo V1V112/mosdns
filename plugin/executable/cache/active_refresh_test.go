@@ -31,6 +31,17 @@ func newDormantActiveCache(t *testing.T, args *Args, opts Opts) *Cache {
 	return c
 }
 
+func activeRefreshTrackingPolicyForTest(maxTrackedEntries int) ActiveRefreshArgs {
+	return ActiveRefreshArgs{
+		MaxTrackedEntries: maxTrackedEntries,
+		AdmissionHits:     1,
+		AdmissionWindow:   600,
+		HeatHalfLife:      600,
+		ProtectedRatio:    80,
+		EvictionScanLimit: 64,
+	}
+}
+
 func counterValue(t *testing.T, counter prometheus.Counter) float64 {
 	t.Helper()
 	metric := new(dto.Metric)
@@ -115,6 +126,702 @@ func TestActiveRefreshDynamicTimingHelpers(t *testing.T) {
 	}
 	if got, ok := calculateProbeTimeout(500*time.Millisecond, 120*time.Millisecond); !ok || got != 120*time.Millisecond {
 		t.Fatalf("probe timeout = %s, %v; want 120ms", got, ok)
+	}
+}
+
+func TestActiveRefreshLegacyFirstAccessTracksImmediately(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 4}, Opts{})
+	defer c.Close()
+	if c.activeRefreshTrackingPolicyEnabled() {
+		t.Fatal("tracking policy unexpectedly enabled without its six fields")
+	}
+
+	qCtx := newTestQuery("legacy-first-access.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	p := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Minute)
+	if !c.commitPrepared(k, nil, 0, p) {
+		t.Fatal("failed to seed legacy cache entry")
+	}
+	c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, time.Now(), p.msg)
+	if meta := p.item.activeMeta.Load(); meta == nil || meta.expected != p.item || meta.task == nil {
+		t.Fatalf("first legacy observation was not tracked immediately: %#v", meta)
+	}
+}
+
+func TestActiveRefreshSecondHitAdmissionAndWindowReset(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.AdmissionHits = 2
+	policy.AdmissionWindow = 60
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	qCtx := newTestQuery("second-hit.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	p := testPreparedA(t, qCtx.Q(), "192.0.2.1", 5*time.Minute)
+	if !c.commitPrepared(k, nil, 0, p) {
+		t.Fatal("failed to seed cache")
+	}
+	base := time.Now()
+	c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, base, p.msg)
+	if meta := p.item.activeMeta.Load(); meta != nil {
+		t.Fatal("first access created active refresh metadata")
+	}
+	c.observeActiveRefresh(k, p.item, qCtx, sequence.ChainWalker{}, base.Add(time.Second), p.msg)
+	if meta := p.item.activeMeta.Load(); meta == nil {
+		t.Fatal("second access inside admission window was not admitted")
+	}
+	if got := p.item.activityState().realAccessCount.Load(); got != 2 {
+		t.Fatalf("real access count = %d, want 2", got)
+	}
+
+	qCtx2 := newTestQuery("window-reset.example.", dns.TypeA, dns.ClassINET, true)
+	k2 := testCacheKey(t, qCtx2)
+	p2 := testPreparedA(t, qCtx2.Q(), "192.0.2.2", 5*time.Minute)
+	if !c.commitPrepared(k2, nil, 0, p2) {
+		t.Fatal("failed to seed reset candidate")
+	}
+	c.trackActiveRefresh(k2, p2.item, qCtx2.CopyWithoutResponse(), sequence.ChainWalker{}, base, p2.msg)
+	c.observeActiveRefresh(k2, p2.item, qCtx2, sequence.ChainWalker{}, base.Add(61*time.Second), p2.msg)
+	if meta := p2.item.activeMeta.Load(); meta != nil {
+		t.Fatal("access outside admission window reused the old hit")
+	}
+	c.observeActiveRefresh(k2, p2.item, qCtx2, sequence.ChainWalker{}, base.Add(62*time.Second), p2.msg)
+	if meta := p2.item.activeMeta.Load(); meta == nil {
+		t.Fatal("second access in the reset window was not admitted")
+	}
+}
+
+func TestActiveRefreshAdmissionHeatDoesNotRevivePreviousWindow(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.AdmissionHits = 2
+	policy.AdmissionWindow = 60
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	qCtx := newTestQuery("old-window-heat.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	p := testPreparedA(t, qCtx.Q(), "192.0.2.1", 5*time.Minute)
+	if !c.commitPrepared(k, nil, 0, p) {
+		t.Fatal("failed to seed cache entry")
+	}
+	activity := p.item.activityState()
+	const oldHits = uint32(100)
+	activity.realAccessCount.Store(uint64(oldHits))
+	oldWindow := time.Now().Add(-2 * time.Duration(policy.AdmissionWindow) * time.Second)
+	activity.admissionState.Store(uint64(uint32(oldWindow.Unix()))<<32 | uint64(oldHits))
+
+	now := time.Now()
+	c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, now, p.msg)
+	if meta := p.item.activeMeta.Load(); meta != nil {
+		t.Fatal("first hit in the new window unexpectedly admitted the old history")
+	}
+	c.observeActiveRefresh(k, p.item, qCtx, sequence.ChainWalker{}, now.Add(time.Second), p.msg)
+
+	c.activeMu.RLock()
+	meta := c.activeMeta[k]
+	var heat float64
+	var observed uint64
+	if meta != nil {
+		heat = meta.heat
+		observed = meta.heatObserved
+	}
+	c.activeMu.RUnlock()
+	if meta == nil {
+		t.Fatal("second hit in the new window was not admitted")
+	}
+	if heat != 2 {
+		t.Fatalf("new-window initial heat = %f, want 2", heat)
+	}
+	if want := uint64(oldHits) + 2; observed != want {
+		t.Fatalf("lifetime heat baseline = %d, want %d", observed, want)
+	}
+}
+
+func TestActiveRefreshReadmissionHeatDoesNotReviveEvictedHistory(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(1)
+	policy.AdmissionWindow = 60
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	k, qCtx, p := seedTrackedEntry(t, c, "readmitted-heat.example.", 5*time.Minute, 0)
+	activity := p.item.activityState()
+	const historicalHits = uint64(501)
+	activity.realAccessCount.Store(historicalHits)
+	oldWindow := time.Now().Add(-2 * time.Duration(policy.AdmissionWindow) * time.Second)
+	activity.admissionState.Store(uint64(uint32(oldWindow.Unix()))<<32 | uint64(uint32(historicalHits)))
+
+	c.activeMu.Lock()
+	oldMeta := c.activeMeta[k]
+	if oldMeta == nil {
+		c.activeMu.Unlock()
+		t.Fatal("missing initially tracked metadata")
+	}
+	oldMeta.referenced.Store(false)
+	oldMeta.protected = false
+	c.activeProtected = 0
+	evicted := c.evictLeastUrgentMetaLocked()
+	_, stillTracked := c.activeMeta[k]
+	c.activeMu.Unlock()
+	if !evicted || stillTracked {
+		t.Fatalf("failed to evict old metadata: evicted=%v tracked=%v", evicted, stillTracked)
+	}
+
+	c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, time.Now(), p.msg)
+	c.activeMu.RLock()
+	meta := c.activeMeta[k]
+	var heat float64
+	var observed uint64
+	if meta != nil {
+		heat = meta.heat
+		observed = meta.heatObserved
+	}
+	c.activeMu.RUnlock()
+	if meta == nil || meta == oldMeta {
+		t.Fatalf("evicted entry was not readmitted with new metadata: %#v", meta)
+	}
+	if heat != 1 {
+		t.Fatalf("readmitted initial heat = %f, want 1", heat)
+	}
+	if want := historicalHits + 1; observed != want {
+		t.Fatalf("readmitted lifetime heat baseline = %d, want %d", observed, want)
+	}
+}
+
+func TestActiveRefreshMetaHeatWaitsForCompleteAdmissionPublication(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.AdmissionHits = 5
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	qCtx := newTestQuery("coherent-heat-snapshot.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	p := testPreparedA(t, qCtx.Q(), "192.0.2.63", time.Minute)
+	p.item.generation = c.generation.Add(1)
+	activity := p.item.activityState()
+	writer := acquireActiveRefreshActivityWriter(p.item)
+	if writer.meta != nil || !writer.admissionLocked {
+		writer.release()
+		t.Fatal("failed to establish untracked admission publication")
+	}
+
+	// Publish only the lifetime side first. Metadata creation must wait instead
+	// of pairing this new baseline with the previous admission window.
+	saturatingAddUint64(&activity.realAccessCount, 5)
+	activity.recordRealAccess(time.Now())
+	meta := &activeRefreshMeta{k: k, expected: p.item, evictionIndex: -1}
+	installed := make(chan struct{})
+	go func() {
+		c.activeMu.Lock()
+		c.addActiveMetaLocked(k, meta)
+		c.activeMu.Unlock()
+		close(installed)
+	}()
+	select {
+	case <-installed:
+		writer.release()
+		t.Fatal("metadata captured a half-published admission state")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	if hits := updateActiveAdmission(p.item, time.Now(), time.Duration(policy.AdmissionWindow)*time.Second, 5); hits != 5 {
+		writer.release()
+		t.Fatalf("published admission hits = %d, want 5", hits)
+	}
+	publicationCompletedAt := time.Now()
+	writer.release()
+	<-installed
+
+	if meta.heatObserved != 5 || meta.heat != 5 {
+		t.Fatalf("coherent heat snapshot = observed:%d heat:%f, want 5/5", meta.heatObserved, meta.heat)
+	}
+	if meta.heatAt.Before(publicationCompletedAt) {
+		t.Fatalf("heat timestamp predates completed admission publication: %s < %s", meta.heatAt, publicationCompletedAt)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestActiveRefreshConsumesFastCacheAggregateWithoutDoubleCount(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.AdmissionHits = 5
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	qCtx := newTestQuery("fast-weight.example.", dns.TypeA, dns.ClassINET, true)
+	qCtx.SetFastCacheHits(9)
+	k := testCacheKey(t, qCtx)
+	p := testPreparedA(t, qCtx.Q(), "192.0.2.9", time.Minute)
+	if !c.commitPrepared(k, nil, 0, p) {
+		t.Fatal("failed to seed cache")
+	}
+	c.trackActiveRefresh(k, p.item, qCtx, sequence.ChainWalker{}, time.Now(), p.msg)
+	if got := p.item.activityState().realAccessCount.Load(); got != 9 {
+		t.Fatalf("aggregated real access count = %d, want 9", got)
+	}
+	if meta := p.item.activeMeta.Load(); meta == nil {
+		t.Fatal("aggregated fast-cache hits did not satisfy admission")
+	}
+	if got := counterValue(t, c.activeRefreshEvents.WithLabelValues("fast_cache_hits_merged")); got != 9 {
+		t.Fatalf("merged-hit metric = %f, want 9", got)
+	}
+	// A parallel Context copy sees that the aggregate token existed but was
+	// already consumed; it must not add a synthetic +1.
+	parallelSource := newTestQuery("parallel-fast-weight.example.", dns.TypeA, dns.ClassINET, true)
+	parallelSource.SetFastCacheHits(7)
+	firstBranch := parallelSource.Copy()
+	secondBranch := parallelSource.Copy()
+	kp := testCacheKey(t, parallelSource)
+	pp := testPreparedA(t, parallelSource.Q(), "192.0.2.11", time.Minute)
+	if !c.commitPrepared(kp, nil, 0, pp) {
+		t.Fatal("failed to seed parallel sample entry")
+	}
+	c.trackActiveRefresh(kp, pp.item, firstBranch, sequence.ChainWalker{}, time.Now(), pp.msg)
+	pp.item.activityState().storeRefreshSuccesses(4)
+	firstAccess := pp.item.activityState().lastRealAccess.Load()
+	c.observeActiveRefresh(kp, pp.item, secondBranch, sequence.ChainWalker{}, time.Now(), pp.msg)
+	if got := pp.item.activityState().realAccessCount.Load(); got != 7 {
+		t.Fatalf("parallel aggregate count = %d, want 7", got)
+	}
+	if got := pp.item.activityState().lastRealAccess.Load(); got != firstAccess {
+		t.Fatalf("consumed parallel token changed last access: got=%d want=%d", got, firstAccess)
+	}
+	if got := pp.item.activityState().refreshSuccesses(); got != 4 {
+		t.Fatalf("consumed parallel token reset refresh successes: got=%d want=4", got)
+	}
+	if got := counterValue(t, c.activeRefreshEvents.WithLabelValues("fast_cache_hits_merged")); got != 16 {
+		t.Fatalf("merged-hit metric after parallel sample = %f, want 16", got)
+	}
+
+	internal := newTestQuery("internal-no-heat.example.", dns.TypeA, dns.ClassINET, true)
+	internal.MarkCacheRefresh()
+	ki := testCacheKey(t, internal)
+	pi := testPreparedA(t, internal.Q(), "192.0.2.10", time.Minute)
+	if !c.commitPrepared(ki, nil, 0, pi) {
+		t.Fatal("failed to seed internal entry")
+	}
+	c.trackActiveRefresh(ki, pi.item, internal, sequence.ChainWalker{}, time.Now(), pi.msg)
+	if got := pi.item.activityState().realAccessCount.Load(); got != 0 || pi.item.activeMeta.Load() != nil {
+		t.Fatalf("internal refresh changed heat: count=%d meta=%#v", got, pi.item.activeMeta.Load())
+	}
+	if got := counterValue(t, c.activeRefreshEvents.WithLabelValues("fast_cache_hits_merged")); got != 16 {
+		t.Fatalf("internal refresh changed merged-hit metric: got %f, want 16", got)
+	}
+}
+
+func TestActiveRefreshAdmissionCaptureHasSingleOwnerAndRetries(t *testing.T) {
+	v := &item{generation: 1}
+	const contenders = 32
+	start := make(chan struct{})
+	release := make(chan struct{})
+	var attempted sync.WaitGroup
+	var finished sync.WaitGroup
+	attempted.Add(contenders)
+	finished.Add(contenders)
+	var owners atomic.Int32
+	for range contenders {
+		go func() {
+			defer finished.Done()
+			<-start
+			owned := beginActiveRefreshCapture(v)
+			if owned {
+				owners.Add(1)
+			}
+			attempted.Done()
+			if owned {
+				<-release
+				endActiveRefreshCapture(v)
+			}
+		}()
+	}
+	close(start)
+	attempted.Wait()
+	if got := owners.Load(); got != 1 {
+		t.Fatalf("capture owners = %d, want 1", got)
+	}
+	close(release)
+	finished.Wait()
+	if !beginActiveRefreshCapture(v) {
+		t.Fatal("capture ownership was not released for retry")
+	}
+	endActiveRefreshCapture(v)
+}
+
+func TestActiveActivityConcurrentInitialization(t *testing.T) {
+	v := new(item)
+	const contenders = 64
+	start := make(chan struct{})
+	activities := make(chan *activeActivity, contenders)
+	var wg sync.WaitGroup
+	wg.Add(contenders)
+	for range contenders {
+		go func() {
+			defer wg.Done()
+			<-start
+			activities <- v.activityState()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(activities)
+
+	var first *activeActivity
+	for activity := range activities {
+		if activity == nil {
+			t.Fatal("activityState returned nil")
+		}
+		if first == nil {
+			first = activity
+			continue
+		}
+		if activity != first {
+			t.Fatal("concurrent initialization published more than one activity pointer")
+		}
+	}
+}
+
+func TestActiveActivityGenerationHandoffSharesOnlyActivity(t *testing.T) {
+	old := &item{generation: 1}
+	oldActivity := old.activityState()
+	oldActivity.realAccessCount.Store(7)
+	oldActivity.storeRefreshSuccesses(3)
+	oldActivity.admissionState.Store(11)
+	old.admissionCapture.Store(true)
+
+	updated := &item{generation: 2}
+	inheritActiveRefreshActivity(updated, old)
+	if updated.activityState() != oldActivity {
+		t.Fatal("generation handoff copied activity instead of sharing its pointer")
+	}
+	if updated.admissionCapture.Load() {
+		t.Fatal("generation-local admission capture gate was inherited")
+	}
+	if !updated.admissionCapture.CompareAndSwap(false, true) {
+		t.Fatal("new generation could not independently claim replay capture")
+	}
+
+	saturatingAddUint64(&updated.activityState().realAccessCount, 5)
+	if got := old.activityState().realAccessCount.Load(); got != 12 {
+		t.Fatalf("old generation did not observe shared heat: got=%d want=12", got)
+	}
+	old.activityState().admissionState.Store(19)
+	if got := updated.activityState().admissionState.Load(); got != 19 {
+		t.Fatalf("new generation did not observe shared admission state: got=%d want=19", got)
+	}
+}
+
+func TestActiveActivityRealHitWinsRefreshCompletion(t *testing.T) {
+	activity := newActiveActivity(time.Now())
+	activity.storeRefreshSuccesses(3)
+	epochCaptured := make(chan uint32, 1)
+	hitFinished := make(chan struct{})
+	refreshRecorded := make(chan bool, 1)
+	go func() {
+		epoch := activity.refreshEpoch()
+		epochCaptured <- epoch
+		<-hitFinished
+		refreshRecorded <- activity.addRefreshSuccess(epoch)
+	}()
+
+	oldEpoch := <-epochCaptured
+	activity.recordRealAccess(time.Now().Add(time.Second))
+	close(hitFinished)
+	if recorded := <-refreshRecorded; recorded {
+		t.Fatal("refresh completion incremented after a newer real hit")
+	}
+	if got := activity.refreshSuccesses(); got != 0 {
+		t.Fatalf("real hit did not reset consecutive successes: got=%d want=0", got)
+	}
+	if got := activity.refreshEpoch(); got == oldEpoch {
+		t.Fatalf("real hit did not advance refresh epoch: got=%d", got)
+	}
+
+	currentEpoch := activity.refreshEpoch()
+	if !activity.addRefreshSuccess(currentEpoch) {
+		t.Fatal("refresh completion with the current epoch was rejected")
+	}
+	if got := activity.refreshSuccesses(); got != 1 {
+		t.Fatalf("current refresh success count = %d, want 1", got)
+	}
+	activity.storeRefreshSuccesses(^uint32(0))
+	if !activity.addRefreshSuccess(activity.refreshEpoch()) || activity.refreshSuccesses() != ^uint32(0) {
+		t.Fatal("refresh success count did not saturate at uint32 max")
+	}
+}
+
+func TestActiveRefreshIndependentCapEvictsColdEntry(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(2)
+	policy.EvictionScanLimit = 8
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	seed := func(name string) (key, *query_context.Context, *preparedCacheEntry) {
+		qCtx := newTestQuery(name, dns.TypeA, dns.ClassINET, true)
+		k := testCacheKey(t, qCtx)
+		p := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Minute)
+		if !c.commitPrepared(k, nil, 0, p) {
+			t.Fatalf("failed to seed %s", name)
+		}
+		c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, time.Now(), p.msg)
+		return k, qCtx, p
+	}
+	coldKey, _, _ := seed("cold-cap.example.")
+	hotKey, _, hot := seed("hot-cap.example.")
+	// Make the second resident measurably hot, then expose both residents to the
+	// bounded cold-candidate scan.
+	saturatingAddUint64(&hot.item.activityState().realAccessCount, 20)
+	c.activeMu.Lock()
+	for _, meta := range c.activeMeta {
+		meta.referenced.Store(false)
+		meta.protected = false
+	}
+	c.activeProtected = 0
+	c.activeMu.Unlock()
+	thirdKey, _, _ := seed("incoming-cap.example.")
+
+	c.activeMu.RLock()
+	_, coldPresent := c.activeMeta[coldKey]
+	_, hotPresent := c.activeMeta[hotKey]
+	_, incomingPresent := c.activeMeta[thirdKey]
+	tracked := len(c.activeMeta)
+	c.activeMu.RUnlock()
+	if coldPresent || !hotPresent || !incomingPresent || tracked != 2 {
+		t.Fatalf("cap result cold=%v hot=%v incoming=%v tracked=%d", coldPresent, hotPresent, incomingPresent, tracked)
+	}
+}
+
+func TestActiveRefreshIndependentCapRejectsColderIncomingEntry(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(1)
+	policy.EvictionScanLimit = 4
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+	hotKey, _, hot := seedTrackedEntry(t, c, "resident-hot.example.", time.Minute, 0)
+	saturatingAddUint64(&hot.item.activityState().realAccessCount, 100)
+	if meta := hot.item.activeMeta.Load(); meta != nil {
+		meta.referenced.Store(false)
+	}
+
+	incomingCtx := newTestQuery("incoming-cold.example.", dns.TypeA, dns.ClassINET, true)
+	incomingKey := testCacheKey(t, incomingCtx)
+	incoming := testPreparedA(t, incomingCtx.Q(), "192.0.2.2", time.Minute)
+	if !c.commitPrepared(incomingKey, nil, 0, incoming) {
+		t.Fatal("failed to seed incoming entry")
+	}
+	c.trackActiveRefresh(incomingKey, incoming.item, incomingCtx, sequence.ChainWalker{}, time.Now(), incoming.msg)
+
+	c.activeMu.RLock()
+	_, hotPresent := c.activeMeta[hotKey]
+	_, incomingPresent := c.activeMeta[incomingKey]
+	c.activeMu.RUnlock()
+	if !hotPresent || incomingPresent {
+		t.Fatalf("colder admission replaced hot resident: hot=%v incoming=%v", hotPresent, incomingPresent)
+	}
+}
+
+func TestActiveRefreshEvictionRechecksCounterBeforeReferenceBit(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(1)
+	policy.EvictionScanLimit = 4
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	k, _, p := seedTrackedEntry(t, c, "eviction-counter-race.example.", time.Minute, 0)
+	activity := p.item.activityState()
+
+	c.activeMu.Lock()
+	meta := c.activeMeta[k]
+	if meta == nil || meta.evictionIndex < 0 {
+		c.activeMu.Unlock()
+		t.Fatal("tracked entry is missing from the eviction heap")
+	}
+	heap.Remove(&c.activeEviction, meta.evictionIndex)
+	meta.referenced.Store(false)
+	sampledAt := time.Now()
+	sampledHeat := c.refreshActiveHeatLocked(meta, sampledAt)
+	sampledCount := meta.heatObserved
+
+	// Model the precise lock-free hit interleaving that used to be missed:
+	// realAccessCount has been published, but the goroutine is paused before it
+	// records lastRealAccess or reaches referenced.Store(true). A last-access
+	// baseline taken now cannot detect this hit; the fixed heat sample must.
+	const newHits = uint64(37)
+	saturatingAddUint64(&activity.realAccessCount, newHits)
+	if c.finalizeActiveEvictionLocked(meta, sampledCount) {
+		c.activeMu.Unlock()
+		t.Fatal("eviction committed after realAccessCount changed since heat sampling")
+	}
+	kept := c.activeMeta[k] == meta
+	requeued := meta.evictionIndex >= 0
+	rebound := p.item.activeMeta.Load() == meta && meta.boundGeneration.Load() == p.item.generation
+	observed := meta.heatObserved
+	refreshedHeat := meta.heat
+	c.activeMu.Unlock()
+
+	if !kept || !requeued || !rebound {
+		t.Fatalf("raced victim was not restored: kept=%v requeued=%v rebound=%v", kept, requeued, rebound)
+	}
+	if want := sampledCount + newHits; observed != want {
+		t.Fatalf("refreshed heat observed count = %d, want %d", observed, want)
+	}
+	if refreshedHeat < sampledHeat+float64(newHits)-0.01 {
+		t.Fatalf("raced hit was not folded into heat: before=%f after=%f", sampledHeat, refreshedHeat)
+	}
+}
+
+func TestActiveRefreshEvictionRejectsHitAlreadyAddedBeforeSampling(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy bool
+	}{
+		{name: "legacy"},
+		{name: "clock", policy: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := &Args{Size: 1}
+			if tc.policy {
+				args.Size = 16
+				args.ActiveRefresh = activeRefreshTrackingPolicyForTest(1)
+			}
+			c := newDormantActiveCache(t, args, Opts{})
+			defer c.Close()
+
+			k, _, p := seedTrackedEntry(t, c, "partial-hit-"+tc.name+".example.", time.Minute, 0)
+			activity := p.item.activityState()
+			meta := p.item.activeMeta.Load()
+			if meta == nil {
+				t.Fatal("missing tracked metadata")
+			}
+			writer := acquireActiveRefreshMetaWriter(p.item)
+			if writer != meta {
+				if writer != nil {
+					releaseActiveRefreshMetaWriter(writer)
+				}
+				t.Fatalf("failed to pin tracked metadata: got=%p want=%p", writer, meta)
+			}
+			before := activity.realAccessCount.Load()
+			const newHits = uint64(37)
+			// This is the formerly unsafe interleaving: Add is visible before
+			// eviction takes any counter/timestamp sample, while lastRealAccess
+			// and referenced are deliberately still unpublished.
+			saturatingAddUint64(&activity.realAccessCount, newHits)
+
+			c.activeMu.Lock()
+			meta.referenced.Store(false)
+			evicted := c.evictLeastUrgentMetaLocked()
+			kept := c.activeMeta[k] == meta
+			requeued := meta.evictionIndex >= 0
+			rebound := p.item.activeMeta.Load() == meta && meta.boundGeneration.Load() == p.item.generation
+			observed := meta.heatObserved
+			c.activeMu.Unlock()
+
+			// Complete the paused hit in the same order as the production path.
+			activity.recordRealAccess(time.Now())
+			if tc.policy {
+				meta.referenced.Store(true)
+			}
+			releaseActiveRefreshMetaWriter(writer)
+
+			if evicted || !kept || !requeued || !rebound {
+				t.Fatalf("partially published hit was evicted: evicted=%v kept=%v requeued=%v rebound=%v", evicted, kept, requeued, rebound)
+			}
+			if tc.policy && observed != before+newHits {
+				t.Fatalf("CLOCK sampled counter = %d, want %d", observed, before+newHits)
+			}
+			if got := meta.accessWriters.Load(); got != 0 {
+				t.Fatalf("writer pin leaked after hit completion: %d", got)
+			}
+			assertActiveEvictionInvariant(t, c)
+		})
+	}
+}
+
+func TestActiveRefreshHitAfterHandleClearUsesAdmissionSlowPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy bool
+	}{
+		{name: "legacy"},
+		{name: "clock", policy: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := &Args{Size: 1}
+			if tc.policy {
+				args.Size = 16
+				args.ActiveRefresh = activeRefreshTrackingPolicyForTest(1)
+			}
+			c := newDormantActiveCache(t, args, Opts{})
+			defer c.Close()
+
+			k, qCtx, p := seedTrackedEntry(t, c, "post-clear-hit-"+tc.name+".example.", time.Minute, 0)
+			c.activeMu.Lock()
+			meta := c.activeMeta[k]
+			clearActiveMetaHandleLocked(meta)
+			c.activeMu.Unlock()
+			if meta == nil || p.item.activeMeta.Load() != nil {
+				t.Fatal("failed to establish cleared-handle interleaving")
+			}
+
+			before := p.item.activityState().realAccessCount.Load()
+			if ready := c.recordActiveRefreshActivity(p.item, time.Now(), 1); !ready {
+				t.Fatal("hit beginning after handle clear did not enter the admission slow path")
+			}
+			if got := p.item.activityState().realAccessCount.Load(); got != before+1 {
+				t.Fatalf("slow-path hit count = %d, want %d", got, before+1)
+			}
+			if got := meta.accessWriters.Load(); got != 0 {
+				t.Fatalf("post-clear hit incorrectly pinned detached metadata: %d", got)
+			}
+			if !beginActiveRefreshCapture(p.item) {
+				t.Fatal("post-clear slow path could not claim replay capture")
+			}
+			c.captureActiveRefreshReplay(
+				k,
+				p.item,
+				qCtx.CopyWithoutResponse(),
+				sequence.ChainWalker{},
+				time.Now(),
+				p.msg,
+			)
+			endActiveRefreshCapture(p.item)
+			if rebound := boundActiveRefreshMeta(p.item); rebound != meta {
+				t.Fatalf("slow path did not restore metadata binding: got=%p want=%p", rebound, meta)
+			}
+		})
+	}
+}
+
+func TestActiveRefreshHeatHalfLife(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.HeatHalfLife = 10
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+	_, _, p := seedTrackedEntry(t, c, "heat-decay.example.", time.Minute, 0)
+	meta := p.item.activeMeta.Load()
+	if meta == nil {
+		t.Fatal("missing metadata")
+	}
+	now := time.Now()
+	c.activeMu.Lock()
+	meta.heat = 8
+	meta.heatObserved = p.item.activityState().realAccessCount.Load()
+	meta.heatAt = now.Add(-10 * time.Second)
+	got := c.refreshActiveHeatLocked(meta, now)
+	c.activeMu.Unlock()
+	if got < 3.99 || got > 4.01 {
+		t.Fatalf("one-half-life heat = %f, want about 4", got)
+	}
+}
+
+func TestActiveRefreshProtectedLimitLeavesProbationSlot(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(2)
+	policy.ProtectedRatio = 100
+	c := newDormantActiveCache(t, &Args{Size: 2, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+	if got := c.activeRefreshProtectedLimit(); got != 1 {
+		t.Fatalf("protected limit = %d, want 1 of 2", got)
+	}
+	c.args.ActiveRefresh.MaxTrackedEntries = 1
+	if got := c.activeRefreshProtectedLimit(); got != 0 {
+		t.Fatalf("single-entry protected limit = %d, want 0", got)
 	}
 }
 
@@ -225,7 +932,7 @@ func TestStaleGenerationRejectedBeforeInflight(t *testing.T) {
 	}
 	// Simulate the commit-to-metadata handoff used by a concurrent lazy refresh.
 	// Rejecting the old task must not delete the metadata container needed here.
-	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, qCtx, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, 0, qCtx, sequence.ChainWalker{})
 	c.activeMu.RLock()
 	meta := c.activeMeta[k]
 	c.activeMu.RUnlock()
@@ -268,7 +975,7 @@ func TestActiveRefreshSuccessReschedulesFromNewTTL(t *testing.T) {
 	c.activeMu.RUnlock()
 	work := &activeRefreshWork{
 		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, next: task.meta.next.Fork(),
-		expected: old.item, epoch: c.refreshEpoch.Load(),
+		expected: old.item, epoch: c.refreshEpoch.Load(), activityEpoch: old.item.activityState().refreshEpoch(),
 		flight: refreshFlightKey{k: k, generation: old.item.generation},
 	}
 	started := time.Now()
@@ -307,7 +1014,8 @@ func TestMaxRefreshSuccessLimitStopsUntilRealAccess(t *testing.T) {
 	c.activeMu.RUnlock()
 	c.runActiveRefreshTask(&activeRefreshWork{
 		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: old.item,
-		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: old.item.generation},
+		epoch: c.refreshEpoch.Load(), activityEpoch: old.item.activityState().refreshEpoch(),
+		flight: refreshFlightKey{k: k, generation: old.item.generation},
 	})
 
 	current, _, present := c.backend.Get(k)
@@ -315,7 +1023,7 @@ func TestMaxRefreshSuccessLimitStopsUntilRealAccess(t *testing.T) {
 	meta := c.activeMeta[k]
 	c.activeMu.RUnlock()
 	if !present || meta == nil || meta.expected != current || meta.task != nil || !meta.stopped.Load() ||
-		current.refreshSuccess.Load() != 1 || current.activeMeta.Load() != nil {
+		current.activityState().refreshSuccesses() != 1 || current.activeMeta.Load() != nil {
 		t.Fatalf("max-refresh stop state: present=%v current=%#v meta=%#v", present, current, meta)
 	}
 	msg := new(dns.Msg)
@@ -324,7 +1032,7 @@ func TestMaxRefreshSuccessLimitStopsUntilRealAccess(t *testing.T) {
 	}
 	c.observeActiveRefresh(k, current, qCtx, sequence.ChainWalker{}, time.Now(), msg)
 	c.activeMu.RLock()
-	resumed := meta.task != nil && !meta.stopped.Load() && current.refreshSuccess.Load() == 0 &&
+	resumed := meta.task != nil && !meta.stopped.Load() && current.activityState().refreshSuccesses() == 0 &&
 		current.activeMeta.Load() == meta && meta.boundGeneration.Load() == current.generation
 	c.activeMu.RUnlock()
 	if !resumed {
@@ -350,7 +1058,8 @@ func TestSuccessfulRefreshCommitsNewlyExcludedAnswerThenStops(t *testing.T) {
 	c.activeMu.RUnlock()
 	c.runActiveRefreshTask(&activeRefreshWork{
 		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: old.item,
-		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: old.item.generation},
+		epoch: c.refreshEpoch.Load(), activityEpoch: old.item.activityState().refreshEpoch(),
+		flight: refreshFlightKey{k: k, generation: old.item.generation},
 	})
 	current, _, ok := c.backend.Get(k)
 	if !ok || current == old.item {
@@ -378,7 +1087,8 @@ func TestActiveRefreshFailureUsesDynamicRetry(t *testing.T) {
 	c.activeMu.RUnlock()
 	work := &activeRefreshWork{
 		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: old.item,
-		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: old.item.generation},
+		epoch: c.refreshEpoch.Load(), activityEpoch: old.item.activityState().refreshEpoch(),
+		flight: refreshFlightKey{k: k, generation: old.item.generation},
 	}
 	before := time.Now()
 	c.runActiveRefreshTask(work)
@@ -408,7 +1118,8 @@ func TestInsufficientTimeSkipsRequery(t *testing.T) {
 	c.activeMu.RUnlock()
 	work := &activeRefreshWork{
 		task: task, replay: task.meta.replay, qCtx: replayContextForTest(t, task.meta), nextBase: task.meta.next, expected: p.item,
-		epoch: c.refreshEpoch.Load(), flight: refreshFlightKey{k: k, generation: p.item.generation},
+		epoch: c.refreshEpoch.Load(), activityEpoch: p.item.activityState().refreshEpoch(),
+		flight: refreshFlightKey{k: k, generation: p.item.generation},
 	}
 	c.runActiveRefreshTask(work)
 	if queries.Load() != 0 {
@@ -459,7 +1170,7 @@ func TestInactiveEntryStopsAndRealHitReactivates(t *testing.T) {
 
 	c.activeMu.Lock()
 	meta := c.activeMeta[k]
-	meta.expected.lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
+	meta.expected.activityState().lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
 	meta.task.dueAt = time.Now().Add(-time.Millisecond)
 	heap.Fix(&c.activeSchedule, meta.task.scheduleIndex)
 	c.activeMu.Unlock()
@@ -482,7 +1193,7 @@ func TestInactiveEntryStopsAndRealHitReactivates(t *testing.T) {
 	c.activeMu.RLock()
 	reactivated := c.activeMeta[k]
 	c.activeMu.RUnlock()
-	if reactivated == nil || reactivated.task == nil || p.item.refreshSuccess.Load() != 0 {
+	if reactivated == nil || reactivated.task == nil || p.item.activityState().refreshSuccesses() != 0 {
 		t.Fatalf("real cache hit did not reactivate refresh: %#v", reactivated)
 	}
 }
@@ -534,7 +1245,7 @@ func TestTrackedHitDoesNotWaitForActiveMu(t *testing.T) {
 	if meta == nil || p.item.activeMeta.Load() != meta || meta.boundGeneration.Load() != p.item.generation {
 		t.Fatalf("active handle was not published: meta=%#v handle=%#v", meta, p.item.activeMeta.Load())
 	}
-	p.item.refreshSuccess.Store(3)
+	p.item.activityState().storeRefreshSuccesses(3)
 	hitAt := time.Now()
 
 	c.activeMu.Lock()
@@ -552,10 +1263,10 @@ func TestTrackedHitDoesNotWaitForActiveMu(t *testing.T) {
 		t.Fatal("tracked cache hit waited for activeMu")
 	}
 
-	if got := p.item.refreshSuccess.Load(); got != 0 {
+	if got := p.item.activityState().refreshSuccesses(); got != 0 {
 		t.Fatalf("refresh success count after real hit = %d, want 0", got)
 	}
-	if got := time.Unix(0, p.item.lastRealAccess.Load()); got.Before(hitAt) {
+	if got := time.Unix(0, p.item.activityState().lastRealAccess.Load()); got.Before(hitAt) {
 		t.Fatalf("last access = %s, want >= %s", got, hitAt)
 	}
 }
@@ -570,7 +1281,7 @@ func TestPendingIdleSentinelExtendedByRealHitIsRequeued(t *testing.T) {
 	now := time.Now()
 	c.activeMu.Lock()
 	meta := c.activeMeta[k]
-	meta.expected.lastRealAccess.Store(now.Add(-10 * time.Second).UnixNano())
+	meta.expected.activityState().lastRealAccess.Store(now.Add(-10 * time.Second).UnixNano())
 	meta.task.dueAt = now.Add(-time.Millisecond)
 	heap.Fix(&c.activeSchedule, meta.task.scheduleIndex)
 	c.activeMu.Unlock()
@@ -618,17 +1329,17 @@ func TestOldGenerationObservationCannotDeleteNewMetadata(t *testing.T) {
 	}
 }
 
-func TestOldGenerationHandleCannotResetNewGenerationActivity(t *testing.T) {
+func TestOldGenerationHandleSharesNewGenerationActivity(t *testing.T) {
 	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
 	defer c.Close()
 
 	k, qCtx, old := seedTrackedEntry(t, c, "old-handle.example.", time.Minute, 0)
-	old.item.refreshSuccess.Store(2)
+	old.item.activityState().storeRefreshSuccesses(2)
 	newer := testPreparedA(t, qCtx.Q(), "192.0.2.2", 2*time.Minute)
 	if !c.commitPrepared(k, old.item, c.refreshEpoch.Load(), newer) {
 		t.Fatal("failed to commit newer generation")
 	}
-	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, qCtx, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, 0, qCtx, sequence.ChainWalker{})
 
 	c.activeMu.RLock()
 	meta := c.activeMeta[k]
@@ -641,12 +1352,12 @@ func TestOldGenerationHandleCannotResetNewGenerationActivity(t *testing.T) {
 	}
 
 	// Model an L1 lookup that captured the old pointer before the replacement.
-	// Its activity must remain generation-local and must not reset the current
-	// generation's consecutive refresh count.
-	newer.item.refreshSuccess.Store(2)
+	// Both physical generations share one activity lineage, so this real hit
+	// must reset the current generation's consecutive refresh count.
+	newer.item.activityState().storeRefreshSuccesses(2)
 	c.observeActiveRefresh(k, old.item, qCtx, sequence.ChainWalker{}, time.Now(), old.msg)
-	if got := newer.item.refreshSuccess.Load(); got != 2 {
-		t.Fatalf("stale generation reset current refresh count to %d", got)
+	if got := newer.item.activityState().refreshSuccesses(); got != 0 {
+		t.Fatalf("stale-pointer real hit did not reset shared refresh count: got=%d", got)
 	}
 	if newer.item.activeMeta.Load() != meta || meta.boundGeneration.Load() != newer.item.generation {
 		t.Fatal("stale generation disturbed the current active handle")
@@ -664,33 +1375,37 @@ func TestGenerationHandoffPreservesRealHitBeforeHandleDetach(t *testing.T) {
 	if !c.commitPrepared(k, old.item, c.refreshEpoch.Load(), newer) {
 		t.Fatal("failed to commit newer generation")
 	}
-	committedAccess := newer.item.lastRealAccess.Load()
+	committedAccess := newer.item.activityState().lastRealAccess.Load()
+	activityEpoch := newer.item.activityState().refreshEpoch()
 	hitAt := time.Now().Add(time.Millisecond)
 	// The backend and L1 already contain newer, but an in-progress L1 hit may
 	// still hold old until the metadata handoff detaches its handle.
 	c.observeActiveRefresh(k, old.item, qCtx, sequence.ChainWalker{}, hitAt, old.msg)
-	if old.item.lastRealAccess.Load() <= committedAccess {
+	if old.item.activityState().lastRealAccess.Load() <= committedAccess {
 		t.Fatal("test hit did not advance old generation activity")
 	}
 
-	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, true, qCtx, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, true, activityEpoch, qCtx, sequence.ChainWalker{})
 	c.activeMu.RLock()
 	meta := c.activeMeta[k]
 	c.activeMu.RUnlock()
 	if meta == nil || meta.expected != newer.item || meta.task == nil || meta.stopped.Load() {
 		t.Fatalf("handoff hit was lost and stopped the new generation: %#v", meta)
 	}
-	if got := newer.item.refreshSuccess.Load(); got != 0 {
+	if got := newer.item.activityState().refreshSuccesses(); got != 0 {
 		t.Fatalf("new generation refresh count = %d, want reset by real hit", got)
 	}
-	if got := newer.item.lastRealAccess.Load(); got < hitAt.UnixNano() {
+	if got := newer.item.activityState().lastRealAccess.Load(); got < hitAt.UnixNano() {
 		t.Fatalf("new generation last access = %d, want >= %d", got, hitAt.UnixNano())
 	}
 }
 
-func TestMetadataCapPinsGenerationHandoff(t *testing.T) {
+func TestLegacyMetadataCapPinsGenerationHandoff(t *testing.T) {
 	c := newDormantActiveCache(t, &Args{Size: 1}, Opts{})
 	defer c.Close()
+	if c.activeRefreshTrackingPolicyEnabled() {
+		t.Fatal("legacy metadata cap test enabled the tracking policy")
+	}
 
 	k1, qCtx1, old := seedTrackedEntry(t, c, "handoff-pinned.example.", time.Minute, 0)
 	newer := testPreparedA(t, qCtx1.Q(), "192.0.2.2", 2*time.Minute)
@@ -721,7 +1436,7 @@ func TestMetadataCapPinsGenerationHandoff(t *testing.T) {
 	if pinned == nil || pinned.expected != old.item || contenderTracked {
 		t.Fatalf("cap evicted handoff metadata: pinned=%#v contenderTracked=%v", pinned, contenderTracked)
 	}
-	c.updateActiveRefreshAfterCommit(k1, old.item, newer.item, time.Now(), newer.msg, false, qCtx1, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k1, old.item, newer.item, time.Now(), newer.msg, false, 0, qCtx1, sequence.ChainWalker{})
 	c.activeMu.RLock()
 	handedOff := c.activeMeta[k1]
 	metaLen := len(c.activeMeta)
@@ -731,9 +1446,12 @@ func TestMetadataCapPinsGenerationHandoff(t *testing.T) {
 	}
 }
 
-func TestMetadataCapPinsInflightAndDispatchedTask(t *testing.T) {
+func TestLegacyMetadataCapPinsInflightAndDispatchedTask(t *testing.T) {
 	c := newDormantActiveCache(t, &Args{Size: 1}, Opts{})
 	defer c.Close()
+	if c.activeRefreshTrackingPolicyEnabled() {
+		t.Fatal("legacy metadata cap test enabled the tracking policy")
+	}
 
 	k, _, p := seedTrackedEntry(t, c, "inflight-meta-pinned.example.", time.Minute, 0)
 	flight := refreshFlightKey{k: k, generation: p.item.generation}
@@ -762,8 +1480,31 @@ func TestMetadataCapPinsInflightAndDispatchedTask(t *testing.T) {
 	}
 }
 
-func TestMetadataEvictionHeapUsesLeastUrgentOrder(t *testing.T) {
-	c := newDormantActiveCache(t, &Args{Size: 4096}, Opts{})
+func TestActiveRefreshLegacyEvictsLatestExpiration(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 3}, Opts{})
+	defer c.Close()
+	if c.activeRefreshTrackingPolicyEnabled() {
+		t.Fatal("tracking policy unexpectedly enabled without its six fields")
+	}
+
+	k1, _, _ := seedTrackedEntry(t, c, "legacy-urgent.example.", time.Hour, 0)
+	k2, _, _ := seedTrackedEntry(t, c, "legacy-least-urgent.example.", 3*time.Hour, 0)
+	k3, _, _ := seedTrackedEntry(t, c, "legacy-middle.example.", 2*time.Hour, 0)
+	c.activeMu.Lock()
+	evicted := c.evictLeastUrgentMetaLocked()
+	_, has1 := c.activeMeta[k1]
+	_, has2 := c.activeMeta[k2]
+	_, has3 := c.activeMeta[k3]
+	c.activeMu.Unlock()
+	if !evicted || !has1 || has2 || !has3 {
+		t.Fatalf("legacy latest-expiration eviction: evicted=%v present=%v/%v/%v", evicted, has1, has2, has3)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestMetadataEvictionClockStartsWithOldestSegment(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(3)
+	c := newDormantActiveCache(t, &Args{Size: 4096, ActiveRefresh: policy}, Opts{})
 	defer c.Close()
 
 	k1, _, _ := seedTrackedEntry(t, c, "eviction-one.example.", time.Hour, 0)
@@ -771,23 +1512,35 @@ func TestMetadataEvictionHeapUsesLeastUrgentOrder(t *testing.T) {
 	k3, _, _ := seedTrackedEntry(t, c, "eviction-three.example.", 3*time.Hour, 0)
 	assertActiveEvictionInvariant(t, c)
 
-	// Keep the backend roomy while exercising the metadata admission cap.
-	c.args.Size = 3
+	// Keep the backend roomy while exercising the independent metadata cap.
 	c.activeMu.Lock()
+	commonHeatAt := time.Now()
+	for _, meta := range c.activeMeta {
+		meta.referenced.Store(false)
+		meta.heat = 1
+		meta.heatAt = commonHeatAt
+		meta.heatObserved = meta.expected.activityState().realAccessCount.Load()
+	}
 	evicted := c.evictLeastUrgentMetaLocked()
 	_, has1 := c.activeMeta[k1]
 	_, has2 := c.activeMeta[k2]
 	_, has3 := c.activeMeta[k3]
 	c.activeMu.Unlock()
-	if !evicted || !has1 || !has2 || has3 {
-		t.Fatalf("least-urgent eviction: evicted=%v present=%v/%v/%v", evicted, has1, has2, has3)
+	if !evicted || has1 || !has2 || !has3 {
+		t.Fatalf("oldest CLOCK segment eviction: evicted=%v present=%v/%v/%v", evicted, has1, has2, has3)
 	}
 	assertActiveEvictionInvariant(t, c)
 }
 
-func TestMetadataEvictionHeapFixesGenerationHandoff(t *testing.T) {
-	c := newDormantActiveCache(t, &Args{Size: 4096}, Opts{})
+func TestLegacyMetadataEvictionHeapFixesGenerationHandoff(t *testing.T) {
+	// Keep the backend roomy while seeding. With a cache size below the shard
+	// count, two deterministic keys may hash to the same one-entry shard and
+	// make this metadata test depend on the process-random maphash seed.
+	c := newDormantActiveCache(t, &Args{Size: 2 * shardCount}, Opts{})
 	defer c.Close()
+	if c.activeRefreshTrackingPolicyEnabled() {
+		t.Fatal("legacy eviction heap test enabled the tracking policy")
+	}
 
 	k1, qCtx1, old := seedTrackedEntry(t, c, "eviction-handoff.example.", time.Hour, 0)
 	k2, _, _ := seedTrackedEntry(t, c, "eviction-other.example.", 2*time.Hour, 0)
@@ -795,9 +1548,11 @@ func TestMetadataEvictionHeapFixesGenerationHandoff(t *testing.T) {
 	if !c.commitPrepared(k1, old.item, c.refreshEpoch.Load(), newer) {
 		t.Fatal("failed to commit handoff generation")
 	}
-	c.updateActiveRefreshAfterCommit(k1, old.item, newer.item, time.Now(), newer.msg, false, qCtx1, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k1, old.item, newer.item, time.Now(), newer.msg, false, 0, qCtx1, sequence.ChainWalker{})
 	assertActiveEvictionInvariant(t, c)
 
+	// Legacy metadata capacity follows args.Size. Tighten it only after both
+	// backend entries and the generation handoff are established.
 	c.args.Size = 2
 	c.activeMu.Lock()
 	evicted := c.evictLeastUrgentMetaLocked()
@@ -810,10 +1565,13 @@ func TestMetadataEvictionHeapFixesGenerationHandoff(t *testing.T) {
 	assertActiveEvictionInvariant(t, c)
 }
 
-func TestMetadataEvictionProbeBudgetIsBounded(t *testing.T) {
+func TestLegacyMetadataEvictionProbeBudgetIsBounded(t *testing.T) {
 	const entries = activeRefreshEvictionProbes + 6
-	c := newDormantActiveCache(t, &Args{Size: 8192}, Opts{})
+	c := newDormantActiveCache(t, &Args{Size: entries}, Opts{})
 	defer c.Close()
+	if c.activeRefreshTrackingPolicyEnabled() {
+		t.Fatal("legacy eviction budget test enabled the tracking policy")
+	}
 
 	flights := make([]refreshFlightKey, 0, entries)
 	for i := 0; i < entries; i++ {
@@ -822,7 +1580,6 @@ func TestMetadataEvictionProbeBudgetIsBounded(t *testing.T) {
 		c.refreshInFlight.Store(flight, struct{}{})
 		flights = append(flights, flight)
 	}
-	c.args.Size = entries
 	c.activeMu.Lock()
 	evicted := c.evictLeastUrgentMetaLocked()
 	remaining := len(c.activeMeta)
@@ -848,6 +1605,47 @@ func TestMetadataEvictionProbeBudgetIsBounded(t *testing.T) {
 	}
 	for _, flight := range flights {
 		c.refreshInFlight.Delete(flight)
+	}
+	assertActiveEvictionInvariant(t, c)
+}
+
+func TestMetadataEvictionClockAdvancesPastPinnedSegment(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(3)
+	policy.EvictionScanLimit = 2
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+
+	var pinned []refreshFlightKey
+	for i := 0; i < 3; i++ {
+		k, _, p := seedTrackedEntry(t, c, "clock-rotation-"+strconv.Itoa(i)+".example.", time.Hour, 0)
+		p.item.activityState().realAccessCount.Store(1)
+		if i < 2 {
+			flight := refreshFlightKey{k: k, generation: p.item.generation}
+			c.refreshInFlight.Store(flight, struct{}{})
+			pinned = append(pinned, flight)
+		}
+	}
+	c.activeMu.Lock()
+	for _, meta := range c.activeMeta {
+		meta.referenced.Store(false)
+		meta.heat = 1
+		meta.heatAt = time.Now()
+		meta.heatObserved = meta.expected.activityState().realAccessCount.Load()
+	}
+	first := c.evictLeastUrgentMetaLocked()
+	firstRemaining := len(c.activeMeta)
+	second := c.evictLeastUrgentMetaLocked()
+	secondRemaining := len(c.activeMeta)
+	c.activeMu.Unlock()
+	for _, flight := range pinned {
+		c.refreshInFlight.Delete(flight)
+	}
+
+	if first || firstRemaining != 3 {
+		t.Fatalf("first bounded scan unexpectedly evicted: evicted=%v remaining=%d", first, firstRemaining)
+	}
+	if !second || secondRemaining != 2 {
+		t.Fatalf("CLOCK did not advance beyond pinned segment: evicted=%v remaining=%d", second, secondRemaining)
 	}
 	assertActiveEvictionInvariant(t, c)
 }
@@ -893,7 +1691,7 @@ func TestOutOfOrderBackendRemovalHintPreservesHandoff(t *testing.T) {
 	if preserved == nil || preserved.expected != old.item {
 		t.Fatalf("out-of-order removal destroyed handoff metadata: %#v", preserved)
 	}
-	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, qCtx, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, 0, qCtx, sequence.ChainWalker{})
 	c.activeMu.RLock()
 	handedOff := c.activeMeta[k]
 	c.activeMu.RUnlock()
@@ -1047,7 +1845,7 @@ func TestMetadataHandoffRecoversEvictedContainer(t *testing.T) {
 	c.removeActiveMetaLocked(k, c.activeMeta[k])
 	c.activeMu.Unlock()
 
-	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, qCtx, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k, old.item, newer.item, time.Now(), newer.msg, false, 0, qCtx, sequence.ChainWalker{})
 	c.activeMu.RLock()
 	recovered := c.activeMeta[k]
 	c.activeMu.RUnlock()
@@ -1077,7 +1875,7 @@ func TestActiveRefreshHandoffUsesExistingReplayWhenNewSnapshotFails(t *testing.T
 		t.Fatal("failed to commit replacement generation")
 	}
 	newerAccess := time.Now().Add(time.Second).UnixNano()
-	newer.item.lastRealAccess.Store(newerAccess)
+	newer.item.activityState().lastRealAccess.Store(newerAccess)
 
 	// A foreground request whose DNS message cannot be packed has no new replay
 	// snapshot. The existing immutable template must still hand off to the new
@@ -1095,7 +1893,7 @@ func TestActiveRefreshHandoffUsesExistingReplayWhenNewSnapshotFails(t *testing.T
 	if old.item.activeMeta.Load() != nil || newer.item.activeMeta.Load() != handedOff {
 		t.Fatal("generation handles were not transferred to the committed item")
 	}
-	if got := newer.item.lastRealAccess.Load(); got != newerAccess {
+	if got := newer.item.activityState().lastRealAccess.Load(); got != newerAccess {
 		t.Fatalf("adoption overwrote newer concurrent activity: got %d, want %d", got, newerAccess)
 	}
 	assertActiveEvictionInvariant(t, c)
@@ -1106,7 +1904,10 @@ func TestActiveRefreshReplayAdoptionCrossesFallbackDerivative(t *testing.T) {
 	defer c.Close()
 
 	k, qCtx, old := seedTrackedEntry(t, c, "snapshot-fallback-race.example.", time.Minute, 0)
-	old.item.refreshSuccess.Store(7)
+	old.item.activityState().storeRefreshSuccesses(7)
+	if !c.recordActiveRefreshActivity(old.item, time.Now(), 1) {
+		t.Fatal("foreground real hit was not recorded")
+	}
 	c.activeMu.RLock()
 	originalReplay := c.activeMeta[k].replay
 	c.activeMu.RUnlock()
@@ -1117,7 +1918,7 @@ func TestActiveRefreshReplayAdoptionCrossesFallbackDerivative(t *testing.T) {
 	if !c.commitPrepared(k, old.item, epoch, stale) {
 		t.Fatal("failed to install fallback derivative")
 	}
-	c.updateActiveRefreshAfterCommit(k, old.item, stale.item, time.Now(), stale.msg, false, qCtx, sequence.ChainWalker{})
+	c.updateActiveRefreshAfterCommit(k, old.item, stale.item, time.Now(), stale.msg, false, 0, qCtx, sequence.ChainWalker{})
 	c.activeMu.RLock()
 	staleMeta := c.activeMeta[k]
 	c.activeMu.RUnlock()
@@ -1143,7 +1944,7 @@ func TestActiveRefreshReplayAdoptionCrossesFallbackDerivative(t *testing.T) {
 	if stale.item.activeMeta.Load() != nil || fresh.item.activeMeta.Load() != handedOff {
 		t.Fatal("fallback generation handle was not transferred")
 	}
-	if got := fresh.item.refreshSuccess.Load(); got != 0 {
+	if got := fresh.item.activityState().refreshSuccesses(); got != 0 {
 		t.Fatalf("foreground adoption inherited refresh-success count %d", got)
 	}
 	assertActiveEvictionInvariant(t, c)
@@ -1298,7 +2099,7 @@ func TestActiveRefreshReplayAdoptionFromTrackedTransient(t *testing.T) {
 	if transient.item.activeMeta.Load() != nil || healthy.item.activeMeta.Load() != handedOff {
 		t.Fatal("transient generation handle was not transferred")
 	}
-	if got := healthy.item.refreshSuccess.Load(); got != 0 {
+	if got := healthy.item.activityState().refreshSuccesses(); got != 0 {
 		t.Fatalf("healthy foreground entry inherited refresh-success count %d", got)
 	}
 	assertActiveEvictionInvariant(t, c)
@@ -1370,7 +2171,7 @@ func TestActiveRefreshHandoffReusesPristineReplaySnapshot(t *testing.T) {
 	}
 	c.runActiveRefreshTask(&activeRefreshWork{
 		task: task, replay: replay, qCtx: qCtx, nextBase: nextBase,
-		expected: old.item, epoch: c.refreshEpoch.Load(),
+		expected: old.item, epoch: c.refreshEpoch.Load(), activityEpoch: old.item.activityState().refreshEpoch(),
 		flight: refreshFlightKey{k: k, generation: old.item.generation},
 	})
 
@@ -1404,11 +2205,11 @@ func TestConcurrentRealHitCannotBeLostByStopDecision(t *testing.T) {
 			heap.Remove(&c.activeSchedule, task.scheduleIndex)
 		}
 		if i%2 == 0 {
-			meta.expected.lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
-			meta.expected.refreshSuccess.Store(0)
+			meta.expected.activityState().lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
+			meta.expected.activityState().storeRefreshSuccesses(0)
 		} else {
-			meta.expected.lastRealAccess.Store(time.Now().UnixNano())
-			meta.expected.refreshSuccess.Store(1)
+			meta.expected.activityState().lastRealAccess.Store(time.Now().UnixNano())
+			meta.expected.activityState().storeRefreshSuccesses(1)
 		}
 		c.activeMu.Unlock()
 
@@ -1432,7 +2233,7 @@ func TestConcurrentRealHitCannotBeLostByStopDecision(t *testing.T) {
 		c.activeMu.RLock()
 		currentMeta := c.activeMeta[k]
 		valid := currentMeta != nil && currentMeta.expected == p.item && currentMeta.task != nil &&
-			!currentMeta.stopped.Load() && p.item.refreshSuccess.Load() == 0 &&
+			!currentMeta.stopped.Load() && p.item.activityState().refreshSuccesses() == 0 &&
 			p.item.activeMeta.Load() == currentMeta && currentMeta.boundGeneration.Load() == p.item.generation
 		c.activeMu.RUnlock()
 		if !valid {
@@ -1454,14 +2255,14 @@ func TestExcludedRealHitStillUpdatesPersistedActivity(t *testing.T) {
 	if !c.commitPrepared(k, nil, 0, p) {
 		t.Fatal("failed to seed excluded entry")
 	}
-	p.item.lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
-	p.item.refreshSuccess.Store(7)
+	p.item.activityState().lastRealAccess.Store(time.Now().Add(-time.Hour).UnixNano())
+	p.item.activityState().storeRefreshSuccesses(7)
 	hitAt := time.Now()
 	c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, hitAt, p.msg)
-	if got := time.Unix(0, p.item.lastRealAccess.Load()); got.Before(hitAt) {
+	if got := time.Unix(0, p.item.activityState().lastRealAccess.Load()); got.Before(hitAt) {
 		t.Fatalf("last real access = %s, want >= %s", got, hitAt)
 	}
-	if got := p.item.refreshSuccess.Load(); got != 0 {
+	if got := p.item.activityState().refreshSuccesses(); got != 0 {
 		t.Fatalf("consecutive refresh successes = %d, want 0", got)
 	}
 	c.activeMu.RLock()
@@ -1824,8 +2625,8 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	source.activeMu.RLock()
 	sourceMeta := source.activeMeta[k]
 	source.activeMu.RUnlock()
-	sourceMeta.expected.lastRealAccess.Store(time.Now().Add(-time.Minute).UnixNano())
-	sourceMeta.expected.refreshSuccess.Store(2)
+	sourceMeta.expected.activityState().lastRealAccess.Store(time.Now().Add(-time.Minute).UnixNano())
+	sourceMeta.expected.activityState().storeRefreshSuccesses(2)
 
 	buf := new(bytes.Buffer)
 	if n, err := source.writeDump(buf); err != nil || n != 1 {
@@ -1856,10 +2657,10 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	if meta == nil || meta.task == nil || meta.expected == nil || meta.expected.generation == 0 {
 		t.Fatalf("restored metadata is incomplete: %#v", meta)
 	}
-	if got := meta.expected.refreshSuccess.Load(); got != 2 {
+	if got := meta.expected.activityState().refreshSuccesses(); got != 2 {
 		t.Fatalf("restored consecutive refreshes = %d, want 2", got)
 	}
-	if got := time.Unix(0, meta.expected.lastRealAccess.Load()); time.Since(got) < 50*time.Second || time.Since(got) > 70*time.Second {
+	if got := time.Unix(0, meta.expected.activityState().lastRealAccess.Load()); time.Since(got) < 50*time.Second || time.Since(got) > 70*time.Second {
 		t.Fatalf("restored last access = %s", got)
 	}
 	replayCtx := replayContextForTest(t, meta)
@@ -1983,7 +2784,7 @@ func TestRestoreActiveRefreshEntriesHonorsMetadataCap(t *testing.T) {
 		p := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
 		p.item.generation = c.generation.Add(1)
 		lastAccess := time.Now().Add(-time.Minute)
-		p.item.lastRealAccess.Store(lastAccess.UnixNano())
+		p.item.activityState().lastRealAccess.Store(lastAccess.UnixNano())
 		c.backend.Store(k, p.item, p.cacheExpiration)
 		entries = append(entries, decodedDumpEntry{
 			k: k, item: p.item, cacheExpiration: p.cacheExpiration, lastRealAccess: lastAccess,
@@ -2018,7 +2819,7 @@ func TestRestoreDoesNotOverwriteConcurrentMetadata(t *testing.T) {
 	k, qCtx, old := seedTrackedEntry(t, c, "restore-concurrent.example.", time.Hour, 0)
 	c.activeMu.RLock()
 	originalMeta := c.activeMeta[k]
-	originalAccess := originalMeta.expected.lastRealAccess.Load()
+	originalAccess := originalMeta.expected.activityState().lastRealAccess.Load()
 	c.activeMu.RUnlock()
 	oldEntry := decodedDumpEntry{
 		k: k, item: old.item, cacheExpiration: old.cacheExpiration,
@@ -2028,7 +2829,7 @@ func TestRestoreDoesNotOverwriteConcurrentMetadata(t *testing.T) {
 	c.activeMu.RLock()
 	preserved := c.activeMeta[k]
 	c.activeMu.RUnlock()
-	if preserved != originalMeta || preserved.expected.lastRealAccess.Load() != originalAccess || preserved.expected.refreshSuccess.Load() != 0 {
+	if preserved != originalMeta || preserved.expected.activityState().lastRealAccess.Load() != originalAccess || preserved.expected.activityState().refreshSuccesses() != 0 {
 		t.Fatalf("restore overwrote newer same-generation activity: %#v", preserved)
 	}
 

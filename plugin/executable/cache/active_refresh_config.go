@@ -17,10 +17,54 @@ var removedActiveRefreshFields = map[string]string{
 	"refresh_sequence":     "active_refresh.refresh_sequence has been removed; the cache continuation is now bound automatically by sequence",
 }
 
+var activeRefreshTrackingPolicyFields = [...]string{
+	"max_tracked_entries",
+	"admission_hits",
+	"admission_window",
+	"heat_half_life",
+	"protected_ratio",
+	"eviction_scan_limit",
+}
+
+func validateActiveRefreshTrackingPolicyPresence(present map[string]bool) (bool, error) {
+	configured := 0
+	missing := make([]string, 0, len(activeRefreshTrackingPolicyFields))
+	for _, field := range activeRefreshTrackingPolicyFields {
+		if present[field] {
+			configured++
+		} else {
+			missing = append(missing, "active_refresh."+field)
+		}
+	}
+	if configured == 0 {
+		return false, nil
+	}
+	if configured != len(activeRefreshTrackingPolicyFields) {
+		return false, fmt.Errorf(
+			"active_refresh tracking policy fields must be configured together; missing: %s",
+			strings.Join(missing, ", "),
+		)
+	}
+	return true, nil
+}
+
 // ValidateRawConfig runs before mapstructure decoding. It provides explicit
 // migration errors for removed fields and preserves whether zero-valued fields
 // such as max_retry_times and max_idle_time were intentionally configured.
 func (a *Args) ValidateRawConfig(raw any) error {
+	// WeakDecode may reuse a destination. Clear presence-sensitive state and
+	// values before inspecting the new input so an earlier opt-in cannot leak
+	// into a later configuration that omits the policy group.
+	a.ActiveRefresh.maxRetryTimesConfigured = false
+	a.ActiveRefresh.maxIdleTimeConfigured = false
+	a.ActiveRefresh.trackingPolicyConfigured = false
+	a.ActiveRefresh.MaxTrackedEntries = 0
+	a.ActiveRefresh.AdmissionHits = 0
+	a.ActiveRefresh.AdmissionWindow = 0
+	a.ActiveRefresh.HeatHalfLife = 0
+	a.ActiveRefresh.ProtectedRatio = 0
+	a.ActiveRefresh.EvictionScanLimit = 0
+
 	root, ok := rawStringMap(raw)
 	if !ok {
 		return nil
@@ -33,6 +77,15 @@ func (a *Args) ValidateRawConfig(raw any) error {
 	if !ok {
 		return nil
 	}
+	present := make(map[string]bool, len(activeRefreshTrackingPolicyFields))
+	for _, field := range activeRefreshTrackingPolicyFields {
+		_, present[field] = active[field]
+	}
+	trackingConfigured, err := validateActiveRefreshTrackingPolicyPresence(present)
+	if err != nil {
+		return err
+	}
+	a.ActiveRefresh.trackingPolicyConfigured = trackingConfigured
 	for _, field := range []string{"interval", "min_refresh_interval", "max_entries_per_scan", "refresh_sequence"} {
 		if _, exists := active[field]; exists {
 			return fmt.Errorf("%s", removedActiveRefreshFields[field])
@@ -47,6 +100,8 @@ func (a *Args) ValidateRawConfig(raw any) error {
 	for _, field := range []string{
 		"threshold", "requery_timeout_ms", "workers", "max_refresh_qps",
 		"refresh_burst", "max_tasks_per_batch", "max_pending_tasks",
+		"max_tracked_entries", "admission_hits", "admission_window",
+		"heat_half_life", "protected_ratio", "eviction_scan_limit",
 	} {
 		if value, exists := active[field]; exists {
 			n, err := rawNumber(value)
@@ -55,6 +110,9 @@ func (a *Args) ValidateRawConfig(raw any) error {
 			}
 			if n <= 0 {
 				return fmt.Errorf("active_refresh.%s must be greater than 0", field)
+			}
+			if field == "protected_ratio" && n > 100 {
+				return fmt.Errorf("active_refresh.protected_ratio must not exceed 100")
 			}
 		}
 	}
@@ -154,6 +212,12 @@ func validateActiveRefreshBeforeDefaults(a *ActiveRefreshArgs) error {
 		"max_retry_times":     float64(a.MaxRetryTimes),
 		"max_refresh_times":   float64(a.MaxRefreshTimes),
 		"max_idle_time":       float64(a.MaxIdleTime),
+		"max_tracked_entries": float64(a.MaxTrackedEntries),
+		"admission_hits":      float64(a.AdmissionHits),
+		"admission_window":    float64(a.AdmissionWindow),
+		"heat_half_life":      float64(a.HeatHalfLife),
+		"protected_ratio":     float64(a.ProtectedRatio),
+		"eviction_scan_limit": float64(a.EvictionScanLimit),
 	} {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return fmt.Errorf("active_refresh.%s must be finite", field)
@@ -162,6 +226,22 @@ func validateActiveRefreshBeforeDefaults(a *ActiveRefreshArgs) error {
 			return fmt.Errorf("active_refresh.%s must be greater than or equal to 0", field)
 		}
 	}
+	if a.trackingPolicyConfigured {
+		return nil
+	}
+	present := map[string]bool{
+		"max_tracked_entries": a.MaxTrackedEntries != 0,
+		"admission_hits":      a.AdmissionHits != 0,
+		"admission_window":    a.AdmissionWindow != 0,
+		"heat_half_life":      a.HeatHalfLife != 0,
+		"protected_ratio":     a.ProtectedRatio != 0,
+		"eviction_scan_limit": a.EvictionScanLimit != 0,
+	}
+	configured, err := validateActiveRefreshTrackingPolicyPresence(present)
+	if err != nil {
+		return err
+	}
+	a.trackingPolicyConfigured = configured
 	return nil
 }
 
@@ -195,17 +275,49 @@ func validateActiveRefreshArgs(a *ActiveRefreshArgs) error {
 	case a.MaxIdleTime < 0:
 		return fmt.Errorf("active_refresh.max_idle_time must be greater than or equal to 0")
 	}
+	if !a.trackingPolicyConfigured {
+		return nil
+	}
+	switch {
+	case a.MaxTrackedEntries <= 0:
+		return fmt.Errorf("active_refresh.max_tracked_entries must be greater than 0")
+	case a.AdmissionHits <= 0:
+		return fmt.Errorf("active_refresh.admission_hits must be greater than 0")
+	case a.AdmissionWindow <= 0:
+		return fmt.Errorf("active_refresh.admission_window must be greater than 0")
+	case a.HeatHalfLife <= 0:
+		return fmt.Errorf("active_refresh.heat_half_life must be greater than 0")
+	case a.ProtectedRatio <= 0 || a.ProtectedRatio > 100:
+		return fmt.Errorf("active_refresh.protected_ratio must be between 1 and 100")
+	case a.EvictionScanLimit <= 0:
+		return fmt.Errorf("active_refresh.eviction_scan_limit must be greater than 0")
+	}
 	return nil
 }
 
-func validateActiveRefreshYAMLNode(node *yaml.Node) (maxRetryConfigured, maxIdleConfigured bool, err error) {
+func validateActiveRefreshYAMLNode(node *yaml.Node) (maxRetryConfigured, maxIdleConfigured, trackingConfigured bool, err error) {
 	if node == nil || node.Kind != yaml.MappingNode {
-		return false, false, nil
+		return false, false, false, nil
 	}
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		field := strings.ToLower(node.Content[i].Value)
+	var decoded any
+	if decodeErr := node.Decode(&decoded); decodeErr != nil {
+		return false, false, false, decodeErr
+	}
+	active, ok := rawStringMap(decoded)
+	if !ok {
+		return false, false, false, fmt.Errorf("active_refresh must be a mapping")
+	}
+	present := make(map[string]bool, len(activeRefreshTrackingPolicyFields))
+	for _, field := range activeRefreshTrackingPolicyFields {
+		_, present[field] = active[field]
+	}
+	trackingConfigured, err = validateActiveRefreshTrackingPolicyPresence(present)
+	if err != nil {
+		return false, false, false, err
+	}
+	for field, raw := range active {
 		if message, removed := removedActiveRefreshFields[field]; removed {
-			return false, false, fmt.Errorf("%s", message)
+			return false, false, false, fmt.Errorf("%s", message)
 		}
 		if field == "max_retry_times" {
 			maxRetryConfigured = true
@@ -213,27 +325,29 @@ func validateActiveRefreshYAMLNode(node *yaml.Node) (maxRetryConfigured, maxIdle
 		if field == "max_idle_time" {
 			maxIdleConfigured = true
 		}
-		valueNode := node.Content[i+1]
 		strictlyPositive := field == "threshold" || field == "requery_timeout_ms" ||
 			field == "workers" || field == "max_refresh_qps" || field == "refresh_burst" ||
-			field == "max_tasks_per_batch" || field == "max_pending_tasks"
-		nonNegative := field == "max_retry_times" || field == "max_refresh_times" || field == "max_idle_time"
+			field == "max_tasks_per_batch" || field == "max_pending_tasks" ||
+			field == "max_tracked_entries" || field == "admission_hits" || field == "admission_window" ||
+			field == "heat_half_life" || field == "protected_ratio" ||
+			field == "eviction_scan_limit"
+		nonNegative := field == "max_retry_times" || field == "max_refresh_times" ||
+			field == "max_idle_time"
 		if strictlyPositive || nonNegative {
-			var raw any
-			if decodeErr := valueNode.Decode(&raw); decodeErr != nil {
-				return false, false, fmt.Errorf("active_refresh.%s must be a number: %w", field, decodeErr)
-			}
 			n, numberErr := rawNumber(raw)
 			if numberErr != nil {
-				return false, false, fmt.Errorf("active_refresh.%s must be a finite number", field)
+				return false, false, false, fmt.Errorf("active_refresh.%s must be a finite number", field)
 			}
 			if strictlyPositive && n <= 0 {
-				return false, false, fmt.Errorf("active_refresh.%s must be greater than 0", field)
+				return false, false, false, fmt.Errorf("active_refresh.%s must be greater than 0", field)
 			}
 			if nonNegative && n < 0 {
-				return false, false, fmt.Errorf("active_refresh.%s must be greater than or equal to 0", field)
+				return false, false, false, fmt.Errorf("active_refresh.%s must be greater than or equal to 0", field)
+			}
+			if field == "protected_ratio" && n > 100 {
+				return false, false, false, fmt.Errorf("active_refresh.protected_ratio must not exceed 100")
 			}
 		}
 	}
-	return maxRetryConfigured, maxIdleConfigured, nil
+	return maxRetryConfigured, maxIdleConfigured, trackingConfigured, nil
 }
