@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -53,11 +54,12 @@ const (
 	defaultLazyUpdateTimeout = time.Second * 5
 	expiredMsgTtl            = 5
 
-	minimumChangesToDump   = 1024
-	dumpHeader             = "mosdns_cache_v3"
-	dumpBlockSize          = 128
-	dumpMaximumBlockLength = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
-	dumpMaximumTotalLength = 256 << 20
+	minimumChangesToDump          = 1024
+	dumpHeader                    = "mosdns_cache_v3"
+	dumpBlockSize                 = 128
+	dumpMaximumBlockLength        = 1 << 20 // 1M block. 8kb pre entry. Should be enough.
+	dumpMaximumTotalLength        = 256 << 20
+	activeRefreshDumpStateVersion = 1
 
 	shardCount = 256   // 256分段锁，平衡锁竞争与内存开销
 	l1TotalCap = 51200 // L1 总容量限制
@@ -325,7 +327,6 @@ func (a *FallbackProbeArgs) UnmarshalYAML(node *yaml.Node) error {
 
 type ActiveRefreshArgs struct {
 	Enabled          bool    `yaml:"enabled"`
-	RestoreOnStartup bool    `yaml:"restore_on_startup"`
 	Threshold        int     `yaml:"threshold"`
 	RequeryTimeoutMS int     `yaml:"requery_timeout_ms"`
 	Workers          int     `yaml:"workers"`
@@ -358,7 +359,6 @@ type ActiveRefreshArgs struct {
 
 type activeRefreshArgsRaw struct {
 	Enabled           bool                    `yaml:"enabled"`
-	RestoreOnStartup  bool                    `yaml:"restore_on_startup"`
 	Threshold         int                     `yaml:"threshold"`
 	RequeryTimeoutMS  int                     `yaml:"requery_timeout_ms"`
 	Workers           int                     `yaml:"workers"`
@@ -406,7 +406,6 @@ func (a *ActiveRefreshArgs) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	a.Enabled = raw.Enabled
-	a.RestoreOnStartup = raw.RestoreOnStartup
 	a.Threshold = raw.Threshold
 	a.RequeryTimeoutMS = raw.RequeryTimeoutMS
 	a.Workers = raw.Workers
@@ -539,12 +538,25 @@ type preparedCacheEntry struct {
 	msg             *dns.Msg
 }
 
+// restoredPopularityState is shared by queued, in-flight and locally copied
+// restore entries. Dump snapshots and metadata installation therefore advance
+// one decay/count baseline even while ownership moves between those views.
+type restoredPopularityState struct {
+	mu       sync.Mutex
+	heat     float64
+	heatAt   time.Time
+	observed uint64
+}
+
 type decodedDumpEntry struct {
-	k               key
-	item            *item
-	cacheExpiration time.Time
-	lastRealAccess  time.Time
-	refreshCount    uint32
+	k                      key
+	item                   *item
+	cacheExpiration        time.Time
+	lastRealAccess         time.Time
+	refreshCount           uint32
+	popularityStatePresent bool
+	popularityTracked      bool
+	popularity             *restoredPopularityState
 }
 
 type Cache struct {
@@ -552,6 +564,7 @@ type Cache struct {
 	logger       *zap.Logger
 	backend      *cache.Cache[key, *item]
 	closeOnce    sync.Once
+	closeErr     error
 	closeNotify  chan struct{}
 	lifecycleCtx context.Context
 	cancel       context.CancelFunc
@@ -607,10 +620,12 @@ type Cache struct {
 	activeWorkerReady chan chan *activeRefreshWork
 	activeWorkers     sync.WaitGroup
 
-	activeRestoreMu   sync.Mutex
-	activeRestore     map[key]decodedDumpEntry
-	activeReplayNext  sequence.ChainWalker
-	activeReplayBound bool
+	activeRestoreMu       sync.Mutex
+	activeRestore         map[key]decodedDumpEntry
+	activeRestoreInFlight map[key]decodedDumpEntry
+	activeRestoreRunning  bool
+	activeReplayNext      sequence.ChainWalker
+	activeReplayBound     bool
 }
 
 type Opts struct {
@@ -785,6 +800,7 @@ func NewCacheWithError(args *Args, opts Opts) (*Cache, error) {
 		activeMeta:                 make(map[key]*activeRefreshMeta),
 		activeWake:                 make(chan struct{}, 1),
 		activeRestore:              make(map[key]decodedDumpEntry),
+		activeRestoreInFlight:      make(map[key]decodedDumpEntry),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name:        "query_total",
@@ -1515,18 +1531,20 @@ func (c *Cache) Close() error {
 		c.cancel()
 		close(c.closeNotify)
 		c.flushMu.Unlock()
+
+		c.lazyWorkers.Wait()
+		c.activeWorkers.Wait()
+		c.dumpLoopWG.Wait()
+		c.drainPendingRefreshTasks()
+		if err := c.dumpCacheOnClose(); err != nil {
+			c.logger.Error("failed to dump cache", zap.Error(err))
+		}
+		c.clearActiveRefreshState()
+		c.refreshInFlight.Clear()
+		c.activeRemoved.Clear()
+		c.closeErr = c.backend.Close()
 	})
-	c.lazyWorkers.Wait()
-	c.activeWorkers.Wait()
-	c.dumpLoopWG.Wait()
-	c.drainPendingRefreshTasks()
-	c.clearActiveRefreshState()
-	c.refreshInFlight.Clear()
-	c.activeRemoved.Clear()
-	if err := c.dumpCache(); err != nil {
-		c.logger.Error("failed to dump cache", zap.Error(err))
-	}
-	return c.backend.Close()
+	return c.closeErr
 }
 
 func (c *Cache) clearActiveRefreshState() {
@@ -1544,6 +1562,8 @@ func (c *Cache) clearActiveRefreshState() {
 
 	c.activeRestoreMu.Lock()
 	clear(c.activeRestore)
+	clear(c.activeRestoreInFlight)
+	c.activeRestoreRunning = false
 	c.activeReplayNext = sequence.ChainWalker{}
 	c.activeReplayBound = false
 	c.activeRestoreMu.Unlock()
@@ -1611,8 +1631,26 @@ func (c *Cache) startDumpLoop() {
 }
 
 func (c *Cache) dumpCache() error {
+	return c.dumpCacheInternal(false)
+}
+
+func (c *Cache) dumpCacheOnClose() error {
+	return c.dumpCacheInternal(true)
+}
+
+func (c *Cache) dumpCacheInternal(allowClosed bool) error {
 	c.dumpMu.Lock()
 	defer c.dumpMu.Unlock()
+	return c.persistDumpLocked(allowClosed, false)
+}
+
+// persistDumpLocked serializes file writers under dumpMu. When flushLocked is
+// true the caller also owns flushMu for writing, so the snapshot must not try
+// to acquire its normal read side again.
+func (c *Cache) persistDumpLocked(allowClosed, flushLocked bool) error {
+	if !allowClosed && c.lifecycleCtx.Err() != nil {
+		return context.Canceled
+	}
 
 	if len(c.args.DumpFile) == 0 {
 		return nil
@@ -1620,7 +1658,7 @@ func (c *Cache) dumpCache() error {
 	var en int
 	err := writeFileAtomically(c.args.DumpFile, func(f *os.File) error {
 		var err error
-		en, err = c.writeDump(f)
+		en, err = c.writeDumpInternal(f, flushLocked)
 		return err
 	})
 	if err != nil {
@@ -1635,17 +1673,37 @@ func (c *Cache) Api() *chi.Mux {
 
 	flushCache := coremain.WithAsyncGC(func(w http.ResponseWriter, req *http.Request) {
 		c.logger.Info("flushing cache via api")
+		if c.lifecycleCtx.Err() != nil {
+			http.Error(w, "cache is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		dumpConfigured := len(c.args.DumpFile) > 0
+		// Keep the global order dumpMu -> flushMu. Ordinary dumps take the same
+		// order with flushMu held for reading while they snapshot the backend.
+		if dumpConfigured {
+			c.dumpMu.Lock()
+		}
 		c.flushMu.Lock()
+		if c.lifecycleCtx.Err() != nil {
+			c.flushMu.Unlock()
+			if dumpConfigured {
+				c.dumpMu.Unlock()
+			}
+			http.Error(w, "cache is shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		c.refreshEpoch.Add(1)
 		c.backend.Flush()
-		c.clearRuntimeViews()
+		c.clearRuntimeViews(nil)
 		c.updatedKey.Store(0)
-		dumpConfigured := len(c.args.DumpFile) > 0
 		var dumpErr error
 		if dumpConfigured {
-			dumpErr = c.dumpCache()
+			dumpErr = c.persistDumpLocked(false, true)
 		}
 		c.flushMu.Unlock()
+		if dumpConfigured {
+			c.dumpMu.Unlock()
+		}
 		c.notifyActiveScheduler()
 
 		if dumpErr != nil {
@@ -1796,7 +1854,7 @@ func (c *Cache) Api() *chi.Mux {
 // clearRuntimeViews invalidates state derived from the L2 backend. The caller
 // must hold flushMu for writing so no cache commit can repopulate the views
 // halfway through the reset.
-func (c *Cache) clearRuntimeViews() {
+func (c *Cache) clearRuntimeViews(restored []decodedDumpEntry) bool {
 	for i := 0; i < shardCount; i++ {
 		c.shards[i].Lock()
 		capacity := len(c.shards[i].order)
@@ -1815,13 +1873,24 @@ func (c *Cache) clearRuntimeViews() {
 	c.activePending = nil
 	c.activeEviction = nil
 	c.activeProtected = 0
-	c.activeClockTicket = 0
-	c.activeMu.Unlock()
-	c.activeRemoved.Clear()
-
+	// Keep CLOCK tickets process-monotonic. A restore batch can reserve its
+	// final ordering before a concurrent runtime load clears these derived
+	// views; resetting here could make the surviving reservations collide with
+	// tickets allocated after the load.
 	c.activeRestoreMu.Lock()
 	clear(c.activeRestore)
+	clear(c.activeRestoreInFlight)
+	restoreEnabled := c.activeRefreshEnabled()
+	if restoreEnabled {
+		for _, entry := range restored {
+			c.activeRestore[entry.k] = entry
+		}
+	}
+	replayBound := restoreEnabled && len(restored) > 0 && c.activeReplayBound
 	c.activeRestoreMu.Unlock()
+	c.activeMu.Unlock()
+	c.activeRemoved.Clear()
+	return replayBound
 }
 
 func keyToString(k key) string {
@@ -1897,7 +1966,23 @@ func dnsMsgToString(msg *dns.Msg) string {
 	return strings.TrimSpace(msg.String()) + "\n"
 }
 
+func validActiveRefreshDumpState(state *ActiveRefreshState) bool {
+	if state == nil || state.GetVersion() != activeRefreshDumpStateVersion {
+		return false
+	}
+	start := state.GetAdmissionWindowStartUnix()
+	hits := state.GetAdmissionHits()
+	if hits == 0 {
+		return start == 0
+	}
+	return start > 0 && uint64(start) <= uint64(^uint32(0)) && uint64(hits) <= state.GetRealAccessCount()
+}
+
 func (c *Cache) writeDump(w io.Writer) (int, error) {
+	return c.writeDumpInternal(w, false)
+}
+
+func (c *Cache) writeDumpInternal(w io.Writer, flushLocked bool) (int, error) {
 	en := 0
 	gw, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
 	gw.Name = dumpHeader
@@ -1921,8 +2006,13 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 		return nil
 	}
 
+	if !flushLocked {
+		c.flushMu.RLock()
+	}
 	now := time.Now()
+	popularity := c.snapshotActiveRefreshPopularityForDump()
 	entries := make([]*CachedEntry, 0, c.backend.Len())
+	activities := make([]*activeActivity, 0, c.backend.Len())
 	rangeFunc := func(k key, v *item, cacheExpirationTime time.Time) error {
 		// A probe-retained stale answer carries an absolute in-memory age
 		// budget. Do not persist it and accidentally reset that budget after
@@ -1930,29 +2020,53 @@ func (c *Cache) writeDump(w io.Writer) (int, error) {
 		if cacheExpirationTime.Before(now) || v.isStale || v.isTransient {
 			return nil
 		}
-		activity := v.activityState()
-		lastRealAccess := activity.lastRealAccess.Load()
-		lastAccess := time.Unix(0, lastRealAccess).Unix()
-		if lastRealAccess <= 0 {
-			lastAccess = v.storedTime.Unix()
-		}
 		entries = append(entries, &CachedEntry{
-			Key:                         []byte(k),
-			CacheExpirationTime:         cacheExpirationTime.Unix(),
-			MsgExpirationTime:           v.expirationTime.Unix(),
-			MsgStoredTime:               v.storedTime.Unix(),
-			Msg:                         v.resp,
-			DomainSet:                   v.domainSet,
-			LastRealAccessTime:          lastAccess,
-			ConsecutiveRefreshSuccesses: activity.refreshSuccesses(),
+			Key:                 []byte(k),
+			CacheExpirationTime: cacheExpirationTime.Unix(),
+			MsgExpirationTime:   v.expirationTime.Unix(),
+			MsgStoredTime:       v.storedTime.Unix(),
+			Msg:                 v.resp,
+			DomainSet:           v.domainSet,
 		})
+		activities = append(activities, v.activityState())
 		return nil
 	}
-	if err := c.backend.Range(rangeFunc); err != nil {
-		return en, err
+	rangeErr := c.backend.Range(rangeFunc)
+	for i, entry := range entries {
+		activity := activities[i]
+		accessCount, admissionState := snapshotActiveAdmissionStateFromActivity(activity)
+		lastRealAccess := activity.lastRealAccess.Load()
+		entry.LastRealAccessTime = time.Unix(0, lastRealAccess).Unix()
+		if lastRealAccess <= 0 {
+			entry.LastRealAccessTime = entry.MsgStoredTime
+		}
+		entry.ConsecutiveRefreshSuccesses = activity.refreshSuccesses()
+
+		state := &ActiveRefreshState{
+			Version:                  activeRefreshDumpStateVersion,
+			RealAccessCount:          accessCount,
+			AdmissionWindowStartUnix: int64(uint32(admissionState >> 32)),
+			AdmissionHits:            uint32(admissionState),
+		}
+		if tracked, ok := popularity[activity]; ok {
+			state.Tracked = true
+			state.RealAccessCount = tracked.realAccessCount
+			state.AdmissionWindowStartUnix = int64(uint32(tracked.admissionState >> 32))
+			state.AdmissionHits = uint32(tracked.admissionState)
+			state.Heat = tracked.heat
+			state.HeatAtUnixNano = tracked.heatAt.UnixNano()
+		}
+		entry.ActiveRefreshState = state
 	}
-	// Serialize after releasing backend shard locks. A slow disk or HTTP dump
-	// consumer must not stall ordinary cache Get/Store operations.
+	if !flushLocked {
+		c.flushMu.RUnlock()
+	}
+	if rangeErr != nil {
+		_ = gw.Close()
+		return en, rangeErr
+	}
+	// Serialize after releasing backend shard locks and the flush snapshot lock.
+	// A slow disk or HTTP dump consumer must not stall ordinary cache operations.
 	for _, entry := range entries {
 		block.Entries = append(block.Entries, entry)
 		if len(block.Entries) >= dumpBlockSize {
@@ -2000,9 +2114,11 @@ func (c *Cache) readDump(r io.Reader) (int, error) {
 	}
 	// Loading is merge-compatible at L2, but any overwritten entry makes its
 	// L1 pointer and active-refresh expectation stale.
-	c.clearRuntimeViews()
+	replayBound := c.clearRuntimeViews(entries)
 	c.flushMu.Unlock()
-	c.queueRestoredActiveRefresh(entries)
+	if replayBound {
+		c.bindActiveRefreshReplay(sequence.ChainWalker{})
+	}
 	c.notifyActiveScheduler()
 	return len(entries), nil
 }
@@ -2091,8 +2207,26 @@ func (c *Cache) decodeDump(r io.Reader) ([]decodedDumpEntry, error) {
 			}
 			activity := newActiveActivity(lastRealAccess)
 			activity.storeRefreshSuccesses(entry.GetConsecutiveRefreshSuccesses())
-			activity.realAccessCount.Store(1)
-			activity.admissionState.Store(uint64(uint32(lastRealAccess.Unix()))<<32 | 1)
+			state := entry.GetActiveRefreshState()
+			statePresent := validActiveRefreshDumpState(state)
+			if statePresent {
+				activity.realAccessCount.Store(state.GetRealAccessCount())
+				windowStart := state.GetAdmissionWindowStartUnix()
+				if windowStart > now.Unix() {
+					// A dump written before a wall-clock correction must not pin an
+					// admission window in the future.
+					windowStart = now.Unix()
+				}
+				if windowStart > 0 && uint64(windowStart) <= uint64(^uint32(0)) {
+					activity.admissionState.Store(uint64(uint32(windowStart))<<32 | uint64(state.GetAdmissionHits()))
+				}
+			} else if !c.activeRefreshTrackingPolicyEnabled() {
+				// Older v3 dumps had no popularity state. Preserve their legacy
+				// immediate-admission baseline only when the explicit hot policy is
+				// not enabled. Policy mode must wait for fresh, real admission hits.
+				activity.realAccessCount.Store(1)
+				activity.admissionState.Store(uint64(uint32(lastRealAccess.Unix()))<<32 | 1)
+			}
 			i.activity.Store(activity)
 			i.upstreamOpt = copyCacheableUpstreamOPT(restored.IsEdns0())
 			if c.args.LazyCacheTTL > 0 && restored.Rcode == dns.RcodeSuccess {
@@ -2105,9 +2239,26 @@ func (c *Cache) decodeDump(r io.Reader) ([]decodedDumpEntry, error) {
 			if _, ok := questionFromKey(k); !ok {
 				return nil, fmt.Errorf("cache dump contains an invalid cache key")
 			}
+			popularityTracked := false
+			var popularity *restoredPopularityState
+			if statePresent && state.GetTracked() && state.GetAdmissionHits() > 0 &&
+				!math.IsNaN(state.GetHeat()) && !math.IsInf(state.GetHeat(), 0) &&
+				state.GetHeat() >= 0 && state.GetHeat() <= float64(state.GetRealAccessCount()) &&
+				state.GetHeatAtUnixNano() > 0 {
+				popularityTracked = true
+				heatAt := time.Unix(0, state.GetHeatAtUnixNano())
+				if heatAt.After(now) {
+					heatAt = now
+				}
+				popularity = &restoredPopularityState{
+					heat: state.GetHeat(), heatAt: heatAt, observed: state.GetRealAccessCount(),
+				}
+			}
 			entries = append(entries, decodedDumpEntry{
 				k: k, item: i, cacheExpiration: cacheExpTime,
 				lastRealAccess: lastRealAccess, refreshCount: entry.GetConsecutiveRefreshSuccesses(),
+				popularityStatePresent: statePresent, popularityTracked: popularityTracked,
+				popularity: popularity,
 			})
 		}
 	}

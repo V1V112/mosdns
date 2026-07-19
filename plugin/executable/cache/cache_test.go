@@ -194,7 +194,6 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 		"exclude_ip": []any{"203.0.113.0/24"},
 		"active_refresh": map[string]any{
 			"enabled":             true,
-			"restore_on_startup":  true,
 			"threshold":           60,
 			"requery_timeout_ms":  1000,
 			"workers":             16,
@@ -245,9 +244,6 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 	if !ar.trackingPolicyConfigured {
 		t.Fatal("active refresh tracking policy should be enabled when all six fields are configured")
 	}
-	if !ar.RestoreOnStartup {
-		t.Fatal("restore on startup should be enabled")
-	}
 	if ar.RequeryTimeoutMS != 1000 || ar.MaxRefreshQPS != 30 || ar.RefreshBurst != 60 {
 		t.Fatalf("active limits mismatch: %#v", ar)
 	}
@@ -290,6 +286,11 @@ func TestActiveRefreshArgs_WeakDecode(t *testing.T) {
 				t.Fatalf("error = %v, want %q", err, want)
 			}
 		})
+	}
+	var removed Args
+	err = yaml.Unmarshal([]byte("active_refresh:\n  restore_on_startup: false\n"), &removed)
+	if want := removedActiveRefreshFields["restore_on_startup"]; err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("direct YAML restore_on_startup error = %v, want %q", err, want)
 	}
 }
 

@@ -15,6 +15,7 @@ var removedActiveRefreshFields = map[string]string{
 	"min_refresh_interval": "active_refresh.min_refresh_interval has been removed; retry intervals are now calculated dynamically",
 	"max_entries_per_scan": "active_refresh.max_entries_per_scan has been removed; use max_tasks_per_batch instead",
 	"refresh_sequence":     "active_refresh.refresh_sequence has been removed; the cache continuation is now bound automatically by sequence",
+	"restore_on_startup":   "active_refresh.restore_on_startup has been removed; dump refresh tasks now follow active_refresh.enabled automatically",
 }
 
 var activeRefreshTrackingPolicyFields = [...]string{
@@ -86,7 +87,7 @@ func (a *Args) ValidateRawConfig(raw any) error {
 		return err
 	}
 	a.ActiveRefresh.trackingPolicyConfigured = trackingConfigured
-	for _, field := range []string{"interval", "min_refresh_interval", "max_entries_per_scan", "refresh_sequence"} {
+	for _, field := range []string{"interval", "min_refresh_interval", "max_entries_per_scan", "refresh_sequence", "restore_on_startup"} {
 		if _, exists := active[field]; exists {
 			return fmt.Errorf("%s", removedActiveRefreshFields[field])
 		}

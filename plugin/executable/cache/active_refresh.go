@@ -446,7 +446,13 @@ func snapshotActiveAdmissionState(v *item) (accessCount, admissionState uint64) 
 	if v == nil {
 		return 0, 0
 	}
-	activity := v.activityState()
+	return snapshotActiveAdmissionStateFromActivity(v.activityState())
+}
+
+func snapshotActiveAdmissionStateFromActivity(activity *activeActivity) (accessCount, admissionState uint64) {
+	if activity == nil {
+		return 0, 0
+	}
 	activity.admissionMu.Lock()
 	accessCount = activity.realAccessCount.Load()
 	admissionState = activity.admissionState.Load()
@@ -998,14 +1004,27 @@ func (c *Cache) refreshActiveHeatLocked(meta *activeRefreshMeta, now time.Time) 
 	if !c.activeRefreshTrackingPolicyEnabled() || meta == nil || meta.expected == nil {
 		return 0
 	}
+	return c.refreshActiveHeatToCountLocked(meta, now, meta.expected.activityState().realAccessCount.Load())
+}
+
+// refreshActiveHeatToCountLocked advances a score to an explicitly sampled
+// counter. Dump snapshots use this form so the admission window and the count
+// folded into heat come from the same activity publication.
+func (c *Cache) refreshActiveHeatToCountLocked(meta *activeRefreshMeta, now time.Time, current uint64) float64 {
+	if !c.activeRefreshTrackingPolicyEnabled() || meta == nil || meta.expected == nil {
+		return 0
+	}
 	if meta.heatAt.IsZero() {
 		meta.heatAt = now
+	} else if now.Before(meta.heatAt) {
+		// Callers can carry request or dump timestamps that were captured before
+		// they acquired activeMu. Never move the decay baseline backwards.
+		now = meta.heatAt
 	}
 	if elapsed := now.Sub(meta.heatAt); elapsed > 0 {
 		halfLife := time.Duration(c.args.ActiveRefresh.HeatHalfLife) * time.Second
 		meta.heat *= math.Exp2(-elapsed.Seconds() / halfLife.Seconds())
 	}
-	current := meta.expected.activityState().realAccessCount.Load()
 	if current >= meta.heatObserved {
 		meta.heat += float64(current - meta.heatObserved)
 	} else {
@@ -1015,6 +1034,138 @@ func (c *Cache) refreshActiveHeatLocked(meta *activeRefreshMeta, now time.Time) 
 	meta.heatObserved = current
 	meta.heatAt = now
 	return meta.heat
+}
+
+type activeRefreshPopularityDumpState struct {
+	realAccessCount uint64
+	admissionState  uint64
+	heat            float64
+	heatAt          time.Time
+}
+
+type activeRefreshRestoreDumpSnapshot struct {
+	entry decodedDumpEntry
+}
+
+func advanceRestoredPopularityForDump(
+	entry decodedDumpEntry,
+	now time.Time,
+	policyEnabled bool,
+	halfLife time.Duration,
+) (activeRefreshPopularityDumpState, bool) {
+	if !entry.popularityTracked || entry.item == nil || entry.popularity == nil {
+		return activeRefreshPopularityDumpState{}, false
+	}
+	popularity := entry.popularity
+	popularity.mu.Lock()
+	defer popularity.mu.Unlock()
+
+	activity := entry.item.activityState()
+	accessCount, admissionState := snapshotActiveAdmissionStateFromActivity(activity)
+	heat := popularity.heat
+	heatAt := popularity.heatAt
+	observed := popularity.observed
+	if policyEnabled {
+		if heatAt.IsZero() {
+			return activeRefreshPopularityDumpState{}, false
+		}
+		if now.Before(heatAt) {
+			// A stale caller timestamp or a wall-clock correction must never move
+			// the persisted decay baseline backwards.
+			now = heatAt
+		} else if elapsed := now.Sub(heatAt); elapsed > 0 {
+			if halfLife <= 0 {
+				return activeRefreshPopularityDumpState{}, false
+			}
+			heat *= math.Exp2(-elapsed.Seconds() / halfLife.Seconds())
+		}
+		if accessCount >= observed {
+			heat += float64(accessCount - observed)
+		} else {
+			// Defensive handling for a replaced/corrupt lineage. Normal restored
+			// entries retain the same monotonic activity counter.
+			heat += float64(accessCount)
+		}
+		heatAt = now
+		observed = accessCount
+	}
+	if math.IsNaN(heat) || math.IsInf(heat, 0) || heat < 0 || heat > float64(observed) ||
+		uint64(uint32(admissionState)) > observed {
+		return activeRefreshPopularityDumpState{}, false
+	}
+	if policyEnabled {
+		popularity.heat = heat
+		popularity.heatAt = heatAt
+		popularity.observed = observed
+	}
+	return activeRefreshPopularityDumpState{
+		realAccessCount: observed,
+		admissionState:  admissionState,
+		heat:            heat,
+		heatAt:          heatAt,
+	}, true
+}
+
+// snapshotActiveRefreshPopularityForDump captures entries admitted by the
+// explicit popularity policy, including state still moving from a dump into
+// live metadata. Activity identity is the lookup key so two generations of the
+// same DNS key cannot hide one another during a concurrent /load_dump.
+func (c *Cache) snapshotActiveRefreshPopularityForDump() map[*activeActivity]activeRefreshPopularityDumpState {
+	states := make(map[*activeActivity]activeRefreshPopularityDumpState)
+	transfers := make([]activeRefreshRestoreDumpSnapshot, 0)
+	policyEnabled := c.activeRefreshTrackingPolicyEnabled()
+	now := time.Now()
+	// Snapshot active and transfer state atomically with the same activeMu ->
+	// activeRestoreMu order used when completed transfers are retired. Every
+	// admitted entry is therefore visible in metadata, pending, or in-flight.
+	c.activeMu.Lock()
+	if policyEnabled {
+		for _, meta := range c.activeMeta {
+			if meta == nil || meta.expected == nil || meta.replay == nil || meta.stopped.Load() {
+				continue
+			}
+			activity := meta.expected.activityState()
+			accessCount, admissionState := snapshotActiveAdmissionStateFromActivity(activity)
+			heat := c.refreshActiveHeatToCountLocked(meta, now, accessCount)
+			if math.IsNaN(heat) || math.IsInf(heat, 0) || heat < 0 || heat > float64(accessCount) ||
+				uint64(uint32(admissionState)) > accessCount {
+				continue
+			}
+			states[activity] = activeRefreshPopularityDumpState{
+				realAccessCount: accessCount, admissionState: admissionState,
+				heat: heat, heatAt: meta.heatAt,
+			}
+		}
+	}
+	c.activeRestoreMu.Lock()
+	for _, entry := range c.activeRestoreInFlight {
+		transfers = append(transfers, activeRefreshRestoreDumpSnapshot{entry: entry})
+	}
+	// A newer queued generation wins over an older same-key in-flight transfer.
+	for _, entry := range c.activeRestore {
+		transfers = append(transfers, activeRefreshRestoreDumpSnapshot{entry: entry})
+	}
+	c.activeRestoreMu.Unlock()
+	c.activeMu.Unlock()
+
+	// A startup dump can be loaded before sequence compilation binds its
+	// continuation, or while the binding is installing metadata. Preserve its
+	// admitted state across an early Close or periodic re-dump. Advance each
+	// transfer baseline once. Queued, in-flight and installer copies share the
+	// same locked state, so subsequent dumps decay prior samples instead of
+	// counting them again at the new time.
+	halfLife := time.Duration(c.args.ActiveRefresh.HeatHalfLife) * time.Second
+	for _, transfer := range transfers {
+		state, ok := advanceRestoredPopularityForDump(transfer.entry, now, policyEnabled, halfLife)
+		if !ok {
+			continue
+		}
+		activity := transfer.entry.item.activityState()
+		if _, live := states[activity]; !live {
+			states[activity] = state
+		}
+	}
+	return states
 }
 
 func (c *Cache) evictLeastUrgentMetaLocked() bool {
@@ -1350,7 +1501,9 @@ func (c *Cache) addActiveMetaLocked(k key, meta *activeRefreshMeta) {
 	meta.k = k
 	meta.evictionIndex = -1
 	if c.activeRefreshTrackingPolicyEnabled() {
-		meta.evictionTicket = c.nextActiveClockTicketLocked()
+		if meta.evictionTicket == 0 {
+			meta.evictionTicket = c.nextActiveClockTicketLocked()
+		}
 	} else {
 		meta.evictionTicket = 0
 	}
@@ -2340,7 +2493,7 @@ func (c *Cache) updateActiveRefreshAfterCommitReplay(
 // sequence compiler. Dump-restored refresh work can therefore be rebuilt at
 // startup without a dedicated refresh_sequence or a bootstrap client query.
 func (c *Cache) BindContinuation(next sequence.ChainWalker) error {
-	if !c.activeRefreshEnabled() || !c.args.ActiveRefresh.RestoreOnStartup || c.activeRefreshExec != nil {
+	if !c.activeRefreshEnabled() || c.activeRefreshExec != nil {
 		return nil
 	}
 	return c.installActiveRefreshReplay(next, true)
@@ -2351,57 +2504,96 @@ func (c *Cache) bindActiveRefreshReplay(next sequence.ChainWalker) {
 }
 
 func (c *Cache) installActiveRefreshReplay(next sequence.ChainWalker, rejectDuplicate bool) error {
-	if !c.activeRefreshEnabled() || !c.args.ActiveRefresh.RestoreOnStartup {
+	if !c.activeRefreshEnabled() {
 		return nil
 	}
 	c.activeRestoreMu.Lock()
+	if c.lifecycleCtx.Err() != nil {
+		c.activeRestoreMu.Unlock()
+		return nil
+	}
 	if !c.activeReplayBound {
 		c.activeReplayNext = next.Fork()
 		c.activeReplayBound = true
 	} else if rejectDuplicate {
 		c.activeRestoreMu.Unlock()
-		return fmt.Errorf("cache is referenced by more than one sequence while active_refresh.restore_on_startup is enabled")
+		return fmt.Errorf("cache is referenced by more than one sequence while active refresh dump restoration is enabled")
 	}
-	if len(c.activeRestore) == 0 {
+	if len(c.activeRestore) == 0 || c.activeRestoreRunning {
 		c.activeRestoreMu.Unlock()
 		return nil
 	}
-	entries := make([]decodedDumpEntry, 0, len(c.activeRestore))
-	for _, entry := range c.activeRestore {
-		entries = append(entries, entry)
-	}
-	clear(c.activeRestore)
-	replayNext := c.activeReplayNext.Fork()
+	c.activeRestoreRunning = true
 	c.activeRestoreMu.Unlock()
-	c.restoreActiveRefreshEntries(entries, replayNext)
-	return nil
-}
 
-func (c *Cache) queueRestoredActiveRefresh(entries []decodedDumpEntry) {
-	if !c.activeRefreshEnabled() || !c.args.ActiveRefresh.RestoreOnStartup || len(entries) == 0 {
-		return
-	}
-	c.activeRestoreMu.Lock()
-	for _, entry := range entries {
-		c.activeRestore[entry.k] = entry
-	}
-	bound := c.activeReplayBound
-	c.activeRestoreMu.Unlock()
-	if bound {
-		c.bindActiveRefreshReplay(sequence.ChainWalker{})
+	for {
+		c.activeRestoreMu.Lock()
+		if c.lifecycleCtx.Err() != nil {
+			c.activeRestoreRunning = false
+			c.activeRestoreMu.Unlock()
+			return nil
+		}
+		if len(c.activeRestore) == 0 {
+			c.activeRestoreRunning = false
+			c.activeRestoreMu.Unlock()
+			return nil
+		}
+		entries := make([]decodedDumpEntry, 0, len(c.activeRestore))
+		for k, entry := range c.activeRestore {
+			entries = append(entries, entry)
+			c.activeRestoreInFlight[k] = entry
+			delete(c.activeRestore, k)
+		}
+		replayNext := c.activeReplayNext.Fork()
+		c.activeRestoreMu.Unlock()
+
+		c.restoreActiveRefreshEntries(entries, replayNext)
+
+		// Close linearizes cancellation under flushMu. If cancellation won,
+		// leave in-flight entries visible to the final dump. Otherwise retire
+		// them while holding the same combined locks used by dump snapshots.
+		c.flushMu.RLock()
+		if c.lifecycleCtx.Err() != nil {
+			c.flushMu.RUnlock()
+			c.activeRestoreMu.Lock()
+			c.activeRestoreRunning = false
+			c.activeRestoreMu.Unlock()
+			return nil
+		}
+		c.activeMu.Lock()
+		c.activeRestoreMu.Lock()
+		for _, entry := range entries {
+			if current, ok := c.activeRestoreInFlight[entry.k]; ok && current.item == entry.item {
+				delete(c.activeRestoreInFlight, entry.k)
+			}
+		}
+		c.activeRestoreMu.Unlock()
+		c.activeMu.Unlock()
+		c.flushMu.RUnlock()
 	}
 }
 
 func (c *Cache) restoreActiveRefreshEntries(entries []decodedDumpEntry, next sequence.ChainWalker) {
+	if c.lifecycleCtx.Err() != nil {
+		return
+	}
 	now := time.Now()
+	policyEnabled := c.activeRefreshTrackingPolicyEnabled()
 	restored := 0
-	// Dump decoding is map-backed and therefore unordered. Restore most-recently
-	// used entries first so an independent tracking cap deterministically keeps
-	// the hottest available candidates after restart.
-	sort.SliceStable(entries, func(i, j int) bool {
-		return entries[i].lastRealAccess.After(entries[j].lastRealAccess)
-	})
+	type restoreCandidate struct {
+		entry          decodedDumpEntry
+		heat           float64
+		evictionTicket uint64
+	}
+	candidates := make([]restoreCandidate, 0, len(entries))
+	missingPopularityState := 0
 	for _, entry := range entries {
+		if policyEnabled && !entry.popularityTracked {
+			if !entry.popularityStatePresent {
+				missingPopularityState++
+			}
+			continue
+		}
 		v := entry.item
 		if v == nil || !now.Before(v.expirationTime) {
 			continue
@@ -2419,6 +2611,77 @@ func (c *Cache) restoreActiveRefreshEntries(entries []decodedDumpEntry, next seq
 		if maxRefresh := c.args.ActiveRefresh.MaxRefreshTimes; maxRefresh > 0 && entry.refreshCount >= uint32(maxRefresh) {
 			continue
 		}
+		heat := 0.0
+		if policyEnabled {
+			var state activeRefreshPopularityDumpState
+			var ok bool
+			state, ok = advanceRestoredPopularityForDump(
+				entry,
+				now,
+				true,
+				time.Duration(c.args.ActiveRefresh.HeatHalfLife)*time.Second,
+			)
+			if !ok {
+				continue
+			}
+			heat = state.heat
+		}
+		candidates = append(candidates, restoreCandidate{entry: entry, heat: heat})
+	}
+	if missingPopularityState > 0 {
+		c.logger.Debug("cache dump entries have no popularity state; active refresh waits for fresh admission",
+			zap.Int("entries", missingPopularityState))
+	}
+	// Legacy mode preserves the historical most-recently-used restore order.
+	// Popularity mode ranks the previously admitted set by heat after downtime
+	// decay, then uses access recency and key bytes as deterministic tie-breakers.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if policyEnabled && candidates[i].heat != candidates[j].heat {
+			return candidates[i].heat > candidates[j].heat
+		}
+		if !candidates[i].entry.lastRealAccess.Equal(candidates[j].entry.lastRealAccess) {
+			return candidates[i].entry.lastRealAccess.After(candidates[j].entry.lastRealAccess)
+		}
+		return candidates[i].entry.k < candidates[j].entry.k
+	})
+	if policyEnabled && len(candidates) > 0 {
+		// Reserve the final CLOCK order before installing any candidate. Restores
+		// are selected hot-to-cold, but colder entries must carry earlier tickets
+		// immediately; otherwise a concurrent admission can evict a temporarily
+		// old-looking hot entry before a later bulk reticket pass.
+		ticketOrder := make([]int, len(candidates))
+		for i := range ticketOrder {
+			ticketOrder[i] = i
+		}
+		sort.SliceStable(ticketOrder, func(i, j int) bool {
+			left := candidates[ticketOrder[i]]
+			right := candidates[ticketOrder[j]]
+			if left.heat != right.heat {
+				return left.heat < right.heat
+			}
+			return left.entry.k < right.entry.k
+		})
+		c.activeMu.Lock()
+		for _, candidateIndex := range ticketOrder {
+			candidates[candidateIndex].evictionTicket = c.nextActiveClockTicketLocked()
+		}
+		c.activeMu.Unlock()
+	}
+	for _, candidate := range candidates {
+		if c.lifecycleCtx.Err() != nil {
+			break
+		}
+		if policyEnabled {
+			c.activeMu.Lock()
+			c.drainActiveBackendRemovalsLocked(c.args.ActiveRefresh.EvictionScanLimit)
+			atCapacity := len(c.activeMeta) >= c.activeRefreshCapacity()
+			c.activeMu.Unlock()
+			if atCapacity {
+				break
+			}
+		}
+		entry := candidate.entry
+		v := entry.item
 		qCtx, ok := queryContextFromKey(entry.k)
 		if !ok || c.activeDomainExcluded(qCtx.QQuestion().Name) {
 			continue
@@ -2433,12 +2696,15 @@ func (c *Cache) restoreActiveRefreshEntries(entries []decodedDumpEntry, next seq
 			continue
 		}
 
-		installed := func() bool {
+		installed := func() *activeRefreshMeta {
 			// Runtime /load_dump may overlap ordinary hits after the backend merge.
 			// Use the normal flush -> per-shard commit -> active lock order so the
 			// backend generation check and metadata admission are one transaction.
 			c.flushMu.RLock()
 			defer c.flushMu.RUnlock()
+			if c.lifecycleCtx.Err() != nil {
+				return nil
+			}
 			commitMu := &c.commitLocks[entry.k.Sum()%shardCount]
 			commitMu.Lock()
 			defer commitMu.Unlock()
@@ -2447,31 +2713,78 @@ func (c *Cache) restoreActiveRefreshEntries(entries []decodedDumpEntry, next seq
 
 			current, _, present := c.backend.Get(entry.k)
 			if !present || current != v || current.generation != v.generation {
-				return false
+				return nil
 			}
 			if existing := c.activeMeta[entry.k]; existing != nil {
 				if existing.expected == v {
 					// A real hit already rebuilt this generation after the dump merge.
-					// Preserve its newer activity state and TTL task.
-					return false
+					// Preserve its TTL task and CLOCK state, but merge the persisted
+					// popularity baseline so the foreground race cannot discard heat
+					// or the downtime decay already carried by the dump.
+					if policyEnabled {
+						mergeAt := time.Now()
+						if mergeAt.Before(existing.heatAt) {
+							mergeAt = existing.heatAt
+						}
+						if state, ok := advanceRestoredPopularityForDump(
+							entry,
+							mergeAt,
+							true,
+							time.Duration(c.args.ActiveRefresh.HeatHalfLife)*time.Second,
+						); ok {
+							existing.heat = state.heat
+							existing.heatAt = state.heatAt
+							existing.heatObserved = state.realAccessCount
+						}
+					}
+					return nil
 				}
 				c.removeActiveMetaLocked(entry.k, existing)
 			}
-			if !c.ensureActiveMetaSlotLocked(v) {
-				return false
+			if policyEnabled {
+				c.drainActiveBackendRemovalsLocked(c.args.ActiveRefresh.EvictionScanLimit)
+				// Candidates are already hottest-first. Never let a colder restored
+				// entry churn an earlier restored or concurrently admitted entry.
+				if len(c.activeMeta) >= c.activeRefreshCapacity() {
+					return nil
+				}
+			} else if !c.ensureActiveMetaSlotLocked(v) {
+				return nil
+			}
+			var restoredState activeRefreshPopularityDumpState
+			if policyEnabled {
+				state, ok := advanceRestoredPopularityForDump(
+					entry,
+					time.Now(),
+					true,
+					time.Duration(c.args.ActiveRefresh.HeatHalfLife)*time.Second,
+				)
+				if !ok {
+					return nil
+				}
+				restoredState = state
 			}
 
 			meta := &activeRefreshMeta{
 				k: entry.k, replay: replay, next: nextBase, expected: v, evictionIndex: -1,
+				evictionTicket: candidate.evictionTicket,
 			}
 			c.addActiveMetaLocked(entry.k, meta)
+			if policyEnabled {
+				meta.heat = restoredState.heat
+				meta.heatAt = restoredState.heatAt
+				meta.heatObserved = restoredState.realAccessCount
+				// CLOCK reference/protected state is process-local. A restored
+				// entry earns a second chance only after a new real hit.
+				meta.referenced.Store(false)
+			}
 			if !c.scheduleEntryLocked(meta, v, 0, false, now, true) {
 				c.removeActiveMetaLocked(entry.k, meta)
-				return false
+				return nil
 			}
-			return true
+			return meta
 		}()
-		if installed {
+		if installed != nil {
 			restored++
 		}
 	}

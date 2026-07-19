@@ -13,6 +13,19 @@ message CachedEntry {
   string domain_set = 6;
   int64 last_real_access_time = 7;
   uint32 consecutive_refresh_successes = 8;
+  ActiveRefreshState active_refresh_state = 9;
+}
+
+// ActiveRefreshState is optional so a reader can distinguish a current dump
+// from an older v3 dump that did not persist popularity admission state.
+message ActiveRefreshState {
+  uint32 version = 1;
+  bool tracked = 2;
+  uint64 real_access_count = 3;
+  int64 admission_window_start_unix = 4;
+  uint32 admission_hits = 5;
+  double heat = 6;
+  int64 heat_at_unix_nano = 7;
 }
 
 message CacheDumpBlock {

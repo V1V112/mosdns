@@ -31,6 +31,7 @@ type CachedEntry struct {
 	DomainSet                   string                 `protobuf:"bytes,6,opt,name=domain_set,json=domainSet,proto3" json:"domain_set,omitempty"`
 	LastRealAccessTime          int64                  `protobuf:"varint,7,opt,name=last_real_access_time,json=lastRealAccessTime,proto3" json:"last_real_access_time,omitempty"`
 	ConsecutiveRefreshSuccesses uint32                 `protobuf:"varint,8,opt,name=consecutive_refresh_successes,json=consecutiveRefreshSuccesses,proto3" json:"consecutive_refresh_successes,omitempty"`
+	ActiveRefreshState          *ActiveRefreshState    `protobuf:"bytes,9,opt,name=active_refresh_state,json=activeRefreshState,proto3" json:"active_refresh_state,omitempty"`
 	unknownFields               protoimpl.UnknownFields
 	sizeCache                   protoimpl.SizeCache
 }
@@ -121,6 +122,105 @@ func (x *CachedEntry) GetConsecutiveRefreshSuccesses() uint32 {
 	return 0
 }
 
+func (x *CachedEntry) GetActiveRefreshState() *ActiveRefreshState {
+	if x != nil {
+		return x.ActiveRefreshState
+	}
+	return nil
+}
+
+type ActiveRefreshState struct {
+	state                    protoimpl.MessageState `protogen:"open.v1"`
+	Version                  uint32                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	Tracked                  bool                   `protobuf:"varint,2,opt,name=tracked,proto3" json:"tracked,omitempty"`
+	RealAccessCount          uint64                 `protobuf:"varint,3,opt,name=real_access_count,json=realAccessCount,proto3" json:"real_access_count,omitempty"`
+	AdmissionWindowStartUnix int64                  `protobuf:"varint,4,opt,name=admission_window_start_unix,json=admissionWindowStartUnix,proto3" json:"admission_window_start_unix,omitempty"`
+	AdmissionHits            uint32                 `protobuf:"varint,5,opt,name=admission_hits,json=admissionHits,proto3" json:"admission_hits,omitempty"`
+	Heat                     float64                `protobuf:"fixed64,6,opt,name=heat,proto3" json:"heat,omitempty"`
+	HeatAtUnixNano           int64                  `protobuf:"varint,7,opt,name=heat_at_unix_nano,json=heatAtUnixNano,proto3" json:"heat_at_unix_nano,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
+}
+
+func (x *ActiveRefreshState) Reset() {
+	*x = ActiveRefreshState{}
+	mi := &file_plugin_executable_cache_dump_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ActiveRefreshState) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ActiveRefreshState) ProtoMessage() {}
+
+func (x *ActiveRefreshState) ProtoReflect() protoreflect.Message {
+	mi := &file_plugin_executable_cache_dump_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ActiveRefreshState.ProtoReflect.Descriptor instead.
+func (*ActiveRefreshState) Descriptor() ([]byte, []int) {
+	return file_plugin_executable_cache_dump_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ActiveRefreshState) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *ActiveRefreshState) GetTracked() bool {
+	if x != nil {
+		return x.Tracked
+	}
+	return false
+}
+
+func (x *ActiveRefreshState) GetRealAccessCount() uint64 {
+	if x != nil {
+		return x.RealAccessCount
+	}
+	return 0
+}
+
+func (x *ActiveRefreshState) GetAdmissionWindowStartUnix() int64 {
+	if x != nil {
+		return x.AdmissionWindowStartUnix
+	}
+	return 0
+}
+
+func (x *ActiveRefreshState) GetAdmissionHits() uint32 {
+	if x != nil {
+		return x.AdmissionHits
+	}
+	return 0
+}
+
+func (x *ActiveRefreshState) GetHeat() float64 {
+	if x != nil {
+		return x.Heat
+	}
+	return 0
+}
+
+func (x *ActiveRefreshState) GetHeatAtUnixNano() int64 {
+	if x != nil {
+		return x.HeatAtUnixNano
+	}
+	return 0
+}
+
 type CacheDumpBlock struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Entries       []*CachedEntry         `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
@@ -130,7 +230,7 @@ type CacheDumpBlock struct {
 
 func (x *CacheDumpBlock) Reset() {
 	*x = CacheDumpBlock{}
-	mi := &file_plugin_executable_cache_dump_proto_msgTypes[1]
+	mi := &file_plugin_executable_cache_dump_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -142,7 +242,7 @@ func (x *CacheDumpBlock) String() string {
 func (*CacheDumpBlock) ProtoMessage() {}
 
 func (x *CacheDumpBlock) ProtoReflect() protoreflect.Message {
-	mi := &file_plugin_executable_cache_dump_proto_msgTypes[1]
+	mi := &file_plugin_executable_cache_dump_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -155,7 +255,7 @@ func (x *CacheDumpBlock) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CacheDumpBlock.ProtoReflect.Descriptor instead.
 func (*CacheDumpBlock) Descriptor() ([]byte, []int) {
-	return file_plugin_executable_cache_dump_proto_rawDescGZIP(), []int{1}
+	return file_plugin_executable_cache_dump_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *CacheDumpBlock) GetEntries() []*CachedEntry {
@@ -169,19 +269,28 @@ var File_plugin_executable_cache_dump_proto protoreflect.FileDescriptor
 
 const file_plugin_executable_cache_dump_proto_rawDesc = "" +
 	"\n" +
-	"\"plugin/executable/cache/dump.proto\x12\x05cache\"\xd3\x02\n" +
-	"\vCachedEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\fR\x03key\x12\x10\n" +
-	"\x03msg\x18\x02 \x01(\fR\x03msg\x122\n" +
-	"\x15cache_expiration_time\x18\x03 \x01(\x03R\x13cacheExpirationTime\x12.\n" +
-	"\x13msg_expiration_time\x18\x04 \x01(\x03R\x11msgExpirationTime\x12&\n" +
-	"\x0fmsg_stored_time\x18\x05 \x01(\x03R\rmsgStoredTime\x12\x1d\n" +
+	"\"plugin/executable/cache/dump.proto\x12\x05cache\"\x8f\x02\n" +
+	"\vCachedEntry\x12\v\n" +
+	"\x03key\x18\x01 \x01(\f\x12\v\n" +
+	"\x03msg\x18\x02 \x01(\f\x12\x1d\n" +
+	"\x15cache_expiration_time\x18\x03 \x01(\x03\x12\x1b\n" +
+	"\x13msg_expiration_time\x18\x04 \x01(\x03\x12\x17\n" +
+	"\x0fmsg_stored_time\x18\x05 \x01(\x03\x12\x12\n" +
 	"\n" +
-	"domain_set\x18\x06 \x01(\tR\tdomainSet\x121\n" +
-	"\x15last_real_access_time\x18\a \x01(\x03R\x12lastRealAccessTime\x12B\n" +
-	"\x1dconsecutive_refresh_successes\x18\b \x01(\rR\x1bconsecutiveRefreshSuccesses\">\n" +
-	"\x0eCacheDumpBlock\x12,\n" +
-	"\aentries\x18\x01 \x03(\v2\x12.cache.CachedEntryR\aentriesB\x19Z\x17plugin/executable/cacheb\x06proto3"
+	"domain_set\x18\x06 \x01(\t\x12\x1d\n" +
+	"\x15last_real_access_time\x18\a \x01(\x03\x12%\n" +
+	"\x1dconsecutive_refresh_successes\x18\b \x01(\r\x127\n" +
+	"\x14active_refresh_state\x18\t \x01(\v2\x19.cache.ActiveRefreshState\"\xb7\x01\n" +
+	"\x12ActiveRefreshState\x12\x0f\n" +
+	"\aversion\x18\x01 \x01(\r\x12\x0f\n" +
+	"\atracked\x18\x02 \x01(\b\x12\x19\n" +
+	"\x11real_access_count\x18\x03 \x01(\x04\x12#\n" +
+	"\x1badmission_window_start_unix\x18\x04 \x01(\x03\x12\x16\n" +
+	"\x0eadmission_hits\x18\x05 \x01(\r\x12\f\n" +
+	"\x04heat\x18\x06 \x01(\x01\x12\x19\n" +
+	"\x11heat_at_unix_nano\x18\a \x01(\x03\"5\n" +
+	"\x0eCacheDumpBlock\x12#\n" +
+	"\aentries\x18\x01 \x03(\v2\x12.cache.CachedEntryB\x19Z\x17plugin/executable/cacheb\x06proto3"
 
 var (
 	file_plugin_executable_cache_dump_proto_rawDescOnce sync.Once
@@ -195,18 +304,20 @@ func file_plugin_executable_cache_dump_proto_rawDescGZIP() []byte {
 	return file_plugin_executable_cache_dump_proto_rawDescData
 }
 
-var file_plugin_executable_cache_dump_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_plugin_executable_cache_dump_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_plugin_executable_cache_dump_proto_goTypes = []any{
-	(*CachedEntry)(nil),    // 0: cache.CachedEntry
-	(*CacheDumpBlock)(nil), // 1: cache.CacheDumpBlock
+	(*CachedEntry)(nil),        // 0: cache.CachedEntry
+	(*ActiveRefreshState)(nil), // 1: cache.ActiveRefreshState
+	(*CacheDumpBlock)(nil),     // 2: cache.CacheDumpBlock
 }
 var file_plugin_executable_cache_dump_proto_depIdxs = []int32{
-	0, // 0: cache.CacheDumpBlock.entries:type_name -> cache.CachedEntry
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	1, // 0: cache.CachedEntry.active_refresh_state:type_name -> cache.ActiveRefreshState
+	0, // 1: cache.CacheDumpBlock.entries:type_name -> cache.CachedEntry
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_plugin_executable_cache_dump_proto_init() }
@@ -220,7 +331,7 @@ func file_plugin_executable_cache_dump_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_plugin_executable_cache_dump_proto_rawDesc), len(file_plugin_executable_cache_dump_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -2,11 +2,16 @@ package cache
 
 import (
 	"bytes"
+	"compress/gzip"
 	"container/heap"
 	"context"
+	"encoding/binary"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +26,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/protobuf/proto"
 )
 
 func newDormantActiveCache(t *testing.T, args *Args, opts Opts) *Cache {
@@ -70,6 +76,29 @@ func seedTrackedEntry(t *testing.T, c *Cache, name string, ttl, age time.Duratio
 	}
 	c.trackActiveRefresh(k, p.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, time.Now(), p.msg)
 	return k, qCtx, p
+}
+
+func encodeLegacyDumpEntry(t *testing.T, entry *CachedEntry) []byte {
+	t.Helper()
+	block, err := proto.Marshal(&CacheDumpBlock{Entries: []*CachedEntry{entry}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := new(bytes.Buffer)
+	gw := gzip.NewWriter(buf)
+	gw.Name = dumpHeader
+	var header [8]byte
+	binary.BigEndian.PutUint64(header[:], uint64(len(block)))
+	if _, err := gw.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gw.Write(block); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func replayContextForTest(t *testing.T, meta *activeRefreshMeta) *query_context.Context {
@@ -234,6 +263,25 @@ func TestActiveRefreshAdmissionHeatDoesNotRevivePreviousWindow(t *testing.T) {
 	}
 	if want := uint64(oldHits) + 2; observed != want {
 		t.Fatalf("lifetime heat baseline = %d, want %d", observed, want)
+	}
+}
+
+func TestActiveRefreshHeatTimestampNeverMovesBackward(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer c.Close()
+	k, _, prepared := seedTrackedEntry(t, c, "heat-time-order.example.", time.Hour, 0)
+	baseline := time.Now()
+	c.activeMu.Lock()
+	meta := c.activeMeta[k]
+	meta.heat = 4
+	meta.heatAt = baseline
+	meta.heatObserved = prepared.item.activityState().realAccessCount.Load()
+	got := c.refreshActiveHeatLocked(meta, baseline.Add(-time.Second))
+	gotAt := meta.heatAt
+	c.activeMu.Unlock()
+	if got != 4 || !gotAt.Equal(baseline) {
+		t.Fatalf("out-of-order heat refresh = %f at %s, want 4 at %s", got, gotAt, baseline)
 	}
 }
 
@@ -2632,7 +2680,7 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	if n, err := source.writeDump(buf); err != nil || n != 1 {
 		t.Fatalf("write dump: entries=%d err=%v", n, err)
 	}
-	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{RestoreOnStartup: true}}, Opts{})
+	target := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
 	defer target.Close()
 	if n, err := target.readDump(buf); err != nil || n != 1 {
 		t.Fatalf("read dump: entries=%d err=%v", n, err)
@@ -2673,7 +2721,398 @@ func TestDumpRestoreRebuildsVersionedSchedule(t *testing.T) {
 	}
 }
 
-func TestRestoreOnStartupDisabledLoadsCacheWithoutRefreshTasks(t *testing.T) {
+func TestDumpRestorePopularityPolicyOnlyRestoresAdmittedEntries(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.AdmissionHits = 2
+	source := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer source.Close()
+	now := time.Now()
+
+	seed := func(name string) (key, *query_context.Context, *preparedCacheEntry) {
+		qCtx := newTestQuery(name, dns.TypeA, dns.ClassINET, true)
+		k := testCacheKey(t, qCtx)
+		prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+		if !source.commitPrepared(k, nil, 0, prepared) {
+			t.Fatalf("failed to seed %s", name)
+		}
+		source.trackActiveRefresh(k, prepared.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, now, prepared.msg)
+		return k, qCtx, prepared
+	}
+	hotKey, hotQuery, hot := seed("restore-hot.example.")
+	coldKey, coldQuery, cold := seed("restore-cold.example.")
+	source.observeActiveRefresh(hotKey, hot.item, hotQuery, sequence.ChainWalker{}, now.Add(time.Second), hot.msg)
+	if source.activeMeta[hotKey] == nil || source.activeMeta[coldKey] != nil {
+		t.Fatal("test setup did not produce one admitted and one untracked entry")
+	}
+
+	buf := new(bytes.Buffer)
+	if n, err := source.writeDump(buf); err != nil || n != 2 {
+		t.Fatalf("write dump: entries=%d err=%v", n, err)
+	}
+	targetPolicy := activeRefreshTrackingPolicyForTest(16)
+	targetPolicy.AdmissionHits = 2
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: targetPolicy}, Opts{})
+	defer target.Close()
+	target.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := target.readDump(buf); err != nil || n != 2 {
+		t.Fatalf("read dump: entries=%d err=%v", n, err)
+	}
+
+	hotLoaded, _, hotPresent := target.backend.Get(hotKey)
+	coldLoaded, _, coldPresent := target.backend.Get(coldKey)
+	if !hotPresent || !coldPresent {
+		t.Fatalf("cache restore lost entries: hot=%v cold=%v", hotPresent, coldPresent)
+	}
+	target.activeMu.RLock()
+	hotMeta, hotTracked := target.activeMeta[hotKey]
+	_, coldTracked := target.activeMeta[coldKey]
+	target.activeMu.RUnlock()
+	if !hotTracked || hotMeta == nil || hotMeta.task == nil || coldTracked {
+		t.Fatalf("popularity restore mismatch: hot=%#v coldTracked=%v", hotMeta, coldTracked)
+	}
+	if hotMeta.referenced.Load() || hotMeta.protected {
+		t.Fatal("restored popularity metadata inherited process-local CLOCK state")
+	}
+	if got := hotLoaded.activityState().realAccessCount.Load(); got != 2 {
+		t.Fatalf("restored hot access count = %d, want 2", got)
+	}
+	if got := coldLoaded.activityState().realAccessCount.Load(); got != 1 {
+		t.Fatalf("restored cold admission progress = %d, want 1", got)
+	}
+	target.observeActiveRefresh(coldKey, coldLoaded, coldQuery, sequence.ChainWalker{}, now.Add(2*time.Second), cold.msg)
+	if meta := target.activeMeta[coldKey]; meta == nil || meta.task == nil {
+		t.Fatalf("restored partial admission did not accept the next real hit: %#v", meta)
+	}
+	target.activeMu.Lock()
+	coldMeta := target.activeMeta[coldKey]
+	heatAfterAdmission := target.refreshActiveHeatLocked(coldMeta, now.Add(3*time.Second))
+	heatObserved := coldMeta.heatObserved
+	target.activeMu.Unlock()
+	if heatAfterAdmission > 2 || heatAfterAdmission < 1.99 || heatObserved != 2 {
+		t.Fatalf("restored admission heat double-counted: heat=%f observed=%d", heatAfterAdmission, heatObserved)
+	}
+}
+
+func TestDumpRestoreExpiredPartialAdmissionStartsNewWindow(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.AdmissionHits = 2
+	policy.AdmissionWindow = 1
+	source := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer source.Close()
+	qCtx := newTestQuery("restore-expired-admission.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+	if !source.commitPrepared(k, nil, 0, prepared) {
+		t.Fatal("failed to seed partial admission entry")
+	}
+	oldHit := time.Now().Add(-2 * time.Second)
+	source.trackActiveRefresh(k, prepared.item, qCtx.CopyWithoutResponse(), sequence.ChainWalker{}, oldHit, prepared.msg)
+
+	buf := new(bytes.Buffer)
+	if n, err := source.writeDump(buf); err != nil || n != 1 {
+		t.Fatalf("write dump: entries=%d err=%v", n, err)
+	}
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer target.Close()
+	target.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := target.readDump(buf); err != nil || n != 1 {
+		t.Fatalf("read dump: entries=%d err=%v", n, err)
+	}
+	loaded, _, present := target.backend.Get(k)
+	if !present {
+		t.Fatal("partial admission cache entry was not restored")
+	}
+	now := time.Now()
+	target.observeActiveRefresh(k, loaded, qCtx, sequence.ChainWalker{}, now, prepared.msg)
+	if meta := target.activeMeta[k]; meta != nil {
+		t.Fatalf("expired partial admission incorrectly reached threshold: %#v", meta)
+	}
+	state := loaded.activityState().admissionState.Load()
+	if hits := uint32(state); hits != 1 {
+		t.Fatalf("new admission window hits = %d, want 1", hits)
+	}
+}
+
+func TestDumpRestorePopularityCapPrefersPersistedHeat(t *testing.T) {
+	sourcePolicy := activeRefreshTrackingPolicyForTest(2)
+	sourcePolicy.HeatHalfLife = 3600
+	source := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: sourcePolicy}, Opts{})
+	defer source.Close()
+	hotKey, _, hot := seedTrackedEntry(t, source, "restore-hotter.example.", time.Hour, 0)
+	coldKey, _, cold := seedTrackedEntry(t, source, "restore-newer-but-colder.example.", time.Hour, 0)
+	now := time.Now()
+	hot.item.activityState().lastRealAccess.Store(now.Add(-10 * time.Minute).UnixNano())
+	cold.item.activityState().lastRealAccess.Store(now.UnixNano())
+	hot.item.activityState().realAccessCount.Store(100)
+	cold.item.activityState().realAccessCount.Store(2)
+	source.activeMu.Lock()
+	hotMeta := source.activeMeta[hotKey]
+	coldMeta := source.activeMeta[coldKey]
+	hotMeta.heat, hotMeta.heatAt = 100, now
+	coldMeta.heat, coldMeta.heatAt = 2, now
+	hotMeta.heatObserved = hot.item.activityState().realAccessCount.Load()
+	coldMeta.heatObserved = cold.item.activityState().realAccessCount.Load()
+	source.activeMu.Unlock()
+
+	buf := new(bytes.Buffer)
+	if n, err := source.writeDump(buf); err != nil || n != 2 {
+		t.Fatalf("write dump: entries=%d err=%v", n, err)
+	}
+	dumpBytes := append([]byte(nil), buf.Bytes()...)
+	targetPolicy := activeRefreshTrackingPolicyForTest(1)
+	targetPolicy.HeatHalfLife = 3600
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: targetPolicy}, Opts{})
+	defer target.Close()
+	target.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := target.readDump(bytes.NewReader(dumpBytes)); err != nil || n != 2 {
+		t.Fatalf("read dump: entries=%d err=%v", n, err)
+	}
+	target.activeMu.RLock()
+	restoredHot := target.activeMeta[hotKey]
+	restoredCold := target.activeMeta[coldKey]
+	target.activeMu.RUnlock()
+	if restoredHot == nil || restoredHot.task == nil || restoredCold != nil {
+		t.Fatalf("heat cap selection mismatch: hot=%#v cold=%#v", restoredHot, restoredCold)
+	}
+	if restoredHot.heat < 90 {
+		t.Fatalf("restored hot heat = %f, want persisted score near 100", restoredHot.heat)
+	}
+
+	clockPolicy := activeRefreshTrackingPolicyForTest(2)
+	clockPolicy.HeatHalfLife = 3600
+	clockTarget := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: clockPolicy}, Opts{})
+	defer clockTarget.Close()
+	clockTarget.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := clockTarget.readDump(bytes.NewReader(dumpBytes)); err != nil || n != 2 {
+		t.Fatalf("read clock dump: entries=%d err=%v", n, err)
+	}
+	clockTarget.activeMu.RLock()
+	clockHot := clockTarget.activeMeta[hotKey]
+	clockCold := clockTarget.activeMeta[coldKey]
+	clockTarget.activeMu.RUnlock()
+	if clockHot == nil || clockCold == nil || clockCold.evictionTicket >= clockHot.evictionTicket {
+		t.Fatalf("restored CLOCK ticket order: hot=%#v cold=%#v", clockHot, clockCold)
+	}
+	if clockHot.referenced.Load() || clockCold.referenced.Load() || clockHot.protected || clockCold.protected {
+		t.Fatal("restored CLOCK state was not reset")
+	}
+}
+
+func TestDumpRestorePopularityHeatDecaysDuringDowntime(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.HeatHalfLife = 60
+	qCtx := newTestQuery("restore-decay.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+	now := time.Now()
+	dump := encodeLegacyDumpEntry(t, &CachedEntry{
+		Key: []byte(k), Msg: prepared.item.resp,
+		CacheExpirationTime: prepared.cacheExpiration.Unix(), MsgExpirationTime: prepared.item.expirationTime.Unix(),
+		MsgStoredTime: prepared.item.storedTime.Unix(), LastRealAccessTime: now.Unix(),
+		ActiveRefreshState: &ActiveRefreshState{
+			Version: 1, Tracked: true, RealAccessCount: 8,
+			AdmissionWindowStartUnix: now.Unix(), AdmissionHits: 1,
+			Heat: 8, HeatAtUnixNano: now.Add(-60 * time.Second).UnixNano(),
+		},
+	})
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer target.Close()
+	target.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := target.readDump(bytes.NewReader(dump)); err != nil || n != 1 {
+		t.Fatalf("read dump: entries=%d err=%v", n, err)
+	}
+	target.activeMu.RLock()
+	meta := target.activeMeta[k]
+	target.activeMu.RUnlock()
+	if meta == nil || meta.heat < 3.9 || meta.heat > 4.1 {
+		t.Fatalf("restored decayed heat = %#v, want approximately 4", meta)
+	}
+}
+
+func TestOldDumpPopularityPolicyWaitsForFreshAdmission(t *testing.T) {
+	qCtx := newTestQuery("old-dump.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+	legacyDump := encodeLegacyDumpEntry(t, &CachedEntry{
+		Key: []byte(k), Msg: prepared.item.resp,
+		CacheExpirationTime: prepared.cacheExpiration.Unix(), MsgExpirationTime: prepared.item.expirationTime.Unix(),
+		MsgStoredTime: prepared.item.storedTime.Unix(), LastRealAccessTime: time.Now().Unix(),
+	})
+
+	policy := activeRefreshTrackingPolicyForTest(16)
+	policy.AdmissionHits = 2
+	policyTarget := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer policyTarget.Close()
+	policyTarget.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := policyTarget.readDump(bytes.NewReader(legacyDump)); err != nil || n != 1 {
+		t.Fatalf("policy read old dump: entries=%d err=%v", n, err)
+	}
+	loaded, _, present := policyTarget.backend.Get(k)
+	if !present || loaded == nil {
+		t.Fatal("policy mode did not restore old dump cache content")
+	}
+	if meta := policyTarget.activeMeta[k]; meta != nil {
+		t.Fatalf("old dump bypassed popularity admission: %#v", meta)
+	}
+	if got := loaded.activityState().realAccessCount.Load(); got != 0 {
+		t.Fatalf("old dump synthesized %d popularity hits, want 0", got)
+	}
+
+	legacyTarget := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	defer legacyTarget.Close()
+	legacyTarget.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := legacyTarget.readDump(bytes.NewReader(legacyDump)); err != nil || n != 1 {
+		t.Fatalf("legacy read old dump: entries=%d err=%v", n, err)
+	}
+	if meta := legacyTarget.activeMeta[k]; meta == nil || meta.task == nil {
+		t.Fatalf("legacy restore behaviour changed: %#v", meta)
+	}
+}
+
+func TestDecodeDumpSanitizesPopularityState(t *testing.T) {
+	qCtx := newTestQuery("sanitize-dump.example.", dns.TypeA, dns.ClassINET, true)
+	k := testCacheKey(t, qCtx)
+	prepared := testPreparedA(t, qCtx.Q(), "192.0.2.1", time.Hour)
+	policy := activeRefreshTrackingPolicyForTest(16)
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer target.Close()
+	baseEntry := func(state *ActiveRefreshState) *CachedEntry {
+		return &CachedEntry{
+			Key: []byte(k), Msg: prepared.item.resp,
+			CacheExpirationTime: prepared.cacheExpiration.Unix(), MsgExpirationTime: prepared.item.expirationTime.Unix(),
+			MsgStoredTime: prepared.item.storedTime.Unix(), LastRealAccessTime: time.Now().Unix(),
+			ActiveRefreshState: state,
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		state *ActiveRefreshState
+	}{
+		{name: "unknown_version", state: &ActiveRefreshState{Version: 99, Tracked: true, RealAccessCount: 1, AdmissionWindowStartUnix: time.Now().Unix(), AdmissionHits: 1, Heat: 1, HeatAtUnixNano: time.Now().UnixNano()}},
+		{name: "nan_heat", state: &ActiveRefreshState{Version: 1, Tracked: true, RealAccessCount: 1, AdmissionWindowStartUnix: time.Now().Unix(), AdmissionHits: 1, Heat: math.NaN(), HeatAtUnixNano: time.Now().UnixNano()}},
+		{name: "infinite_heat", state: &ActiveRefreshState{Version: 1, Tracked: true, RealAccessCount: 1, AdmissionWindowStartUnix: time.Now().Unix(), AdmissionHits: 1, Heat: math.Inf(1), HeatAtUnixNano: time.Now().UnixNano()}},
+		{name: "negative_heat", state: &ActiveRefreshState{Version: 1, Tracked: true, RealAccessCount: 1, AdmissionWindowStartUnix: time.Now().Unix(), AdmissionHits: 1, Heat: -1, HeatAtUnixNano: time.Now().UnixNano()}},
+		{name: "heat_exceeds_count", state: &ActiveRefreshState{Version: 1, Tracked: true, RealAccessCount: 1, AdmissionWindowStartUnix: time.Now().Unix(), AdmissionHits: 1, Heat: 2, HeatAtUnixNano: time.Now().UnixNano()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, err := target.decodeDump(bytes.NewReader(encodeLegacyDumpEntry(t, baseEntry(tc.state))))
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("decode entries=%d err=%v", len(entries), err)
+			}
+			if entries[0].popularityTracked {
+				t.Fatal("invalid popularity state remained tracked")
+			}
+		})
+	}
+
+	future := time.Now().Add(time.Hour)
+	entries, err := target.decodeDump(bytes.NewReader(encodeLegacyDumpEntry(t, baseEntry(&ActiveRefreshState{
+		Version: 1, Tracked: true, RealAccessCount: 2,
+		AdmissionWindowStartUnix: future.Unix(), AdmissionHits: 1,
+		Heat: 1, HeatAtUnixNano: future.UnixNano(),
+	}))))
+	if err != nil || len(entries) != 1 || !entries[0].popularityTracked {
+		t.Fatalf("future timestamp state was not safely retained: entries=%d err=%v", len(entries), err)
+	}
+	if entries[0].popularity == nil || entries[0].popularity.heatAt.After(time.Now()) {
+		t.Fatalf("future heat timestamp was not clamped: %#v", entries[0].popularity)
+	}
+	state := entries[0].item.activityState().admissionState.Load()
+	if start := int64(uint32(state >> 32)); start > time.Now().Unix() {
+		t.Fatalf("future admission window was not clamped: %d", start)
+	}
+}
+
+func TestCloseDumpPreservesPopularityAdmission(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	dumpPath := filepath.Join(t.TempDir(), "cache.dump")
+	source := newDormantActiveCache(t, &Args{
+		Size: 16, DumpFile: dumpPath, DumpInterval: 3600, ActiveRefresh: policy,
+	}, Opts{})
+	hotKey, _, _ := seedTrackedEntry(t, source, "close-dump-hot.example.", time.Hour, 0)
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if err := source.dumpCache(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("post-close dump error = %v, want context.Canceled", err)
+	}
+
+	f, err := os.Open(dumpPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: activeRefreshTrackingPolicyForTest(16)}, Opts{})
+	defer target.Close()
+	target.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := target.readDump(f); err != nil || n != 1 {
+		t.Fatalf("read close dump: entries=%d err=%v", n, err)
+	}
+	meta := target.activeMeta[hotKey]
+	if meta == nil || meta.task == nil {
+		t.Fatalf("final close dump lost popularity admission: %#v", meta)
+	}
+	activity := meta.expected.activityState()
+	if got := activity.realAccessCount.Load(); got != 1 {
+		t.Fatalf("final close dump access count = %d, want 1", got)
+	}
+	if hits := uint32(activity.admissionState.Load()); hits != 1 || meta.heat < 0.9 || meta.heatObserved != 1 {
+		t.Fatalf("final close dump popularity state: hits=%d heat=%f observed=%d", hits, meta.heat, meta.heatObserved)
+	}
+}
+
+func TestPendingRestoreRedumpPreservesPopularityAdmission(t *testing.T) {
+	policy := activeRefreshTrackingPolicyForTest(16)
+	source := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer source.Close()
+	hotKey, _, _ := seedTrackedEntry(t, source, "pending-redump-hot.example.", time.Hour, 0)
+	firstDump := new(bytes.Buffer)
+	if n, err := source.writeDump(firstDump); err != nil || n != 1 {
+		t.Fatalf("write first dump: entries=%d err=%v", n, err)
+	}
+
+	middle := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer middle.Close()
+	if n, err := middle.readDump(firstDump); err != nil || n != 1 {
+		t.Fatalf("load pending dump: entries=%d err=%v", n, err)
+	}
+	middle.activeRestoreMu.Lock()
+	pending := len(middle.activeRestore)
+	middle.activeRestoreMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending restore entries = %d, want 1", pending)
+	}
+	pendingDump := new(bytes.Buffer)
+	if n, err := middle.writeDump(pendingDump); err != nil || n != 1 {
+		t.Fatalf("write pending dump: entries=%d err=%v", n, err)
+	}
+	middle.activeRestoreMu.Lock()
+	for pendingKey, entry := range middle.activeRestore {
+		middle.activeRestoreInFlight[pendingKey] = entry
+		delete(middle.activeRestore, pendingKey)
+	}
+	middle.activeRestoreRunning = true
+	middle.activeRestoreMu.Unlock()
+	inFlightDump := new(bytes.Buffer)
+	if n, err := middle.writeDump(inFlightDump); err != nil || n != 1 {
+		t.Fatalf("write in-flight dump: entries=%d err=%v", n, err)
+	}
+
+	target := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	defer target.Close()
+	target.bindActiveRefreshReplay(sequence.ChainWalker{})
+	if n, err := target.readDump(inFlightDump); err != nil || n != 1 {
+		t.Fatalf("load in-flight dump: entries=%d err=%v", n, err)
+	}
+	if meta := target.activeMeta[hotKey]; meta == nil || meta.task == nil {
+		t.Fatalf("pending restore redump lost admission: %#v", meta)
+	}
+}
+
+func TestActiveRefreshDisabledLoadsCacheWithoutRefreshTasks(t *testing.T) {
 	source := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
 	defer source.Close()
 	k, _, _ := seedTrackedEntry(t, source, "restore-disabled.example.", time.Hour, 10*time.Minute)
@@ -2682,7 +3121,7 @@ func TestRestoreOnStartupDisabledLoadsCacheWithoutRefreshTasks(t *testing.T) {
 		t.Fatalf("write dump: entries=%d err=%v", n, err)
 	}
 
-	target := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
+	target := newCacheForTest(t, &Args{Size: 16}, Opts{})
 	defer target.Close()
 	if err := target.BindContinuation(sequence.ChainWalker{}); err != nil {
 		t.Fatal(err)
@@ -2704,8 +3143,8 @@ func TestRestoreOnStartupDisabledLoadsCacheWithoutRefreshTasks(t *testing.T) {
 	}
 }
 
-func TestRestoreOnStartupRejectsMultipleSequenceBindings(t *testing.T) {
-	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: ActiveRefreshArgs{RestoreOnStartup: true}}, Opts{})
+func TestAutomaticDumpRestoreRejectsMultipleSequenceBindings(t *testing.T) {
+	c := newDormantActiveCache(t, &Args{Size: 16}, Opts{})
 	defer c.Close()
 	if err := c.BindContinuation(sequence.ChainWalker{}); err != nil {
 		t.Fatal(err)
@@ -2728,7 +3167,7 @@ func TestDumpRestoreStormRemainsBatchAndPendingBounded(t *testing.T) {
 	}
 
 	target := newDormantActiveCache(t, &Args{Size: 256, ActiveRefresh: ActiveRefreshArgs{
-		RestoreOnStartup: true, MaxTasksPerBatch: 3, MaxPendingTasks: 4,
+		MaxTasksPerBatch: 3, MaxPendingTasks: 4,
 	}}, Opts{})
 	defer target.Close()
 	target.bindActiveRefreshReplay(sequence.ChainWalker{})
