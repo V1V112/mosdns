@@ -1723,9 +1723,9 @@ document.addEventListener('DOMContentLoaded', () => {
             if (activeTab === 'system-control') {
                 const sysPromises = [];
                 
-                // [新增] 只要在系统页，自动刷新时也更新上游DNS数据 (因为它包含动态的监控指标)
+                // 自动刷新只更新运行指标与连接状态；手动刷新才重新读取配置，避免打断编辑。
                 if (typeof upstreamManager !== 'undefined') {
-                    sysPromises.push(upstreamManager.loadData());
+                    sysPromises.push(forceAll ? upstreamManager.loadData() : upstreamManager.refreshRuntimeData());
                 }
 
                 // 其他重数据仅在手动刷新(forceAll)时加载
@@ -2126,6 +2126,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 diversionManager.render();
             } else if (activeTab === 'system-control') {
                 cacheManager.renderTable();
+                upstreamManager.renderTable();
             }
             updateLastUpdated();
         }
@@ -3561,13 +3562,24 @@ renderReplacementsTable() {
         state: {
             tags: [],      // 后端发现的 aliapi tags
             config: {},    // Map<pluginTag, Array<UpstreamConfig>>
-            metrics: {}    // 解析后的 metrics 数据
+            metrics: {},   // 解析后的 metrics 数据
+            statusByKey: new Map(),
+            statusLoaded: false,
+            statusError: '',
+            statusRequest: null,
+            statusPollId: null
         },
 
         init() {
             if (!document.getElementById('upstream-dns-module')) return;
             
             this.bindEvents();
+            this.startStatusPolling();
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden && this.isStatusPanelActive()) {
+                    this.refreshStatus();
+                }
+            });
             // 如果已经在系统控制标签页，立即加载
             const tab = document.getElementById('system-control-tab');
             if (tab && tab.classList.contains('active')) {
@@ -3618,6 +3630,7 @@ renderReplacementsTable() {
         },
 
         async loadData() {
+            const statusPromise = this.refreshStatus(false);
             try {
                 const [tagsRes, configRes, metricsRaw] = await Promise.all([
                     api.fetch('/api/v1/upstream/tags'),
@@ -3630,9 +3643,22 @@ renderReplacementsTable() {
                 this.state.config = configRes || {};
                 this.parseMetrics(metricsRaw);
                 this.renderTable();
+                await statusPromise;
+                this.updateStatusCells();
             } catch (e) {
                 console.error("Upstream data load failed", e);
                 ui.showToast('加载上游配置失败', 'error');
+            }
+        },
+
+        async refreshRuntimeData() {
+            const [metricsResult] = await Promise.allSettled([
+                api.getMetrics(),
+                this.refreshStatus()
+            ]);
+            if (metricsResult.status === 'fulfilled') {
+                this.parseMetrics(metricsResult.value);
+                this.updateMetricCells();
             }
         },
 
@@ -3665,6 +3691,325 @@ renderReplacementsTable() {
             };
         },
 
+        startStatusPolling() {
+            if (this.state.statusPollId) return;
+            this.state.statusPollId = setInterval(() => {
+                if (this.isStatusPanelActive()) this.refreshStatus();
+            }, 5000);
+        },
+
+        isStatusPanelActive() {
+            const tab = document.getElementById('system-control-tab');
+            const module = document.getElementById('upstream-dns-module');
+            return !document.hidden && !!tab?.classList.contains('active') && !!module && module.offsetParent !== null;
+        },
+
+        async refreshStatus(updateRows = true) {
+            if (this.state.statusRequest) return this.state.statusRequest;
+
+            this.state.statusRequest = (async () => {
+                const response = await fetch('/api/v1/upstream/status', {
+                    cache: 'no-store',
+                    headers: { 'Accept': 'application/json' }
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const payload = await response.json();
+                const items = Array.isArray(payload) ? payload : (Array.isArray(payload?.items) ? payload.items : []);
+                const next = new Map();
+                items.forEach(item => {
+                    if (!item || typeof item !== 'object') return;
+                    const group = String(item.plugin_tag || '');
+                    const tag = String(item.tag || '');
+                    if (!group || !tag) return;
+                    next.set(`${group}|${tag}`, item);
+                });
+
+                this.state.statusByKey = next;
+                this.state.statusLoaded = true;
+                this.state.statusError = '';
+                if (updateRows) this.updateStatusCells();
+                return items;
+            })().catch(error => {
+                if (!this.state.statusError) {
+                    console.warn('Upstream status refresh failed:', error);
+                }
+                this.state.statusError = error?.message || '状态接口不可用';
+                if (updateRows) this.updateStatusCells();
+                return [];
+            }).finally(() => {
+                this.state.statusRequest = null;
+            });
+
+            return this.state.statusRequest;
+        },
+
+        updateMetricCells() {
+            const tbody = document.getElementById('upstream-dns-tbody');
+            if (!tbody) return;
+            tbody.querySelectorAll('tr[data-group][data-upstream-tag]').forEach(row => {
+                const group = row.dataset.group || '';
+                const tag = row.dataset.upstreamTag || '';
+                const index = parseInt(row.dataset.index, 10);
+                const upstream = this.state.config[group]?.[index];
+                const stats = upstream?.enabled
+                    ? this.getStats(`${group}|${tag}`)
+                    : { avgLat: '-', query: '-', error: '-', rate: '-', winner: '-', winRate: '-' };
+                Object.entries(stats).forEach(([name, value]) => {
+                    row.querySelectorAll(`[data-upstream-stat="${name}"]`).forEach(el => {
+                        el.textContent = value;
+                        if (name === 'error') {
+                            el.style.color = Number(value) > 0 ? 'var(--color-danger)' : '';
+                        }
+                    });
+                });
+            });
+        },
+
+        updateStatusCells() {
+            const tbody = document.getElementById('upstream-dns-tbody');
+            if (!tbody) return;
+            tbody.querySelectorAll('tr[data-group][data-upstream-tag]').forEach(row => {
+                const group = row.dataset.group || '';
+                const tag = row.dataset.upstreamTag || '';
+                const index = parseInt(row.dataset.index, 10);
+                const upstream = this.state.config[group]?.[index] || { tag, protocol: row.dataset.protocol || '' };
+                const runtime = this.findRuntimeStatus(group, tag, upstream);
+                this.updateStatusRow(row, upstream, runtime);
+            });
+        },
+
+        findRuntimeStatus(group, tag, upstream) {
+            const exact = this.state.statusByKey.get(`${group}|${tag}`);
+            if (exact) return exact;
+
+            // 默认 YAML 上游可能没有 tag；运行时会以 configured_addr 作为 tag 回退。
+            const configuredAddr = String(upstream?.addr || '').trim();
+            if (!configuredAddr) return null;
+            for (const item of this.state.statusByKey.values()) {
+                if (String(item?.plugin_tag || '') === group
+                    && String(item?.configured_addr || '').trim() === configuredAddr) {
+                    return item;
+                }
+            }
+            return null;
+        },
+
+        updateStatusRow(row, upstream, runtime) {
+            const addresses = Array.isArray(runtime?.remote_addresses)
+                ? runtime.remote_addresses.filter(value => typeof value === 'string' && value.trim()).map(value => value.trim())
+                : [];
+
+            row.querySelectorAll('[data-upstream-runtime="remote"]').forEach(el => {
+                el.replaceChildren();
+                el.removeAttribute('title');
+                if (addresses.length === 0) {
+                    el.textContent = '—';
+                    return;
+                }
+                el.title = addresses.join('\n');
+                addresses.slice(0, 2).forEach(address => {
+                    const code = document.createElement('code');
+                    code.textContent = address;
+                    code.title = address;
+                    el.appendChild(code);
+                });
+                if (addresses.length > 2) {
+                    const more = document.createElement('small');
+                    more.className = 'upstream-runtime-more';
+                    more.textContent = `另 ${addresses.length - 2} 个地址`;
+                    el.appendChild(more);
+                }
+                if (runtime && Number(runtime.active_connections || 0) === 0) {
+                    const recentHint = document.createElement('small');
+                    recentHint.className = 'upstream-runtime-detail';
+                    recentHint.textContent = '最近使用地址（当前无活动连接）';
+                    el.appendChild(recentHint);
+                }
+                if (runtime?.socks5 === true) {
+                    const proxyHint = document.createElement('small');
+                    proxyHint.className = 'upstream-runtime-detail';
+                    proxyHint.textContent = '代理对端；最终 DNS IP 由代理决定';
+                    el.appendChild(proxyHint);
+                }
+            });
+
+            const protocolText = this.getProtocolAndPort(runtime, upstream, addresses);
+            row.querySelectorAll('[data-upstream-runtime="protocol"]').forEach(el => {
+                el.textContent = protocolText;
+                el.title = protocolText;
+            });
+
+            row.querySelectorAll('[data-upstream-runtime="time"]').forEach(el => {
+                el.replaceChildren();
+                const activity = this.formatRuntimeTime(runtime?.last_activity_time);
+                const connected = this.formatRuntimeTime(runtime?.last_connect_time);
+                if (!activity && !connected) {
+                    el.textContent = '—';
+                    return;
+                }
+                const addLine = (label, value, raw) => {
+                    const line = document.createElement('div');
+                    line.textContent = `${label} ${value}`;
+                    if (raw) line.title = raw;
+                    el.appendChild(line);
+                };
+                if (activity && connected && runtime.last_activity_time === runtime.last_connect_time) {
+                    addLine('连接/通信', activity, runtime.last_activity_time);
+                } else {
+                    if (activity) addLine('通信', activity, runtime.last_activity_time);
+                    if (connected) addLine('连接', connected, runtime.last_connect_time);
+                }
+            });
+
+            const statusInfo = this.getStatusInfo(upstream, runtime);
+            row.querySelectorAll('[data-upstream-runtime="status"]').forEach(el => {
+                el.replaceChildren();
+                const chip = document.createElement('span');
+                chip.className = `upstream-status-chip upstream-status-${statusInfo.className}`;
+                chip.textContent = statusInfo.label;
+                if (statusInfo.title) chip.title = statusInfo.title;
+                el.appendChild(chip);
+
+                const activeConnections = Number(runtime?.active_connections || 0);
+                if (activeConnections > 0) {
+                    const detail = document.createElement('small');
+                    detail.className = 'upstream-runtime-detail';
+                    detail.textContent = `${activeConnections} 个活动连接`;
+                    el.appendChild(detail);
+                }
+                if (runtime?.last_error) {
+                    const error = document.createElement('small');
+                    error.className = 'upstream-runtime-error';
+                    error.textContent = String(runtime.last_error);
+                    error.title = String(runtime.last_error);
+                    el.appendChild(error);
+                }
+            });
+
+            row.querySelectorAll('[data-upstream-runtime="socks5"]').forEach(el => {
+                el.replaceChildren();
+                const hasRuntime = !!runtime;
+                const runtimeProtocol = String(runtime?.protocol || upstream?.protocol || '').toLowerCase();
+                const runtimeTransport = String(runtime?.transport || '').toLowerCase();
+                const socksUnsupported = ['udp', 'doh3', 'h3', 'doq', 'quic'].includes(runtimeProtocol)
+                    || ['http3', 'h3', 'quic', 'udp'].includes(runtimeTransport)
+                    || (!hasRuntime && upstream?.enable_http3 === true);
+                const configuredSocks = typeof upstream?.socks5 === 'string' ? upstream.socks5.trim() : '';
+                const throughSocks = hasRuntime ? runtime.socks5 === true : !!configuredSocks;
+                const runtimeState = String(runtime?.status || '').toLowerCase();
+                const label = document.createElement('span');
+                label.textContent = socksUnsupported && !throughSocks
+                    ? '不支持'
+                    : (hasRuntime ? (throughSocks ? (runtimeState === 'unused' ? '已配置' : '是') : '否') : (throughSocks ? '已配置' : '否'));
+                el.appendChild(label);
+                const address = hasRuntime ? String(runtime.socks5_addr || '').trim() : configuredSocks;
+                if (throughSocks && address) {
+                    const detail = document.createElement('small');
+                    detail.className = 'upstream-runtime-detail';
+                    detail.textContent = address;
+                    detail.title = address;
+                    el.appendChild(detail);
+                }
+            });
+        },
+
+        getStatusInfo(upstream, runtime) {
+            if (this.state.statusError) {
+                return { label: '刷新失败', className: 'unavailable', title: this.state.statusError };
+            }
+            if (!this.state.statusLoaded) {
+                return { label: '加载中', className: 'unavailable', title: '' };
+            }
+            if (!runtime) {
+                return upstream?.enabled === false
+                    ? { label: '已禁用', className: 'disabled', title: '' }
+                    : { label: '尚未使用', className: 'unused', title: '' };
+            }
+
+            const code = String(runtime.status || '').toLowerCase();
+            const states = {
+                connected: { label: '已连接', className: 'connected' },
+                idle: { label: '空闲', className: 'idle' },
+                ok: { label: '通信正常', className: 'ok' },
+                failed: { label: '失败', className: 'failed' },
+                unused: { label: '尚未使用', className: 'unused' }
+            };
+            const result = states[code] || { label: code || '未知', className: 'unavailable' };
+            return { ...result, title: runtime.last_error ? String(runtime.last_error) : '' };
+        },
+
+        getProtocolAndPort(runtime, upstream, addresses) {
+            const protocol = String(runtime?.protocol || upstream?.protocol || '').toLowerCase();
+            const transport = String(runtime?.transport || '').toLowerCase();
+            const protocolLabels = {
+                udp: 'UDP', tcp: 'TCP', tls: 'DoT', dot: 'DoT',
+                https: 'DoH', doh: 'DoH', doh3: 'DoH3', h3: 'DoH3',
+                quic: 'DoQ', doq: 'DoQ', aliapi: 'AliAPI'
+            };
+            const transportLabels = {
+                udp: 'UDP', tcp: 'TCP', tls: 'TLS', https: 'HTTPS', http: 'HTTP',
+                http1: 'HTTP/1.1', 'http/1.1': 'HTTP/1.1', http2: 'HTTP/2', h2: 'HTTP/2',
+                http3: 'HTTP/3', h3: 'HTTP/3', quic: 'QUIC'
+            };
+            const fallbackTransport = {
+                udp: 'UDP', tcp: 'TCP', tls: 'TLS', dot: 'TLS',
+                https: 'HTTPS', doh: 'HTTPS', doh3: 'HTTP/3', h3: 'HTTP/3',
+                quic: 'QUIC', doq: 'QUIC'
+            };
+            const defaultPorts = {
+                udp: '53', tcp: '53', tls: '853', dot: '853',
+                https: '443', doh: '443', doh3: '443', h3: '443',
+                quic: '853', doq: '853', aliapi: '80'
+            };
+
+            const portSources = [
+                ...addresses,
+                runtime?.dial_addr,
+                runtime?.configured_addr,
+                upstream?.dial_addr,
+                upstream?.addr,
+                upstream?.server_addr
+            ].filter(Boolean);
+            const ports = [];
+            portSources.forEach(source => {
+                const port = this.extractPort(String(source));
+                if (port && !ports.includes(port)) ports.push(port);
+            });
+            if (ports.length === 0 && defaultPorts[protocol]) ports.push(defaultPorts[protocol]);
+
+            const logicalLabel = protocolLabels[protocol] || (protocol ? protocol.toUpperCase() : '未知');
+            const transportLabel = transportLabels[transport] || fallbackTransport[protocol] || '';
+            const portText = ports.length ? `/${ports.slice(0, 2).join(',')}` : '';
+            if (transportLabel && transportLabel !== logicalLabel) {
+                return `${logicalLabel} · ${transportLabel}${portText}`;
+            }
+            return `${logicalLabel}${portText}`;
+        },
+
+        extractPort(address) {
+            const value = String(address || '').trim();
+            if (!value) return '';
+            try {
+                if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+                    const parsed = new URL(value);
+                    if (parsed.port) return parsed.port;
+                }
+            } catch (_) { }
+            const bracketed = value.match(/^\[[^\]]+\]:(\d+)$/);
+            if (bracketed) return bracketed[1];
+            const hostPort = value.match(/^[^:]+:(\d+)$/);
+            return hostPort ? hostPort[1] : '';
+        },
+
+        formatRuntimeTime(value) {
+            if (!value) return '';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return String(value);
+            const pad = number => String(number).padStart(2, '0');
+            return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        },
+
 renderTable() {
             const tbody = document.getElementById('upstream-dns-tbody');
             if (!tbody) return;
@@ -3689,7 +4034,7 @@ renderTable() {
             }
 
             if (allUpstreams.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="text-center" style="padding:2rem;">暂无上游配置，请点击添加。</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="16" class="text-center" style="padding:2rem;">暂无上游配置，请点击添加。</td></tr>';
                 return;
             }
 
@@ -3711,6 +4056,8 @@ renderTable() {
                 const tr = document.createElement('tr');
                 tr.dataset.group = group; 
                 tr.dataset.index = index; 
+                tr.dataset.upstreamTag = u.tag || '';
+                tr.dataset.protocol = u.protocol || '';
                 
                 if (!u.enabled) tr.style.opacity = '0.6';
 
@@ -3729,15 +4076,37 @@ renderTable() {
                                         <span class="slider"></span>
                                     </label>
                                 </div>
+                                <div class="upstream-mobile-runtime">
+                                    <div class="mobile-stat-item upstream-runtime-address-item">
+                                        <span class="mobile-stat-label">当前连接 IP</span>
+                                        <div class="mobile-stat-value upstream-runtime-endpoints" data-upstream-runtime="remote">—</div>
+                                    </div>
+                                    <div class="mobile-stat-item">
+                                        <span class="mobile-stat-label">协议 / 端口</span>
+                                        <span class="mobile-stat-value upstream-runtime-protocol" data-upstream-runtime="protocol">—</span>
+                                    </div>
+                                    <div class="mobile-stat-item">
+                                        <span class="mobile-stat-label">连接状态</span>
+                                        <div class="mobile-stat-value" data-upstream-runtime="status"></div>
+                                    </div>
+                                    <div class="mobile-stat-item">
+                                        <span class="mobile-stat-label">最近连接 / 通信</span>
+                                        <div class="mobile-stat-value upstream-runtime-time" data-upstream-runtime="time">—</div>
+                                    </div>
+                                    <div class="mobile-stat-item">
+                                        <span class="mobile-stat-label">SOCKS5</span>
+                                        <div class="mobile-stat-value upstream-runtime-socks" data-upstream-runtime="socks5">—</div>
+                                    </div>
+                                </div>
                                 <div class="mobile-stats-grid">
-                                    <div class="mobile-stat-item"><span class="mobile-stat-label">平均响应</span><span class="mobile-stat-value">${stats.avgLat}</span></div>
-                                    <div class="mobile-stat-item"><span class="mobile-stat-label">请求数</span><span class="mobile-stat-value">${stats.query}</span></div>
+                                    <div class="mobile-stat-item"><span class="mobile-stat-label">平均响应</span><span class="mobile-stat-value" data-upstream-stat="avgLat">${stats.avgLat}</span></div>
+                                    <div class="mobile-stat-item"><span class="mobile-stat-label">请求数</span><span class="mobile-stat-value" data-upstream-stat="query">${stats.query}</span></div>
                                     
-                                    <div class="mobile-stat-item"><span class="mobile-stat-label">采纳数</span><span class="mobile-stat-value">${stats.winner}</span></div>
-                                    <div class="mobile-stat-item"><span class="mobile-stat-label">采纳率</span><span class="mobile-stat-value">${stats.winRate}</span></div>
+                                    <div class="mobile-stat-item"><span class="mobile-stat-label">采纳数</span><span class="mobile-stat-value" data-upstream-stat="winner">${stats.winner}</span></div>
+                                    <div class="mobile-stat-item"><span class="mobile-stat-label">采纳率</span><span class="mobile-stat-value" data-upstream-stat="winRate">${stats.winRate}</span></div>
                                     
-                                    <div class="mobile-stat-item"><span class="mobile-stat-label">错误数</span><span class="mobile-stat-value" style="${stats.error > 0 ? 'color:var(--color-danger)' : ''}">${stats.error}</span></div>
-                                    <div class="mobile-stat-item"><span class="mobile-stat-label">出错率</span><span class="mobile-stat-value">${stats.rate}</span></div>
+                                    <div class="mobile-stat-item"><span class="mobile-stat-label">错误数</span><span class="mobile-stat-value" data-upstream-stat="error" style="${stats.error > 0 ? 'color:var(--color-danger)' : ''}">${stats.error}</span></div>
+                                    <div class="mobile-stat-item"><span class="mobile-stat-label">出错率</span><span class="mobile-stat-value" data-upstream-stat="rate">${stats.rate}</span></div>
                                 </div>
                                 <div class="mobile-card-actions">
                                     <button class="button secondary small edit-btn" style="flex:1;">编辑</button>
@@ -3758,12 +4127,17 @@ renderTable() {
                         <td>${group}</td>
                         <td>${u.tag}</td>
                         <td>${u.protocol}</td>
-                        <td class="text-center">${stats.avgLat}</td>
-                        <td class="text-center">${stats.query}</td>
-                        <td class="text-center">${stats.winner}</td>
-                        <td class="text-center">${stats.winRate}</td>
-                        <td class="text-center">${stats.error}</td>
-                        <td class="text-center">${stats.rate}</td>
+                        <td><div class="upstream-runtime-endpoints" data-upstream-runtime="remote">—</div></td>
+                        <td><span class="upstream-runtime-protocol" data-upstream-runtime="protocol">—</span></td>
+                        <td><div class="upstream-runtime-time" data-upstream-runtime="time">—</div></td>
+                        <td class="text-center"><div data-upstream-runtime="status"></div></td>
+                        <td><div class="upstream-runtime-socks" data-upstream-runtime="socks5">—</div></td>
+                        <td class="text-center" data-upstream-stat="avgLat">${stats.avgLat}</td>
+                        <td class="text-center" data-upstream-stat="query">${stats.query}</td>
+                        <td class="text-center" data-upstream-stat="winner">${stats.winner}</td>
+                        <td class="text-center" data-upstream-stat="winRate">${stats.winRate}</td>
+                        <td class="text-center" data-upstream-stat="error">${stats.error}</td>
+                        <td class="text-center" data-upstream-stat="rate">${stats.rate}</td>
                         <td class="text-center">
                              <div style="display: inline-flex; gap: 0.5rem;">
                                 <button class="button secondary small edit-btn" style="padding: 0.3rem 0.6rem;">编辑</button>
@@ -3773,6 +4147,7 @@ renderTable() {
                     `;
                 }
                 tbody.appendChild(tr);
+                this.updateStatusRow(tr, u, this.findRuntimeStatus(group, u.tag || '', u));
             });
         },
 

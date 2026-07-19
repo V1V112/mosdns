@@ -21,8 +21,10 @@ package fastforward
 
 import (
 	"context"
+	"net"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
 	"github.com/miekg/dns"
@@ -41,6 +43,7 @@ type upstreamWrapper struct {
 
 	connOpened prometheus.Counter
 	connClosed prometheus.Counter
+	runtimeKey string
 }
 
 func (uw *upstreamWrapper) OnEvent(typ upstream.Event) {
@@ -52,6 +55,31 @@ func (uw *upstreamWrapper) OnEvent(typ upstream.Event) {
 	}
 }
 
+func (uw *upstreamWrapper) OnConnectionEvent(typ upstream.Event, remote net.Addr) {
+	remoteAddr := ""
+	if remote != nil {
+		remoteAddr = remote.String()
+	}
+	coremain.ReportUpstreamConnection(uw.runtimeKey, remoteAddr, typ == upstream.EventConnOpen)
+}
+
+func (uw *upstreamWrapper) registerRuntime(pluginTag string) {
+	endpoint := upstream.DescribeEndpoint(uw.cfg.Addr, uw.cfg.EnableHTTP3)
+	socks5Addr := ""
+	if endpoint.SupportsSocks {
+		socks5Addr = uw.cfg.Socks5
+	}
+	uw.runtimeKey = coremain.RegisterUpstreamRuntime(coremain.UpstreamRuntimeMeta{
+		PluginTag:      pluginTag,
+		Tag:            uw.name(),
+		Protocol:       endpoint.Protocol,
+		Transport:      endpoint.Transport,
+		ConfiguredAddr: uw.cfg.Addr,
+		DialAddr:       uw.cfg.DialAddr,
+		Socks5Addr:     socks5Addr,
+	})
+}
+
 // newWrapper inits all metrics.
 // Note: upstreamWrapper.u still needs to be set.
 func newWrapper(idx int, cfg UpstreamConfig, pluginTag string) *upstreamWrapper {
@@ -61,6 +89,7 @@ func newWrapper(idx int, cfg UpstreamConfig, pluginTag string) *upstreamWrapper 
 	}
 	lb := map[string]string{"upstream": upstreamName, "tag": pluginTag}
 	return &upstreamWrapper{
+		idx: idx,
 		cfg: cfg,
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name:        "query_total",
@@ -129,6 +158,7 @@ func (uw *upstreamWrapper) ExchangeContext(ctx context.Context, m []byte) (*[]by
 	uw.thread.Inc()
 	r, err := uw.u.ExchangeContext(ctx, m)
 	uw.thread.Dec()
+	coremain.ReportUpstreamExchange(uw.runtimeKey, err)
 
 	if err != nil {
 		uw.errTotal.Inc()
@@ -139,7 +169,10 @@ func (uw *upstreamWrapper) ExchangeContext(ctx context.Context, m []byte) (*[]by
 }
 
 func (uw *upstreamWrapper) Close() error {
-	return uw.u.Close()
+	err := uw.u.Close()
+	coremain.UnregisterUpstreamRuntime(uw.runtimeKey)
+	uw.runtimeKey = ""
+	return err
 }
 
 type queryInfo dns.Msg

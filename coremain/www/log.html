@@ -444,6 +444,111 @@
         
         [hidden] { display: none !important; }
         .info-icon { color: var(--color-text-secondary); cursor: help; margin-left: 0.5rem; }
+
+        /* 上游 DNS 运行状态 */
+        .upstream-runtime-endpoints {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.2rem;
+            min-width: 0;
+        }
+        .upstream-runtime-endpoints code {
+            display: block;
+            max-width: 190px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--color-text-primary);
+            font-size: 0.78rem;
+        }
+        .upstream-runtime-more,
+        .upstream-runtime-detail,
+        .upstream-runtime-error {
+            display: block;
+            margin-top: 0.15rem;
+            color: var(--color-text-secondary);
+            font-size: 0.72rem;
+            line-height: 1.35;
+        }
+        .upstream-runtime-error {
+            max-width: 150px;
+            overflow: hidden;
+            color: var(--color-danger);
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .upstream-runtime-protocol {
+            color: var(--color-text-primary);
+            font-size: 0.82rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .upstream-runtime-time {
+            min-width: 138px;
+            color: var(--color-text-primary);
+            font-size: 0.76rem;
+            line-height: 1.45;
+            white-space: nowrap;
+        }
+        .upstream-status-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.2rem 0.55rem;
+            border: 1px solid var(--color-border);
+            border-radius: 999px;
+            background: var(--color-bg-alt);
+            color: var(--color-text-secondary);
+            font-size: 0.75rem;
+            font-weight: 600;
+            line-height: 1.3;
+            white-space: nowrap;
+        }
+        .upstream-status-chip::before {
+            width: 0.45rem;
+            height: 0.45rem;
+            border-radius: 50%;
+            background: currentColor;
+            content: '';
+            flex: none;
+        }
+        .upstream-status-connected,
+        .upstream-status-ok { color: var(--color-success); }
+        .upstream-status-idle { color: var(--color-warning, #f59e0b); }
+        .upstream-status-failed { color: var(--color-danger); }
+        .upstream-status-unused,
+        .upstream-status-unavailable,
+        .upstream-status-disabled { color: var(--color-text-secondary); }
+        .upstream-runtime-socks {
+            max-width: 150px;
+            color: var(--color-text-primary);
+            font-size: 0.78rem;
+            line-height: 1.4;
+            word-break: break-all;
+        }
+
+        @media (max-width: 1024px) {
+            .upstream-mobile-runtime {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 0.8rem;
+                padding-bottom: 0.8rem;
+                border-bottom: 1px solid var(--color-border);
+            }
+            .upstream-mobile-runtime .upstream-runtime-address-item {
+                grid-column: 1 / -1;
+            }
+            .upstream-mobile-runtime .upstream-runtime-endpoints code,
+            .upstream-mobile-runtime .upstream-runtime-error,
+            .upstream-mobile-runtime .upstream-runtime-socks {
+                max-width: 100%;
+            }
+            .upstream-mobile-runtime .upstream-runtime-time {
+                min-width: 0;
+                white-space: normal;
+            }
+        }
     </style>
 </head>
 
@@ -1485,13 +1590,18 @@
                     </div>
 
                     <div class="scrollable-table-container">
-                        <table class="data-table" id="upstream-dns-table" style="min-width: 1000px;">
+                        <table class="data-table" id="upstream-dns-table" style="min-width: 1600px;">
                             <thead>
                                 <tr>
                                     <th style="width: 80px; white-space: nowrap;">启用</th>
                                     <th style="min-width: 120px;">所属组</th>
                                     <th style="min-width: 100px;">名称</th>
-                                    <th style="min-width: 60px; white-space: nowrap;">类型</th>
+                                    <th style="min-width: 75px; white-space: nowrap;">配置类型</th>
+                                    <th style="min-width: 180px;">当前连接 IP</th>
+                                    <th style="min-width: 120px; white-space: nowrap;">协议 / 端口</th>
+                                    <th style="min-width: 150px; white-space: nowrap;">最近连接 / 通信</th>
+                                    <th class="text-center" style="min-width: 110px; white-space: nowrap;">连接状态</th>
+                                    <th style="min-width: 130px;">SOCKS5</th>
                                     <th class="text-center" style="min-width: 100px; white-space: nowrap;">平均响应</th>
                                     <th class="text-center">请求数</th>
                                     <th class="text-center">采纳数</th>

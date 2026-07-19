@@ -89,7 +89,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	defaults := make([]coremain.UpstreamOverrideConfig, 0, len(a.Upstreams))
 	for _, u := range a.Upstreams {
 		defaults = append(defaults, coremain.UpstreamOverrideConfig{
-			Tag: u.Tag, Enabled: true, Protocol: protocolFromAddr(u.Addr),
+			Tag: u.Tag, Enabled: true, Protocol: protocolFromAddr(u.Addr, u.EnableHTTP3),
 			Addr: u.Addr, DialAddr: u.DialAddr, IdleTimeout: u.IdleTimeout,
 			UpstreamQueryTimeout: u.UpstreamQueryTimeout, EnablePipeline: u.EnablePipeline,
 			EnableHTTP3: u.EnableHTTP3, InsecureSkipVerify: u.InsecureSkipVerify,
@@ -128,17 +128,16 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	return f, nil
 }
 
-func protocolFromAddr(addr string) string {
-	lower := strings.ToLower(addr)
-	switch {
-	case strings.HasPrefix(lower, "https://"):
-		return "https"
-	case strings.HasPrefix(lower, "tls://"):
-		return "tls"
-	case strings.HasPrefix(lower, "quic://"):
-		return "quic"
-	case strings.HasPrefix(lower, "tcp://"):
+func protocolFromAddr(addr string, enableHTTP3 bool) string {
+	switch upstream.DescribeEndpoint(addr, enableHTTP3).Protocol {
+	case "tcp":
 		return "tcp"
+	case "dot":
+		return "tls"
+	case "doh", "doh3":
+		return "https"
+	case "doq":
+		return "quic"
 	default:
 		return "udp"
 	}
@@ -186,6 +185,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 
 	for i, c := range args.Upstreams {
 		if len(c.Addr) == 0 {
+			_ = f.Close()
 			return nil, fmt.Errorf("#%d upstream invalid args, addr is required", i)
 		}
 		applyGlobal(&c)
@@ -215,6 +215,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 			return nil, fmt.Errorf("failed to init upstream #%d: %w", i, err)
 		}
 		uw.u = u
+		uw.registerRuntime(opt.MetricsTag)
 		f.us = append(f.us, uw)
 
 		if len(c.Tag) > 0 {

@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"time"
@@ -95,7 +96,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	a := args.(*Args)
 	defaults := make([]coremain.UpstreamOverrideConfig, 0, len(a.Upstreams))
 	for _, u := range a.Upstreams {
-		protocol := protocolFromAddr(u.Addr)
+		protocol := protocolFromAddr(u.Addr, u.EnableHTTP3)
 		if u.Type == "aliapi" {
 			protocol = "aliapi"
 		}
@@ -191,17 +192,16 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	return f, nil
 }
 
-func protocolFromAddr(addr string) string {
-	lower := strings.ToLower(addr)
-	switch {
-	case strings.HasPrefix(lower, "https://"):
-		return "https"
-	case strings.HasPrefix(lower, "tls://"):
-		return "tls"
-	case strings.HasPrefix(lower, "quic://"):
-		return "quic"
-	case strings.HasPrefix(lower, "tcp://"):
+func protocolFromAddr(addr string, enableHTTP3 bool) string {
+	switch upstream.DescribeEndpoint(addr, enableHTTP3).Protocol {
+	case "tcp":
 		return "tcp"
+	case "dot":
+		return "tls"
+	case "doh", "doh3":
+		return "https"
+	case "doq":
+		return "quic"
 	default:
 		return "udp"
 	}
@@ -268,6 +268,7 @@ func NewAliAPI(args *Args, opt Opts) (*AliAPI, error) {
 
 		if c.Type == "aliapi" {
 			if args.AccountID == "" || args.AccessKeyID == "" || args.AccessKeySecret == "" {
+				_ = f.Close()
 				return nil, fmt.Errorf("aliapi upstream requires account_id, access_key_id, and access_key_secret to be set in plugin args")
 			}
 			aliAPIArgs := AliAPIUpstreamArgs{
@@ -281,6 +282,7 @@ func NewAliAPI(args *Args, opt Opts) (*AliAPI, error) {
 			u = NewAliAPIUpstream(aliAPIArgs, opt.Logger)
 		} else {
 			if len(c.Addr) == 0 {
+				_ = f.Close()
 				return nil, fmt.Errorf("#%d upstream invalid args, addr is required for type 'dns'", i)
 			}
 			uOpt := upstream.Opt{
@@ -308,6 +310,7 @@ func NewAliAPI(args *Args, opt Opts) (*AliAPI, error) {
 		}
 
 		uw.u = u
+		uw.registerRuntime(opt.MetricsTag, args.ServerAddr)
 		f.us = append(f.us, uw)
 
 		if len(c.Tag) > 0 {
@@ -814,13 +817,14 @@ type upstreamWrapper struct {
 	cfg        UpstreamConfig
 	metricsTag string
 
-	mQueryTotal prometheus.Counter
-	mErrorTotal prometheus.Counter
-        mWinnerTotal     prometheus.Counter
-	mInflight   prometheus.Gauge
-        mResponseLatency prometheus.Histogram
-        mConnOpened prometheus.Counter
-        mConnClosed prometheus.Counter
+	mQueryTotal      prometheus.Counter
+	mErrorTotal      prometheus.Counter
+	mWinnerTotal     prometheus.Counter
+	mInflight        prometheus.Gauge
+	mResponseLatency prometheus.Histogram
+	mConnOpened      prometheus.Counter
+	mConnClosed      prometheus.Counter
+	runtimeKey       string
 }
 
 func (w *upstreamWrapper) OnEvent(e upstream.Event) {
@@ -830,6 +834,44 @@ func (w *upstreamWrapper) OnEvent(e upstream.Event) {
 	case upstream.EventConnClose:
 		w.mConnClosed.Inc()
 	}
+}
+
+func (w *upstreamWrapper) OnConnectionEvent(event upstream.Event, remote net.Addr) {
+	remoteAddr := ""
+	if remote != nil {
+		remoteAddr = remote.String()
+	}
+	coremain.ReportUpstreamConnection(w.runtimeKey, remoteAddr, event == upstream.EventConnOpen)
+}
+
+func (w *upstreamWrapper) registerRuntime(pluginTag, aliServerAddr string) {
+	tag := w.cfg.Tag
+	if tag == "" {
+		tag = w.cfg.Addr
+	}
+	meta := coremain.UpstreamRuntimeMeta{
+		PluginTag:      pluginTag,
+		Tag:            tag,
+		ConfiguredAddr: w.cfg.Addr,
+		DialAddr:       w.cfg.DialAddr,
+	}
+	if w.cfg.Type == "aliapi" {
+		if tag == "" {
+			meta.Tag = "aliapi"
+		}
+		meta.Protocol = "aliapi"
+		meta.Transport = "http"
+		meta.ConfiguredAddr = "http://" + aliServerAddr
+		meta.DialAddr = aliServerAddr
+	} else {
+		endpoint := upstream.DescribeEndpoint(w.cfg.Addr, w.cfg.EnableHTTP3)
+		meta.Protocol = endpoint.Protocol
+		meta.Transport = endpoint.Transport
+		if endpoint.SupportsSocks {
+			meta.Socks5Addr = w.cfg.Socks5
+		}
+	}
+	w.runtimeKey = coremain.RegisterUpstreamRuntime(meta)
 }
 
 func newWrapper(idx int, c UpstreamConfig, metricsTag string) *upstreamWrapper {
@@ -910,11 +952,21 @@ func (w *upstreamWrapper) ExchangeContext(ctx context.Context, req []byte) (*[]b
 	w.mQueryTotal.Inc()
 	w.mInflight.Inc()
 
-	start := time.Now() 
+	start := time.Now()
+	if w.cfg.Type == "aliapi" {
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if info.Conn != nil && info.Conn.RemoteAddr() != nil {
+					coremain.ReportUpstreamRemoteAddress(w.runtimeKey, info.Conn.RemoteAddr().String(), !info.Reused)
+				}
+			},
+		})
+	}
 
 	resp, err := w.u.ExchangeContext(ctx, req) // Call the wrapped upstream's method
 
 	w.mInflight.Dec() // Always decrement inflight after the exchange completes
+	coremain.ReportUpstreamExchange(w.runtimeKey, err)
 
 	if err != nil {
 		w.mErrorTotal.Inc()
@@ -926,7 +978,10 @@ func (w *upstreamWrapper) ExchangeContext(ctx context.Context, req []byte) (*[]b
 }
 
 func (w *upstreamWrapper) Close() error {
-	return w.u.Close()
+	err := w.u.Close()
+	coremain.UnregisterUpstreamRuntime(w.runtimeKey)
+	w.runtimeKey = ""
+	return err
 }
 
 func (w *upstreamWrapper) registerMetricsTo(r prometheus.Registerer) error {

@@ -376,7 +376,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 				tlsConn.Close()
 				return nil, err
 			}
-			return wrapConn(tlsConn, opt.EventObserver), nil
+			// The underlying TCP connection is already observed. Wrapping the TLS
+			// layer again would count one physical connection twice.
+			return tlsConn, nil
 		}
 
 		if opt.EnablePipeline {
@@ -436,7 +438,11 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 					if err != nil {
 						return nil, err
 					}
-					return quicTransport.DialEarly(ctx, ua, tlsCfg, cfg)
+					c, err := quicTransport.DialEarly(ctx, ua, tlsCfg, cfg)
+					if err == nil {
+						observeQUICConnection(c, opt.EventObserver)
+					}
+					return c, err
 				},
 				MaxResponseHeaderBytes: 4 * 1024,
 			}
@@ -539,6 +545,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			if err != nil {
 				return nil, err
 			}
+			observeQUICConnection(c, opt.EventObserver)
 			return transport.NewQuicDnsConn(c), nil
 		}
 

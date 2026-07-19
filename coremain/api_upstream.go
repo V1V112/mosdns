@@ -71,8 +71,17 @@ func RegisterUpstreamAPI(router *chi.Mux) {
 	router.Route("/api/v1/upstream", func(r chi.Router) {
 		r.Get("/tags", handleGetAliAPITags)
 		r.Get("/config", handleGetUpstreamConfig)
+		r.Get("/status", handleGetUpstreamStatus)
 		r.Post("/config", handleSetUpstreamConfig)
 	})
+}
+
+func handleGetUpstreamStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(struct {
+		Items []UpstreamRuntimeStatus `json:"items"`
+	}{Items: GetUpstreamRuntimeStatuses()})
 }
 
 // GetUpstreamOverrides 供 aliapi 插件初始化调用
