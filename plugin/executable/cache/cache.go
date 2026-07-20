@@ -73,6 +73,8 @@ const (
 	defaultActiveRefreshWorkers        = 16
 	defaultActiveRefreshMaxIdleTime    = 3600
 	defaultActiveRefreshMaxQPS         = 30
+	// RefreshBurst and MaxTasksPerBatch use these historical defaults as
+	// baselines and scale linearly when MaxRefreshQPS is changed.
 	defaultActiveRefreshBurst          = 60
 	defaultActiveRefreshMaxBatch       = 256
 	defaultActiveRefreshMaxPending     = 2048
@@ -490,6 +492,33 @@ func (a *Args) init() {
 	a.ActiveRefresh.init(a.Size)
 }
 
+func activeRefreshLimitForQPS(qps float64, baseline int) int {
+	// The caller applies and validates MaxRefreshQPS before reaching here.
+	// Still saturate the conversion so an otherwise valid, very large QPS
+	// cannot overflow int while deriving an omitted limit.
+	maxInt := int(^uint(0) >> 1)
+	maxQPS := float64(maxInt) * defaultActiveRefreshMaxQPS / float64(baseline)
+	if math.IsInf(qps, 1) || qps >= maxQPS {
+		return maxInt
+	}
+	scaled := qps * float64(baseline) / defaultActiveRefreshMaxQPS
+	if math.IsInf(scaled, 1) || scaled >= float64(maxInt) {
+		return maxInt
+	}
+	return max(1, int(math.Ceil(scaled)))
+}
+
+func activeRefreshMaxBatchForQPS(qps float64, maxPending int) int {
+	scaled := activeRefreshLimitForQPS(qps, defaultActiveRefreshMaxBatch)
+	// A tiny batch makes an already-due future heap wake the scheduler in a
+	// tight series of zero-delay loops. Keep automatic batches at least as
+	// large as the scheduler's normal cleanup pass, but never move more than
+	// the pending queue (or its default capacity) in one lock hold.
+	floor := min(activeRefreshEvictionProbes, maxPending)
+	ceiling := min(defaultActiveRefreshMaxPending, maxPending)
+	return min(ceiling, max(floor, scaled))
+}
+
 func (a *ActiveRefreshArgs) init(_ int) {
 	utils.SetDefaultUnsignNum(&a.Threshold, defaultActiveRefreshThreshold)
 	utils.SetDefaultUnsignNum(&a.RequeryTimeoutMS, defaultActiveRefreshRequeryTimeout)
@@ -498,9 +527,13 @@ func (a *ActiveRefreshArgs) init(_ int) {
 		a.MaxIdleTime = defaultActiveRefreshMaxIdleTime
 	}
 	utils.SetDefaultUnsignNum(&a.MaxRefreshQPS, defaultActiveRefreshMaxQPS)
-	utils.SetDefaultUnsignNum(&a.RefreshBurst, defaultActiveRefreshBurst)
-	utils.SetDefaultUnsignNum(&a.MaxTasksPerBatch, defaultActiveRefreshMaxBatch)
 	utils.SetDefaultUnsignNum(&a.MaxPendingTasks, defaultActiveRefreshMaxPending)
+	if a.RefreshBurst == 0 {
+		a.RefreshBurst = activeRefreshLimitForQPS(a.MaxRefreshQPS, defaultActiveRefreshBurst)
+	}
+	if a.MaxTasksPerBatch == 0 {
+		a.MaxTasksPerBatch = activeRefreshMaxBatchForQPS(a.MaxRefreshQPS, a.MaxPendingTasks)
+	}
 	if !a.maxRetryTimesConfigured && a.MaxRetryTimes == 0 {
 		a.MaxRetryTimes = defaultActiveRefreshMaxRetry
 	}
