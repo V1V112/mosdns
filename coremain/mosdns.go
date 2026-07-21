@@ -55,6 +55,8 @@ type Mosdns struct {
 	plugins       map[string]any
 	pluginTypes   map[string]string
 	pluginsLoaded atomic.Bool
+	pluginsReady  chan struct{}
+	readyOnce     sync.Once
 
 	httpMux         *chi.Mux
 	metricsReg      *prometheus.Registry
@@ -80,12 +82,13 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	GlobalAuditCollector.StartWorker()
 
 	m := &Mosdns{
-		logger:      lg,
-		plugins:     make(map[string]any),
-		pluginTypes: make(map[string]string),
-		httpMux:     chi.NewRouter(),
-		metricsReg:  newMetricsReg(),
-		sc:          safe_close.NewSafeClose(),
+		logger:       lg,
+		plugins:      make(map[string]any),
+		pluginTypes:  make(map[string]string),
+		pluginsReady: make(chan struct{}),
+		httpMux:      chi.NewRouter(),
+		metricsReg:   newMetricsReg(),
+		sc:           safe_close.NewSafeClose(),
 	}
 
 	// <<< START OF MODIFICATIONS >>>
@@ -184,7 +187,7 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 		_ = m.sc.WaitClosed()
 		return nil, err
 	}
-	m.pluginsLoaded.Store(true)
+	m.markPluginsReady()
 	m.logger.Info("all plugins are loaded")
 
 	return m, nil
@@ -193,14 +196,15 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 // NewTestMosdnsWithPlugins returns a mosdns instance for testing.
 func NewTestMosdnsWithPlugins(p map[string]any) *Mosdns {
 	m := &Mosdns{
-		logger:      mlog.Nop(),
-		httpMux:     chi.NewRouter(),
-		plugins:     p,
-		pluginTypes: make(map[string]string),
-		metricsReg:  newMetricsReg(),
-		sc:          safe_close.NewSafeClose(),
+		logger:       mlog.Nop(),
+		httpMux:      chi.NewRouter(),
+		plugins:      p,
+		pluginTypes:  make(map[string]string),
+		pluginsReady: make(chan struct{}),
+		metricsReg:   newMetricsReg(),
+		sc:           safe_close.NewSafeClose(),
 	}
-	m.pluginsLoaded.Store(true)
+	m.markPluginsReady()
 	return m
 }
 
@@ -228,6 +232,20 @@ func (m *Mosdns) GetPlugin(tag string) any {
 // PluginsLoaded reports whether configuration-driven plugin initialization is complete.
 func (m *Mosdns) PluginsLoaded() bool {
 	return m.pluginsLoaded.Load()
+}
+
+// PluginsReady returns a channel that is closed after all preset and
+// configuration-driven plugins have loaded successfully. The channel remains
+// open if plugin initialization fails.
+func (m *Mosdns) PluginsReady() <-chan struct{} {
+	return m.pluginsReady
+}
+
+func (m *Mosdns) markPluginsReady() {
+	m.readyOnce.Do(func() {
+		m.pluginsLoaded.Store(true)
+		close(m.pluginsReady)
+	})
 }
 
 func (m *Mosdns) pluginsSnapshot() map[string]any {

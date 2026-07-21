@@ -1,18 +1,21 @@
 # prefer_domain
 
-`prefer_domain` is an A/AAAA response post-processor. It never resolves the
-client-requested name and does nothing until an earlier plugin has populated
-`qCtx.R()`.
+`prefer_domain` is an A/AAAA response post-processor backed by a plugin-private
+preferred-domain cache. The request path never resolves a preferred domain:
+`Exec` only reads the cache entry keyed by preferred domain and QTYPE.
 
 The normal flow is:
 
-1. Domain rules select a resolver or `fallback`.
-2. That resolver produces the final response.
-3. `prefer_domain` checks address records of the requested type against its IP
+1. A resolver or `fallback` produces the client's response.
+2. `prefer_domain` checks address records of the requested type against its IP
    matcher rules.
-4. On the first matching rule, it resolves that rule's preferred domain and
-   replaces the matched owner name's complete A or AAAA RRset.
-5. A miss or any preferred-query failure leaves the existing response intact.
+3. If the first matching rule has a usable cached preferred-domain answer for
+   the same QTYPE, the matched owner's complete A or AAAA RRset is replaced.
+4. If that cache entry is cold or unusable, the original response is returned
+   unchanged. Client requests never wait for an on-demand preferred lookup.
+
+Preferred-domain A and AAAA answers are stored separately in each plugin
+instance. They do not use or populate mosdns' ordinary response cache.
 
 ## Configuration
 
@@ -22,8 +25,7 @@ The normal flow is:
   args:
     resolver: smartdns_direct
     timeout: 500          # milliseconds
-    warm_interval: 300    # seconds; 0 disables periodic warming
-    cache_ttl: 0          # milliseconds; 0 derives it from the answer
+    cache_ttl: 301        # required seconds; internal TTL and refresh window
     warm_on_start: true
     serve_stale: true
     max_stale: 3600       # seconds; 0 means unlimited
@@ -69,8 +71,62 @@ wrap that call with `try` or place `prefer_domain` after an existing outer
 
 The configured preferred-domain `resolver` should be a lower-level resolver or
 sequence that does not depend on this same `prefer_domain` instance. Internal
-preferred-domain queries are marked so an accidental re-entry safely skips the
+preferred-domain queries are marked so accidental re-entry safely skips the
 post-processor.
+
+## Warming, refresh, and internal TTL
+
+Background warming starts only after mosdns has finished loading all plugins,
+so tagged resolvers are ready before the first preferred-domain query.
+
+With `warm_on_start: true`, every distinct preferred-domain and QTYPE pair is
+warmed. A timeout, network/resolver error, missing response, or SERVFAIL is
+treated as transient: the initial warming cycle retries every 15 seconds, for
+10 attempts in total. NXDOMAIN, NOERROR without an address of the requested
+type (NODATA), and other non-transient DNS results are not retried during that
+initial cycle. If all attempts are exhausted, the entry stays cold (or retains
+its previous value). The exhaustion time is used as the origin of the next
+`cache_ttl`-derived refresh window.
+
+With `warm_on_start: false`, that first-ever warming cycle (including its
+transient-error retry policy) is delayed until the first refresh window derived
+from `cache_ttl`. Later periodic windows use the two-attempt policy described
+below.
+
+Periodic refresh performs at most two lookups per entry per window; it does not
+run the startup retry loop. If the first lookup fails for any reason, the second
+lookup starts immediately. A successful lookup atomically replaces the entry.
+If both lookups fail, the old entry is retained rather than cleared.
+
+`cache_ttl` is required, is interpreted in seconds, and must be greater than
+`5`. It is the sole source of both the plugin-private internal TTL and the
+background refresh window; DNS answer TTLs never determine the internal cache
+lifetime. `timeout` must be greater than `0` and less than `2.5` seconds, so
+both bounded periodic attempts can fit inside the five-second refresh headroom.
+
+After a successful lookup, the next refresh time is:
+
+```text
+stored + cache_ttl - 5s
+```
+
+This schedules refresh exactly five seconds before the internal entry expires.
+After two periodic failures, later recovery windows remain anchored to the old
+entry's `stored` time and advance by whole `cache_ttl` periods. Missed windows
+are skipped rather than replayed. If no old entry exists because initial warming
+exhausted all 10 attempts, the exhaustion time acts as the window origin.
+
+After two failed periodic attempts, the retained entry remains fresh until its
+internal lifetime naturally expires. Once expired, `serve_stale: true` allows
+it to continue replacing matching responses with a client-visible TTL of `0`;
+with `serve_stale: false`, the original client response is left unchanged. No
+synchronous recovery lookup is made. A stale entry remains eligible until a
+later window succeeds, subject to `max_stale`; once that limit is exceeded, the
+original client response is left unchanged.
+
+The client-visible replacement TTL remains the TTL from the preferred DNS
+answer and is aged by the cache entry's elapsed lifetime. A stale replacement
+always has a client-visible TTL of `0`.
 
 ## Replacement and failure behavior
 
@@ -84,14 +140,15 @@ The replaced owner name's address RRset is swapped atomically; an invalidated
 RRSIG covering that RRset is removed, and AA/AD are cleared because the new
 RRset is synthesized.
 
-The plugin is a no-op for:
+The plugin is a no-op and preserves the current response for:
 
 - no current response;
 - non-A/AAAA or non-IN questions;
-- NXDOMAIN, SERVFAIL, REFUSED, and other non-NOERROR responses;
+- NXDOMAIN, SERVFAIL, REFUSED, and other non-NOERROR client responses;
 - responses without a matching address;
-- preferred-domain timeouts, resolver errors, non-NOERROR responses, or a
-  missing address of the requested type.
+- a cold preferred-domain cache;
+- a cached result without an address of the requested type; or
+- an expired entry that is not eligible under `serve_stale` and `max_stale`.
 
 The removed `original_resolver`, `original_timeout`,
 `exit_on_original_failure`, and `reuse_original_response` options belonged to

@@ -41,14 +41,21 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
 	PluginType = "prefer_domain"
 
 	defaultTimeoutMilliseconds = 500
-	defaultWarmIntervalSeconds = 300
+	initialWarmAttempts        = 10
+	periodicRefreshAttempts    = 2
+	maxConcurrentRefreshes     = 8
+
+	initialWarmRetryInterval = 15 * time.Second
+	defaultRefreshAdvance    = 5 * time.Second
+	refreshSafetyMargin      = time.Second
+	minimumRefreshDelay      = 10 * time.Millisecond
+	maxWorkerCloseWait       = 5 * time.Second
 )
 
 var internalQueryKey = query_context.RegKey()
@@ -69,9 +76,7 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 //     args:
 //     resolver: fallback_direct
 //     timeout: 500         # milliseconds
-//     warm_interval: 300   # seconds
-//     bind_ttl_to_warm_interval: true          # internal cache TTL = warm_interval + 1s
-//     bind_response_ttl_to_warm_interval: false # optional: also force client-visible TTL
+//     cache_ttl: 301       # seconds; required internal cache TTL
 //     warm_on_start: true
 //     serve_stale: true
 //     max_stale: 3600      # seconds; 0 means unlimited
@@ -86,7 +91,7 @@ var _ interface{ Close() error } = (*PreferDomain)(nil)
 // For a single rule, top-level ip_matcher/prefer_domain are also accepted.
 // Legacy ip_set/ip_set_tag/ipset fields are still accepted as aliases.
 type Args struct {
-	// Resolver resolves the configured preferred domain after an IP rule matches.
+	// Resolver is used only by background warming and refresh work.
 	Resolver string `yaml:"resolver"`
 
 	// Single-rule shorthand.
@@ -105,25 +110,9 @@ type Args struct {
 	// timeout is always milliseconds. Default is 500.
 	Timeout string `yaml:"timeout"`
 
-	// warm_interval is always seconds. Default is 300.
-	// Set to 0/"0" to disable background warm-up.
-	WarmInterval string `yaml:"warm_interval"`
-
-	// cache_ttl is always milliseconds. Default 0 means derive TTL from the
-	// preferred-domain answer.
-	// Ignored for the internal cache when bind_ttl_to_warm_interval is enabled.
+	// cache_ttl is always seconds. It is the preferred-domain cache's
+	// internal TTL and the sole basis for scheduling refresh windows.
 	CacheTTL string `yaml:"cache_ttl"`
-
-	// bind_ttl_to_warm_interval forces only the internal preferred-domain cache TTL
-	// to warm_interval + 1s. This keeps the cached preferred-domain answer valid
-	// slightly longer than the next scheduled warm-up. Requires warm_interval > 0.
-	BindTTLToWarmInterval bool `yaml:"bind_ttl_to_warm_interval"`
-
-	// bind_response_ttl_to_warm_interval also forces the client-visible masked A/AAAA
-	// answer TTL to warm_interval + 1s. Disabled by default so client-visible TTL
-	// keeps the TTL from the preferred-domain A/AAAA answer. Requires
-	// bind_ttl_to_warm_interval and warm_interval > 0 when enabled.
-	BindResponseTTLToWarmInterval bool `yaml:"bind_response_ttl_to_warm_interval"`
 
 	WarmOnStart bool `yaml:"warm_on_start"`
 	ServeStale  bool `yaml:"serve_stale"`
@@ -158,28 +147,60 @@ type cacheEntry struct {
 	expires time.Time
 }
 
+type warmTarget struct {
+	rule  *compiledRule
+	qType uint16
+	key   string
+}
+
+type warmResult struct {
+	target     warmTarget
+	err        error
+	retryAfter time.Duration
+}
+
+type preferredQueryError struct {
+	err       error
+	retryable bool
+}
+
+func (e *preferredQueryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *preferredQueryError) Unwrap() error {
+	return e.err
+}
+
+var errPreferredCacheUnavailable = errors.New("preferred-domain cache is unavailable")
+
 type PreferDomain struct {
 	logger *zap.Logger
 
 	resolver sequence.Executable
 	rules    []compiledRule
 
-	timeout                       time.Duration
-	warmInterval                  time.Duration
-	cacheTTL                      time.Duration
-	bindTTLToWarmInterval         bool
-	bindResponseTTLToWarmInterval bool
-	warmOnStart                   bool
-	serveStale                    bool
-	maxStale                      time.Duration
+	timeout              time.Duration
+	cacheTTL             time.Duration
+	warmOnStart          bool
+	serveStale           bool
+	maxStale             time.Duration
+	ready                <-chan struct{}
+	initialRetryInterval time.Duration
+	initialAttempts      int
+	refreshAdvance       time.Duration
+	refreshSem           chan struct{}
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
 
-	resolveGroup singleflight.Group
-
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	closeOnce   sync.Once
+	startOnce   sync.Once
+	schedulerWG sync.WaitGroup
+	workerWG    sync.WaitGroup
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -205,15 +226,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid timeout: %w", PluginType, err)
 	}
-	warmInterval, err := parseFixedDuration(
-		cfg.WarmInterval,
-		defaultWarmIntervalSeconds,
-		time.Second,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("%s: invalid warm_interval: %w", PluginType, err)
-	}
-	cacheTTL, err := parseFixedDuration(cfg.CacheTTL, 0, time.Millisecond)
+	cacheTTL, err := parseFixedDuration(cfg.CacheTTL, 0, time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid cache_ttl: %w", PluginType, err)
 	}
@@ -221,14 +234,17 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid max_stale: %w", PluginType, err)
 	}
-	if cfg.BindTTLToWarmInterval && warmInterval <= 0 {
-		return nil, fmt.Errorf("%s: bind_ttl_to_warm_interval requires warm_interval > 0", PluginType)
-	}
-	if cfg.BindResponseTTLToWarmInterval && !cfg.BindTTLToWarmInterval {
-		return nil, fmt.Errorf("%s: bind_response_ttl_to_warm_interval requires bind_ttl_to_warm_interval", PluginType)
-	}
 	if maxStale > 0 && !cfg.ServeStale {
 		return nil, fmt.Errorf("%s: max_stale requires serve_stale", PluginType)
+	}
+	if cacheTTL <= defaultRefreshAdvance {
+		return nil, fmt.Errorf("%s: cache_ttl must be greater than %d seconds", PluginType, int(defaultRefreshAdvance/time.Second))
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("%s: timeout must be greater than 0", PluginType)
+	}
+	if timeout >= defaultRefreshAdvance/periodicRefreshAttempts {
+		return nil, fmt.Errorf("%s: timeout must be less than %s so both refresh attempts fit before cache expiry", PluginType, defaultRefreshAdvance/periodicRefreshAttempts)
 	}
 	ruleArgs := normalizeRuleArgs(cfg)
 	if len(ruleArgs) == 0 {
@@ -261,20 +277,22 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &PreferDomain{
-		logger:                        bp.L(),
-		resolver:                      resolver,
-		rules:                         rules,
-		timeout:                       timeout,
-		warmInterval:                  warmInterval,
-		cacheTTL:                      cacheTTL,
-		bindTTLToWarmInterval:         cfg.BindTTLToWarmInterval,
-		bindResponseTTLToWarmInterval: cfg.BindResponseTTLToWarmInterval,
-		warmOnStart:                   cfg.WarmOnStart,
-		serveStale:                    cfg.ServeStale,
-		maxStale:                      maxStale,
-		cache:                         make(map[string]cacheEntry),
-		ctx:                           ctx,
-		cancel:                        cancel,
+		logger:               bp.L(),
+		resolver:             resolver,
+		rules:                rules,
+		timeout:              timeout,
+		cacheTTL:             cacheTTL,
+		warmOnStart:          cfg.WarmOnStart,
+		serveStale:           cfg.ServeStale,
+		maxStale:             maxStale,
+		ready:                bp.M().PluginsReady(),
+		initialRetryInterval: initialWarmRetryInterval,
+		initialAttempts:      initialWarmAttempts,
+		refreshAdvance:       defaultRefreshAdvance,
+		refreshSem:           make(chan struct{}, maxConcurrentRefreshes),
+		cache:                make(map[string]cacheEntry),
+		ctx:                  ctx,
+		cancel:               cancel,
 	}
 
 	p.startWarmers()
@@ -283,16 +301,45 @@ func Init(bp *coremain.BP, args any) (any, error) {
 		zap.Int("rules", len(rules)),
 		zap.String("resolver", cfg.Resolver),
 		zap.Duration("timeout", p.timeout),
-		zap.Duration("warm_interval", p.warmInterval),
+		zap.Duration("cache_ttl", p.cacheTTL),
+		zap.Duration("refresh_advance", p.refreshAdvanceDuration()),
+		zap.Duration("refresh_after", p.refreshDelay()),
 		zap.Duration("max_stale", p.maxStale),
-		zap.Bool("bind_ttl_to_warm_interval", p.bindTTLToWarmInterval),
-		zap.Bool("bind_response_ttl_to_warm_interval", p.bindResponseTTLToWarmInterval))
+		zap.Int("initial_warm_attempts", p.initialAttempts),
+		zap.Duration("initial_warm_retry_interval", p.initialRetryInterval),
+		zap.Int("periodic_refresh_attempts", periodicRefreshAttempts),
+		zap.Int("max_concurrent_refreshes", cap(p.refreshSem)))
 
 	return p, nil
 }
 
 func (p *PreferDomain) Close() error {
-	p.cancel()
+	p.closeOnce.Do(func() {
+		if p.cancel != nil {
+			p.cancel()
+		}
+		p.schedulerWG.Wait()
+		workersDone := make(chan struct{})
+		go func() {
+			p.workerWG.Wait()
+			close(workersDone)
+		}()
+		closeWait := p.timeout + refreshSafetyMargin
+		if closeWait <= 0 {
+			closeWait = refreshSafetyMargin
+		}
+		if closeWait > maxWorkerCloseWait {
+			closeWait = maxWorkerCloseWait
+		}
+		select {
+		case <-workersDone:
+		case <-time.After(closeWait):
+			if p.logger != nil {
+				p.logger.Warn("timed out waiting for preferred-domain background workers to stop",
+					zap.Duration("waited", closeWait))
+			}
+		}
+	})
 	return nil
 }
 
@@ -324,22 +371,16 @@ func (p *PreferDomain) Exec(ctx context.Context, qCtx *query_context.Context) er
 		return nil
 	}
 
-	preferredResp, stale, err := p.getPreferredResponse(ctx, rule, qType)
+	preferredResp, _, err := p.getPreferredResponse(ctx, rule, qType)
 	if err != nil {
-		p.logger.Debug("failed to resolve preferred domain, keep original response",
+		p.logger.Debug("preferred-domain cache unavailable, keep original response",
 			zap.String("prefer_domain", rule.preferDisplay),
 			zap.Stringer("matched_ip", addr),
 			zap.Error(err))
 		return nil
 	}
 
-	forcedTTL := p.forcedResponseTTL()
-	if stale {
-		// Stale data is only an availability fallback. Do not let clients
-		// extend its lifetime, even when response TTL binding is enabled.
-		forcedTTL = 0
-	}
-	replacedResp, ok := buildReplacedResponse(r, preferredResp, qType, owner, forcedTTL)
+	replacedResp, ok := buildReplacedResponse(r, preferredResp, qType, owner)
 	if !ok {
 		p.logger.Debug("preferred domain has no usable answer, keep original response",
 			zap.String("prefer_domain", rule.preferDisplay),
@@ -379,7 +420,7 @@ func (p *PreferDomain) matchRule(r *dns.Msg, qType uint16) (*compiledRule, netip
 	return nil, netip.Addr{}, "", false
 }
 
-func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledRule, qType uint16) (*dns.Msg, bool, error) {
+func (p *PreferDomain) getPreferredResponse(_ context.Context, rule *compiledRule, qType uint16) (*dns.Msg, bool, error) {
 	key := cacheKey(rule.preferDomain, qType)
 	now := time.Now()
 
@@ -397,27 +438,10 @@ func (p *PreferDomain) getPreferredResponse(ctx context.Context, rule *compiledR
 	stale := ce
 	p.mu.RUnlock()
 
-	resultCh := p.resolveAndStore(rule, qType, false)
-	select {
-	case <-ctx.Done():
-		if msg, ok := p.getStaleResponse(stale, time.Now()); ok {
-			return msg, true, nil
-		}
-		return nil, false, context.Cause(ctx)
-	case result := <-resultCh:
-		if result.Err != nil {
-			if msg, ok := p.getStaleResponse(stale, time.Now()); ok {
-				return msg, true, nil
-			}
-			return nil, false, result.Err
-		}
-
-		msg, ok := result.Val.(*dns.Msg)
-		if !ok || msg == nil {
-			return nil, false, errors.New("resolver returned invalid shared result")
-		}
-		return msg.Copy(), false, nil
+	if msg, ok := p.getStaleResponse(stale, now); ok {
+		return msg, true, nil
 	}
+	return nil, false, errPreferredCacheUnavailable
 }
 
 func (p *PreferDomain) getStaleResponse(ce cacheEntry, now time.Time) (*dns.Msg, bool) {
@@ -431,41 +455,6 @@ func (p *PreferDomain) getStaleResponse(ce cacheEntry, now time.Time) (*dns.Msg,
 	msg := ce.msg.Copy()
 	dnsutils.SetTTL(msg, 0)
 	return msg, true
-}
-
-func (p *PreferDomain) resolveAndStore(rule *compiledRule, qType uint16, forceRefresh bool) <-chan singleflight.Result {
-	key := cacheKey(rule.preferDomain, qType)
-	return p.resolveGroup.DoChan(key, func() (any, error) {
-		// Close the small race between the caller's cache lookup and joining
-		// singleflight. A previous flight may have populated the cache in that
-		// interval. Periodic warm-up deliberately bypasses this check.
-		if !forceRefresh {
-			now := time.Now()
-			p.mu.RLock()
-			ce, ok := p.cache[key]
-			if ok && now.Before(ce.expires) && ce.msg != nil {
-				msg := ce.msg.Copy()
-				stored := ce.stored
-				p.mu.RUnlock()
-				if elapsed := now.Sub(stored); elapsed > 0 {
-					subtractTTLToZero(msg, durationToTTLSeconds(elapsed))
-				}
-				return msg, nil
-			}
-			p.mu.RUnlock()
-		}
-
-		parent := p.ctx
-		if parent == nil {
-			parent = context.Background()
-		}
-		msg, err := p.resolvePreferred(parent, rule, qType)
-		if err != nil {
-			return nil, err
-		}
-		p.storePreferred(rule, qType, msg)
-		return msg, nil
-	})
 }
 
 func (p *PreferDomain) resolvePreferred(parent context.Context, rule *compiledRule, qType uint16) (*dns.Msg, error) {
@@ -487,34 +476,48 @@ func resolveDomain(parent context.Context, resolver sequence.Executable, timeout
 	subCtx := query_context.NewContext(q)
 	subCtx.StoreValue(internalQueryKey, internalPlugin)
 	if err := resolver.Exec(ctx, subCtx); err != nil && !errors.Is(err, sequence.ErrExit) {
-		return nil, err
+		if cause := context.Cause(parent); cause != nil {
+			return nil, &preferredQueryError{err: cause}
+		}
+		return nil, &preferredQueryError{err: err, retryable: true}
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		if parentCause := context.Cause(parent); parentCause != nil {
+			return nil, &preferredQueryError{err: parentCause}
+		}
+		return nil, &preferredQueryError{err: cause, retryable: true}
 	}
 
 	r := subCtx.R()
 	if r == nil {
-		return nil, errors.New("resolver returned no response")
+		if cause := context.Cause(parent); cause != nil {
+			return nil, &preferredQueryError{err: cause}
+		}
+		return nil, &preferredQueryError{err: errors.New("resolver returned no response"), retryable: true}
 	}
 	if r.Rcode != dns.RcodeSuccess {
-		return nil, fmt.Errorf("resolver returned rcode %d", r.Rcode)
+		return nil, &preferredQueryError{
+			err:       fmt.Errorf("resolver returned rcode %s", dns.RcodeToString[r.Rcode]),
+			retryable: r.Rcode == dns.RcodeServerFailure,
+		}
 	}
 	if !hasWantedIP(r, qType) {
-		return nil, errors.New("resolver response has no wanted A/AAAA answer")
+		return nil, &preferredQueryError{err: errors.New("resolver response has no wanted A/AAAA answer")}
 	}
 	return r.Copy(), nil
 }
 
-func (p *PreferDomain) storePreferred(rule *compiledRule, qType uint16, msg *dns.Msg) {
+func (p *PreferDomain) storePreferred(rule *compiledRule, qType uint16, msg *dns.Msg) error {
 	if msg == nil {
-		return
+		return errors.New("cannot cache a nil preferred-domain response")
 	}
 
-	ttl := p.cacheDuration(msg, qType)
+	ttl := p.cacheDuration()
 	key := cacheKey(rule.preferDomain, qType)
 	if ttl <= 0 {
-		p.mu.Lock()
-		delete(p.cache, key)
-		p.mu.Unlock()
-		return
+		// A refresh that cannot be cached must not destroy the previous entry;
+		// that entry may be the only stale availability fallback.
+		return errors.New("preferred-domain response has no positive internal cache TTL")
 	}
 	now := time.Now()
 
@@ -525,88 +528,331 @@ func (p *PreferDomain) storePreferred(rule *compiledRule, qType uint16, msg *dns
 		expires: now.Add(ttl),
 	}
 	p.mu.Unlock()
+	return nil
 }
 
 func (p *PreferDomain) startWarmers() {
-	if p.warmOnStart {
-		go p.warmAll()
+	// Init requires a positive cache TTL. Keep this guard for directly
+	// constructed test instances and embedders so an invalid zero TTL cannot
+	// create a background busy loop.
+	if p.cacheTTL <= 0 {
+		return
 	}
-	if p.warmInterval > 0 {
-		go p.warmLoop()
-	}
+	p.startOnce.Do(func() {
+		p.schedulerWG.Add(1)
+		go func() {
+			defer p.schedulerWG.Done()
+			p.runWarmScheduler()
+		}()
+	})
 }
 
-func (p *PreferDomain) warmLoop() {
-	t := time.NewTicker(p.warmInterval)
-	defer t.Stop()
-	for {
+func (p *PreferDomain) runWarmScheduler() {
+	if p.ctx == nil {
+		return
+	}
+	if p.ready != nil {
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-t.C:
-			p.warmAll()
+		case <-p.ready:
+		}
+	}
+	targets := p.getWarmTargets()
+	for _, target := range targets {
+		select {
+		case <-p.ctx.Done():
+			return
+		default:
+		}
+		p.workerWG.Add(1)
+		go func(target warmTarget) {
+			defer p.workerWG.Done()
+			p.runTargetWarmer(target)
+		}(target)
+	}
+}
+
+func (p *PreferDomain) runTargetWarmer(target warmTarget) {
+	if !p.warmOnStart && !p.waitFor(p.refreshDelay()) {
+		return
+	}
+	succeeded := p.runInitialWarmTarget(target)
+	if p.ctx.Err() != nil {
+		return
+	}
+
+	next := time.Now().Add(p.refreshDelay())
+	if succeeded {
+		next = p.nextRefreshAfterSuccess(target, time.Now())
+	}
+	for p.waitUntil(next) {
+		err := p.runPeriodicRefreshTarget(target)
+		completedAt := time.Now()
+		if p.ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			// Only the background worker can recover the entry. A failed window
+			// retains the old value and advances to the next cache-TTL-derived
+			// window anchored to the last successful store.
+			next = p.nextRefreshAfterFailure(target, next, completedAt)
+			p.logPeriodicRefreshFailure(warmResult{
+				target:     target,
+				err:        err,
+				retryAfter: next.Sub(completedAt),
+			})
+			continue
+		}
+		next = p.nextRefreshAfterSuccess(target, completedAt)
+	}
+}
+
+// runPeriodicRefreshTarget performs at most two attempts in one refresh
+// window. The second attempt starts immediately after the first failure so it
+// can still complete within the fixed five-second pre-expiry window.
+func (p *PreferDomain) runPeriodicRefreshTarget(target warmTarget) error {
+	var err error
+	for attempt := 1; attempt <= periodicRefreshAttempts; attempt++ {
+		err = p.refreshTarget(target)
+		if err == nil {
+			return nil
+		}
+		if p.ctx != nil && p.ctx.Err() != nil {
+			return err
+		}
+		if attempt < periodicRefreshAttempts {
+			p.logger.Warn("preferred-domain refresh failed; retrying once",
+				zap.String("prefer_domain", target.rule.preferDisplay),
+				zap.Uint16("qtype", target.qType),
+				zap.Int("attempt", attempt),
+				zap.Int("max_attempts", periodicRefreshAttempts),
+				zap.Error(err))
+		}
+	}
+	return err
+}
+
+func (p *PreferDomain) runInitialWarmTarget(target warmTarget) bool {
+	attempts := p.initialAttempts
+	if attempts <= 0 {
+		attempts = initialWarmAttempts
+	}
+	retryInterval := p.initialRetryInterval
+	if retryInterval <= 0 {
+		retryInterval = initialWarmRetryInterval
+	}
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := p.refreshTarget(target)
+		if err == nil {
+			return true
+		}
+		if p.ctx.Err() != nil {
+			return false
+		}
+
+		retryable := isRetryablePreferredQueryError(err)
+		if retryable && attempt < attempts {
+			p.logger.Warn("initial preferred-domain warm-up failed; retry scheduled",
+				zap.String("prefer_domain", target.rule.preferDisplay),
+				zap.Uint16("qtype", target.qType),
+				zap.Int("attempt", attempt),
+				zap.Int("max_attempts", attempts),
+				zap.Duration("retry_after", retryInterval),
+				zap.Error(err))
+			if !p.waitFor(retryInterval) {
+				return false
+			}
+			continue
+		}
+
+		message := "initial preferred-domain warm-up failed; waiting for next refresh window"
+		if retryable {
+			message = "initial preferred-domain warm-up exhausted retries; waiting for next refresh window"
+		}
+		p.logger.Warn(message,
+			zap.String("prefer_domain", target.rule.preferDisplay),
+			zap.Uint16("qtype", target.qType),
+			zap.Int("attempts", attempt),
+			zap.Error(err))
+		return false
+	}
+	return false
+}
+
+func (p *PreferDomain) warmAll() {
+	pluginCtx := p.ctx
+	if pluginCtx == nil {
+		pluginCtx = context.Background()
+	}
+	for _, target := range p.getWarmTargets() {
+		select {
+		case <-pluginCtx.Done():
+			return
+		default:
+		}
+		if err := p.runPeriodicRefreshTarget(target); err != nil {
+			p.logPeriodicRefreshFailure(warmResult{target: target, err: err})
 		}
 	}
 }
 
-func (p *PreferDomain) warmAll() {
+func (p *PreferDomain) refreshTarget(target warmTarget) error {
+	pluginCtx := p.ctx
+	if pluginCtx == nil {
+		pluginCtx = context.Background()
+	}
+	if p.refreshSem != nil {
+		select {
+		case <-pluginCtx.Done():
+			return context.Cause(pluginCtx)
+		case p.refreshSem <- struct{}{}:
+			defer func() { <-p.refreshSem }()
+		}
+	}
+	msg, err := p.resolvePreferred(pluginCtx, target.rule, target.qType)
+	if err != nil {
+		return err
+	}
+	if cause := context.Cause(pluginCtx); cause != nil {
+		return cause
+	}
+	return p.storePreferred(target.rule, target.qType, msg)
+}
+
+func (p *PreferDomain) getWarmTargets() []warmTarget {
+	targets := make([]warmTarget, 0, len(p.rules)*2)
 	seen := make(map[string]struct{}, len(p.rules)*2)
 	for i := range p.rules {
 		rule := &p.rules[i]
-		for _, qType := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		for _, qType := range [...]uint16{dns.TypeA, dns.TypeAAAA} {
 			key := cacheKey(rule.preferDomain, qType)
 			if _, ok := seen[key]; ok {
 				continue
 			}
 			seen[key] = struct{}{}
-
-			select {
-			case <-p.ctx.Done():
-				return
-			default:
-			}
-
-			resultCh := p.resolveAndStore(rule, qType, true)
-			select {
-			case <-p.ctx.Done():
-				return
-			case result := <-resultCh:
-				if result.Err == nil {
-					continue
-				}
-				p.logger.Debug("preferred domain warm-up failed",
-					zap.String("prefer_domain", rule.preferDisplay),
-					zap.Uint16("qtype", qType),
-					zap.Error(result.Err))
-			}
+			targets = append(targets, warmTarget{rule: rule, qType: qType, key: key})
 		}
 	}
+	return targets
 }
 
-func (p *PreferDomain) cacheDuration(msg *dns.Msg, qType uint16) time.Duration {
-	if ttl := p.boundWarmTTL(); ttl > 0 {
-		return ttl
+func (p *PreferDomain) nextRefreshAfterSuccess(target warmTarget, now time.Time) time.Time {
+	next := now.Add(p.refreshDelay())
+	p.mu.RLock()
+	ce, ok := p.cache[target.key]
+	p.mu.RUnlock()
+	if !ok || ce.msg == nil {
+		return next
 	}
 
-	ttl := p.cacheTTL
-	if ttl <= 0 {
-		ttl = ttlFromAnswer(msg, qType)
+	next = p.refreshDeadline(ce)
+	minimumNext := now.Add(minimumRefreshDelay)
+	if next.Before(minimumNext) {
+		return minimumNext
 	}
-	return ttl
+	return next
 }
 
-func (p *PreferDomain) boundWarmTTL() time.Duration {
-	if !p.bindTTLToWarmInterval || p.warmInterval <= 0 {
-		return 0
+func (p *PreferDomain) nextRefreshAfterFailure(target warmTarget, scheduledAt, now time.Time) time.Time {
+	p.mu.RLock()
+	ce, ok := p.cache[target.key]
+	p.mu.RUnlock()
+	if !ok || ce.msg == nil || ce.stored.IsZero() || !ce.expires.After(ce.stored) {
+		if scheduledAt.IsZero() {
+			return now.Add(p.refreshDelay())
+		}
+		return advanceRefreshWindow(scheduledAt, p.cacheTTL, now)
 	}
-	return p.warmInterval + time.Second
+
+	ttl := ce.expires.Sub(ce.stored)
+	next := ce.expires.Add(-p.refreshAdvanceDuration())
+	return advanceRefreshWindow(next, ttl, now)
 }
 
-func (p *PreferDomain) forcedResponseTTL() uint32 {
-	if !p.bindResponseTTLToWarmInterval {
-		return 0
+func advanceRefreshWindow(next time.Time, period time.Duration, now time.Time) time.Time {
+	if next.After(now) {
+		return next
 	}
-	return durationToTTLSeconds(p.boundWarmTTL())
+	if period <= 0 {
+		return now.Add(minimumRefreshDelay)
+	}
+	// Windows stay anchored to their original origin. Skip every elapsed
+	// window in one calculation so a delayed worker cannot burst.
+	elapsed := now.Sub(next)
+	steps := elapsed/period + 1
+	if steps > time.Duration(1<<62)/period {
+		return now.Add(period)
+	}
+	return next.Add(steps * period)
+}
+
+func (p *PreferDomain) refreshDeadline(ce cacheEntry) time.Time {
+	return ce.expires.Add(-p.refreshAdvanceDuration())
+}
+
+func (p *PreferDomain) refreshAdvanceDuration() time.Duration {
+	if p.refreshAdvance > 0 {
+		return p.refreshAdvance
+	}
+	return defaultRefreshAdvance
+}
+
+// refreshDelay derives the background window from cache_ttl and always starts
+// it exactly five seconds before the internal cache expires. Init rejects TTLs
+// that are too short; the minimum guard protects directly constructed tests.
+func (p *PreferDomain) refreshDelay() time.Duration {
+	delay := p.cacheTTL - p.refreshAdvanceDuration()
+	if delay < minimumRefreshDelay {
+		return minimumRefreshDelay
+	}
+	return delay
+}
+
+func (p *PreferDomain) waitFor(d time.Duration) bool {
+	if d <= 0 {
+		select {
+		case <-p.ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-p.ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func (p *PreferDomain) waitUntil(when time.Time) bool {
+	return p.waitFor(time.Until(when))
+}
+
+func (p *PreferDomain) logPeriodicRefreshFailure(result warmResult) {
+	retryAfter := result.retryAfter
+	if retryAfter <= 0 {
+		retryAfter = p.refreshDelay()
+	}
+	p.logger.Warn("preferred-domain refresh failed twice; current cache state retained until next refresh window",
+		zap.String("prefer_domain", result.target.rule.preferDisplay),
+		zap.Uint16("qtype", result.target.qType),
+		zap.Int("attempts", periodicRefreshAttempts),
+		zap.Duration("retry_after", retryAfter),
+		zap.Error(result.err))
+}
+
+func isRetryablePreferredQueryError(err error) bool {
+	var queryErr *preferredQueryError
+	return errors.As(err, &queryErr) && queryErr.retryable
+}
+
+func (p *PreferDomain) cacheDuration() time.Duration {
+	return p.cacheTTL
 }
 
 func normalizeRuleArgs(cfg *Args) []RuleArgs {
@@ -767,31 +1013,7 @@ func subtractTTLToZero(m *dns.Msg, delta uint32) {
 	}
 }
 
-func ttlFromAnswer(r *dns.Msg, qType uint16) time.Duration {
-	var minTTL uint32
-	found := false
-	for _, rr := range r.Answer {
-		if rr == nil || rr.Header() == nil {
-			continue
-		}
-		if qType == dns.TypeA && rr.Header().Rrtype != dns.TypeA {
-			continue
-		}
-		if qType == dns.TypeAAAA && rr.Header().Rrtype != dns.TypeAAAA {
-			continue
-		}
-		if !found || rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
-			found = true
-		}
-	}
-	if !found {
-		return 0
-	}
-	return time.Duration(minTTL) * time.Second
-}
-
-func buildReplacedResponse(originalResp *dns.Msg, preferredResp *dns.Msg, qType uint16, owner string, forcedTTL uint32) (*dns.Msg, bool) {
+func buildReplacedResponse(originalResp *dns.Msg, preferredResp *dns.Msg, qType uint16, owner string) (*dns.Msg, bool) {
 	if originalResp == nil || preferredResp == nil || owner == "" {
 		return nil, false
 	}
@@ -804,21 +1026,13 @@ func buildReplacedResponse(originalResp *dns.Msg, preferredResp *dns.Msg, qType 
 	for _, rr := range preferredRRSet {
 		switch rr := rr.(type) {
 		case *dns.A:
-			ttl := rr.Hdr.Ttl
-			if forcedTTL > 0 {
-				ttl = forcedTTL
-			}
 			preferredAddresses = append(preferredAddresses, &dns.A{
-				Hdr: dns.RR_Header{Name: owner, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+				Hdr: dns.RR_Header{Name: owner, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: rr.Hdr.Ttl},
 				A:   append(net.IP(nil), rr.A...),
 			})
 		case *dns.AAAA:
-			ttl := rr.Hdr.Ttl
-			if forcedTTL > 0 {
-				ttl = forcedTTL
-			}
 			preferredAddresses = append(preferredAddresses, &dns.AAAA{
-				Hdr:  dns.RR_Header{Name: owner, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
+				Hdr:  dns.RR_Header{Name: owner, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: rr.Hdr.Ttl},
 				AAAA: append(net.IP(nil), rr.AAAA...),
 			})
 		}
