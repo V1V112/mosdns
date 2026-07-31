@@ -45,6 +45,7 @@ type Args struct {
 	Entry       string         `yaml:"entry"`
 	Listen      string         `yaml:"listen"`
 	EnableAudit bool           `yaml:"enable_audit"`
+	FastAccel   bool           `yaml:"fast_accel"`
 	FastCache   *FastCacheArgs `yaml:"fast_cache"`
 }
 
@@ -58,6 +59,7 @@ type UdpServer struct {
 	c         net.PacketConn
 	cancel    context.CancelFunc
 	fastCache *fastCache
+	fastAccel *fastAccelRegistration
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 }
@@ -67,6 +69,9 @@ func (s *UdpServer) Close() error {
 	s.closeOnce.Do(func() {
 		if s.cancel != nil {
 			s.cancel()
+		}
+		if s.fastAccel != nil {
+			unregisterFastAccel(s.fastAccel)
 		}
 		if s.fastCache != nil {
 			s.fastCache.stop()
@@ -89,26 +94,173 @@ type DomainMapperPlugin interface {
 }
 type IPSetPlugin interface{ Match(addr netip.Addr) bool }
 
+// fastAccelRegistration chooses which UDP server may interact with the shared
+// kernel fast path. Userspace caches are private to each server and are not
+// disabled when another listener is selected.
+type fastAccelRegistration struct {
+	manager  *coremain.Mosdns
+	logger   *zap.Logger
+	port     int
+	explicit bool
+	entry    string
+	fc       *fastCache
+
+	enabled atomic.Bool
+	closed  atomic.Bool
+}
+
+type fastAccelGroup struct {
+	regs     map[*fastAccelRegistration]struct{}
+	resolved bool
+}
+
+var fastAccelRegistry = struct {
+	sync.Mutex
+	groups map[*coremain.Mosdns]*fastAccelGroup
+}{groups: make(map[*coremain.Mosdns]*fastAccelGroup)}
+
+func registerFastAccel(
+	manager *coremain.Mosdns,
+	logger *zap.Logger,
+	port int,
+	explicit bool,
+	entry string,
+	fc *fastCache,
+) *fastAccelRegistration {
+	r := &fastAccelRegistration{
+		manager:  manager,
+		logger:   logger,
+		port:     port,
+		explicit: explicit,
+		entry:    entry,
+		fc:       fc,
+	}
+	fastAccelRegistry.Lock()
+	g := fastAccelRegistry.groups[manager]
+	if g == nil {
+		g = &fastAccelGroup{regs: make(map[*fastAccelRegistration]struct{})}
+		fastAccelRegistry.groups[manager] = g
+	}
+	g.regs[r] = struct{}{}
+	fastAccelRegistry.Unlock()
+	return r
+}
+
+func unregisterFastAccel(r *fastAccelRegistration) {
+	if r == nil || !r.closed.CompareAndSwap(false, true) {
+		return
+	}
+	r.enabled.Store(false)
+	r.fc.setKernelActive(false)
+	fastAccelRegistry.Lock()
+	if g := fastAccelRegistry.groups[r.manager]; g != nil {
+		delete(g.regs, r)
+		if len(g.regs) == 0 {
+			delete(fastAccelRegistry.groups, r.manager)
+		}
+	}
+	fastAccelRegistry.Unlock()
+}
+
+func applyFastAccelSelection(regs []*fastAccelRegistration) (selected int, entries []string, selectedKernel int) {
+	anyExplicit := false
+	for _, r := range regs {
+		if !r.closed.Load() && r.explicit {
+			anyExplicit = true
+			break
+		}
+	}
+
+	entrySet := make(map[string]struct{})
+	for _, r := range regs {
+		on := !r.closed.Load() && (r.explicit || (!anyExplicit && r.port == 53))
+		r.enabled.Store(on)
+		r.fc.setKernelActive(on)
+		if !on {
+			continue
+		}
+		selected++
+		if r.fc != nil && r.fc.kernelEnabled {
+			selectedKernel++
+		}
+		entrySet[r.entry] = struct{}{}
+	}
+	for entry := range entrySet {
+		entries = append(entries, entry)
+	}
+	return selected, entries, selectedKernel
+}
+
+func resolveFastAccel(r *fastAccelRegistration) {
+	if r == nil || r.closed.Load() || !r.manager.PluginsLoaded() {
+		return
+	}
+	fastAccelRegistry.Lock()
+	g := fastAccelRegistry.groups[r.manager]
+	if g == nil || g.resolved {
+		fastAccelRegistry.Unlock()
+		return
+	}
+	g.resolved = true
+	regs := make([]*fastAccelRegistration, 0, len(g.regs))
+	for candidate := range g.regs {
+		regs = append(regs, candidate)
+	}
+	selected, entries, selectedKernel := applyFastAccelSelection(regs)
+	fastAccelRegistry.Unlock()
+
+	logger := r.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	if len(entries) > 1 {
+		logger.Warn("fast acceleration selected UDP servers with different entries; the shared kernel cache may be polluted",
+			zap.Strings("entries", entries))
+	}
+	if selectedKernel == 0 {
+		logger.Info("fast acceleration resolved without a kernel-cache owner",
+			zap.Int("selected_servers", selected))
+	} else {
+		logger.Info("fast acceleration landing resolved",
+			zap.Int("selected_servers", selected),
+			zap.Int("kernel_owners", selectedKernel))
+	}
+}
+
+func (r *fastAccelRegistration) active() bool {
+	if r == nil {
+		return true
+	}
+	resolveFastAccel(r)
+	return !r.closed.Load() && r.enabled.Load()
+}
+
 type fastHandler struct {
-	next             server.Handler
-	fc               *fastCache
-	sw               SwitchPlugin
-	legacySwitchGate bool
-	releasePayload   func(*[]byte)
+	next              server.Handler
+	fc                *fastCache
+	sw                SwitchPlugin
+	fastAccel         *fastAccelRegistration
+	explicitUserspace bool
+	legacySwitchGate  bool
+	releasePayload    func(*[]byte)
 }
 
 func (h *fastHandler) Handle(ctx context.Context, q *dns.Msg, meta server.QueryMeta, pack func(*dns.Msg) (*[]byte, error)) *[]byte {
 	meta.ClientAddr = meta.ClientAddr.Unmap()
 	payload := h.next.Handle(ctx, q, meta, pack)
+	cacheActive := h.explicitUserspace || h.fastAccel == nil || h.fastAccel.active()
 
 	if (meta.PreFastFlags & asyncRefreshMark) != 0 {
-		if payload != nil && q.Opcode == dns.OpcodeQuery && len(q.Question) > 0 {
+		if cacheActive && payload != nil && q.Opcode == dns.OpcodeQuery && len(q.Question) > 0 {
 			h.fc.Store(*payload, true)
 		}
 		if payload != nil && h.releasePayload != nil {
 			h.releasePayload(payload)
 		}
 		return nil
+	}
+	if !cacheActive {
+		return payload
 	}
 
 	if h.legacySwitchGate && h.sw != nil && h.sw.GetValue() != "A" {
@@ -126,6 +278,7 @@ const (
 	fastRefreshQueue   = 1024
 	fastRefreshTimeout = 2 * time.Second
 	fastRingReopen     = 3 * time.Second
+	fastRingMaxMisses  = 20
 )
 
 type fastRefreshEvent struct {
@@ -202,6 +355,22 @@ func startFastRefreshWorker(ctx context.Context, h *fastHandler, queue <-chan fa
 	}
 }
 
+func runFastRefreshRuntime(ctx context.Context, h *fastHandler, fc *fastCache, logger *zap.Logger) {
+	refreshCtx, cancel := context.WithCancel(ctx)
+	queue := make(chan fastRefreshEvent, fastRefreshQueue)
+	var workers sync.WaitGroup
+	for i := 0; i < fastRefreshWorkers; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			startFastRefreshWorker(refreshCtx, h, queue)
+		}()
+	}
+	runFastRingbuf(refreshCtx, fc, queue, logger)
+	cancel()
+	workers.Wait()
+}
+
 func startRingbufListener(ctx context.Context, rd *ringbuf.Reader, queue chan<- fastRefreshEvent) error {
 	started := time.Now()
 	var rec ringbuf.Record
@@ -267,18 +436,17 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 		}
 	}()
 
-	isEbpfPort := false
+	port := 0
 	if udpAddr, ok := c.LocalAddr().(*net.UDPAddr); ok {
-		if udpAddr.Port == 53 {
-			isEbpfPort = true
-		}
+		port = udpAddr.Port
 	}
+	isFallbackLanding := port == 53
 
-	if mode.legacy && !isEbpfPort {
+	if mode.legacy && !isFallbackLanding && !args.FastAccel {
 		mode = resolvedFastCacheMode{}
 	}
-	if mode.kernel && !isEbpfPort {
-		return nil, fmt.Errorf("fast_cache kernel mode requires UDP port 53")
+	if mode.kernel && !isFallbackLanding && !args.FastAccel {
+		return nil, fmt.Errorf("fast_cache kernel mode on UDP port %d requires fast_accel: true", port)
 	}
 	if mode.kernel && runtime.GOOS != "linux" {
 		if !mode.legacy {
@@ -306,12 +474,30 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 			return nil, err
 		}
 		s.fastCache = fc
+	}
+
+	// A configured landing wins across all UDP servers. With no explicit
+	// landing, port 53 remains the compatibility fallback.
+	if args.FastAccel || isFallbackLanding {
+		if mode.kernel && s.fastCache != nil {
+			// Do not touch the process-external pinned map until all UDP servers
+			// have registered and the landing decision is final.
+			s.fastCache.setKernelActive(false)
+		}
+		s.fastAccel = registerFastAccel(
+			bp.M(), bp.L(), port, args.FastAccel, args.Entry, s.fastCache,
+		)
+	}
+
+	if s.fastCache != nil {
 		wrappedFastHandler = &fastHandler{
-			next:             dh,
-			fc:               fc,
-			sw:               sw15,
-			legacySwitchGate: mode.legacy && sw15 != nil,
-			releasePayload:   pool.ReleaseBuf,
+			next:              dh,
+			fc:                s.fastCache,
+			sw:                sw15,
+			fastAccel:         s.fastAccel,
+			explicitUserspace: mode.userspace && !mode.legacy,
+			legacySwitchGate:  mode.legacy && sw15 != nil,
+			releasePayload:    pool.ReleaseBuf,
 		}
 		wrappedHandler = wrappedFastHandler
 	}
@@ -319,29 +505,30 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 	// Keep the policy pre-fast stage independent from cache storage. switch15
 	// users retain their early marks/reject behavior even in off/kernel mode.
 	var fastBypass func(int, []byte, netip.AddrPort) (int, int, uint64, string, uint32)
-	if isEbpfPort || (mode.userspace && !mode.legacy) {
+	if s.fastAccel != nil || (mode.userspace && !mode.legacy) {
 		fastBypass = buildFastBypass(
 			bp,
 			s.fastCache,
 			c.(*net.UDPConn),
 			mode.userspace && !mode.legacy,
 			mode.legacy,
+			s.fastAccel,
 		)
 	}
 
 	if mode.kernel && wrappedFastHandler != nil {
-		queue := make(chan fastRefreshEvent, fastRefreshQueue)
-		for i := 0; i < fastRefreshWorkers; i++ {
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				startFastRefreshWorker(runtimeCtx, wrappedFastHandler, queue)
-			}()
-		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			runFastRingbuf(runtimeCtx, s.fastCache, queue)
+			select {
+			case <-runtimeCtx.Done():
+				return
+			case <-bp.M().PluginsReady():
+			}
+			if s.fastAccel == nil || !s.fastAccel.active() {
+				return
+			}
+			runFastRefreshRuntime(runtimeCtx, wrappedFastHandler, s.fastCache, bp.L())
 		}()
 	}
 
@@ -359,6 +546,7 @@ func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
 	}
 	bp.L().Info("udp server fast cache configured",
 		zap.String("mode", resolvedMode),
+		zap.Bool("fast_accel", args.FastAccel),
 		zap.Int("userspace_capacity", func() int {
 			if s.fastCache == nil {
 				return 0
@@ -393,17 +581,26 @@ func waitFastCacheRetry(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func runFastRingbuf(ctx context.Context, fc *fastCache, queue chan<- fastRefreshEvent) {
+func runFastRingbuf(ctx context.Context, fc *fastCache, queue chan<- fastRefreshEvent, logger *zap.Logger) {
 	var lastID ebpf.MapID
 	var haveLastID bool
+	misses := 0
 	for ctx.Err() == nil {
 		rm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/mosdns_ringbuf", nil)
 		if err != nil {
+			misses++
+			if misses > fastRingMaxMisses {
+				if logger != nil {
+					logger.Info("fast cache ring buffer not found; continuing without kernel refresh events")
+				}
+				return
+			}
 			if !waitFastCacheRetry(ctx, fastCacheKernelRetryDelay) {
 				return
 			}
 			continue
 		}
+		misses = 0
 		if rm.Type() != ebpf.RingBuf {
 			_ = rm.Close()
 			if !waitFastCacheRetry(ctx, fastCacheKernelRetryDelay) {
@@ -442,6 +639,7 @@ func buildFastBypass(
 	conn *net.UDPConn,
 	explicitUserspace bool,
 	legacy bool,
+	fastAccel *fastAccelRegistration,
 ) func(int, []byte, netip.AddrPort) (int, int, uint64, string, uint32) {
 	var sw15 SwitchPlugin
 	var dm DomainMapperPlugin
@@ -449,6 +647,11 @@ func buildFastBypass(
 	dependenciesResolved := false
 
 	return func(reqLen int, buf []byte, remoteAddr netip.AddrPort) (int, int, uint64, string, uint32) {
+		// An explicit userspace cache is private to this server. Other fast-path
+		// work must wait for and respect the cross-server landing decision.
+		if !explicitUserspace && fastAccel != nil && !fastAccel.active() {
+			return server.FastActionContinue, 0, 0, "", 0
+		}
 		// Plugins are loaded in configuration order while the UDP listener is
 		// already live. Retry missing dependencies instead of permanently caching
 		// nil from the first packet.

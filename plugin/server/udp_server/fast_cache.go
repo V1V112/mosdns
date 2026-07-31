@@ -213,6 +213,7 @@ type fastCache struct {
 
 	legacyLocalSize int
 	kernelEnabled   bool
+	kernelActive    atomic.Bool
 	updates         chan fastKernelUpdate
 	reloadKernel    chan struct{}
 
@@ -250,6 +251,7 @@ func newFastCacheWithDeps(mode resolvedFastCacheMode, logger *zap.Logger, deps f
 		deps:            deps,
 		logger:          logger,
 	}
+	fc.kernelActive.Store(mode.kernel)
 
 	if mode.userspace {
 		if err := fc.enableUserspace(mode.userspaceSize); err != nil {
@@ -322,8 +324,17 @@ func (fc *fastCache) localCapacity() int {
 	return len(t.groups) * fastCacheAssoc
 }
 
+// setKernelActive controls access to the process-external pinned cache. The
+// userspace table remains per UDP server and is intentionally unaffected.
+func (fc *fastCache) setKernelActive(active bool) {
+	if fc == nil || !fc.kernelEnabled {
+		return
+	}
+	fc.kernelActive.Store(active)
+}
+
 func (fc *fastCache) requestKernelReload() {
-	if fc == nil || !fc.kernelEnabled || fc.closed.Load() {
+	if fc == nil || !fc.kernelEnabled || !fc.kernelActive.Load() || fc.closed.Load() {
 		return
 	}
 	select {
@@ -333,7 +344,7 @@ func (fc *fastCache) requestKernelReload() {
 }
 
 func (fc *fastCache) enqueueKernel(update fastKernelUpdate) {
-	if fc == nil || !fc.kernelEnabled || fc.closed.Load() {
+	if fc == nil || !fc.kernelEnabled || !fc.kernelActive.Load() || fc.closed.Load() {
 		return
 	}
 	if update.priority {
@@ -610,10 +621,11 @@ func (fc *fastCache) Store(resp []byte, priority bool) {
 		return
 	}
 	local := fc.local.Load()
-	if !fc.kernelEnabled && local == nil {
+	kernelActive := fc.kernelEnabled && fc.kernelActive.Load()
+	if !kernelActive && local == nil {
 		return
 	}
-	if fc.kernelEnabled && local == nil {
+	if kernelActive && local == nil {
 		// Kernel-only mode can bake directly into the fixed ABI value. This
 		// avoids allocating a short-lived Go response slice for every fill.
 		value := eBpfCacheVal{Len: uint16(len(resp))}
@@ -640,7 +652,7 @@ func (fc *fastCache) Store(resp []byte, priority bool) {
 	patchAnswerTTLs(bakedResp, fastCacheClientTTL)
 
 	hash := calcFNV1a(question)
-	if fc.kernelEnabled {
+	if kernelActive {
 		value := eBpfCacheVal{
 			Len: uint16(len(bakedResp)),
 		}

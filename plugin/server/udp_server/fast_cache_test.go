@@ -139,8 +139,9 @@ func TestFastCacheArgsValidation(t *testing.T) {
 func TestFastCacheArgsWeakDecode(t *testing.T) {
 	var args Args
 	raw := map[string]any{
-		"entry":  "main",
-		"listen": ":53",
+		"entry":      "main",
+		"listen":     ":5354",
+		"fast_accel": true,
 		"fast_cache": map[string]any{
 			"mode": "userspace",
 			"size": 1024,
@@ -153,7 +154,7 @@ func TestFastCacheArgsWeakDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !mode.userspace || mode.userspaceSize != 1024 {
+	if !args.FastAccel || !mode.userspace || mode.userspaceSize != 1024 {
 		t.Fatalf("unexpected decoded mode: %#v", mode)
 	}
 
@@ -161,6 +162,49 @@ func TestFastCacheArgsWeakDecode(t *testing.T) {
 	raw["fast_cache"].(map[string]any)["unknown"] = true
 	if err := utils.WeakDecode(raw, &bad); err == nil {
 		t.Fatal("unknown nested fast_cache field was accepted")
+	}
+}
+
+func TestFastAccelSelection(t *testing.T) {
+	tests := []struct {
+		name string
+		regs []*fastAccelRegistration
+		want []bool
+	}{
+		{
+			name: "port 53 fallback",
+			regs: []*fastAccelRegistration{{port: 53}, {port: 5354}},
+			want: []bool{true, false},
+		},
+		{
+			name: "explicit non-53 wins",
+			regs: []*fastAccelRegistration{{port: 53}, {port: 5354, explicit: true}},
+			want: []bool{false, true},
+		},
+		{
+			name: "multiple explicit landings",
+			regs: []*fastAccelRegistration{{port: 53, explicit: true}, {port: 5354, explicit: true}},
+			want: []bool{true, true},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			selected, _, _ := applyFastAccelSelection(tc.regs)
+			wantSelected := 0
+			for _, want := range tc.want {
+				if want {
+					wantSelected++
+				}
+			}
+			if selected != wantSelected {
+				t.Fatalf("selected servers = %d, want %d", selected, wantSelected)
+			}
+			for i, r := range tc.regs {
+				if got := r.enabled.Load(); got != tc.want[i] {
+					t.Fatalf("server %d enabled = %v, want %v", i, got, tc.want[i])
+				}
+			}
+		})
 	}
 }
 
@@ -317,6 +361,7 @@ func TestExplicitUserspaceDoesNotEnableSwitchPolicy(t *testing.T) {
 		conn,
 		true,
 		false,
+		nil,
 	)
 	action, _, marks, dset, _ := bypass(len(wire), wire, netip.MustParseAddrPort("127.0.0.1:53000"))
 	if action != server.FastActionContinue || marks != 0 || dset != "" {
@@ -352,6 +397,7 @@ func TestUserspaceFastCacheAggregatesHitsAcrossRefreshReplacement(t *testing.T) 
 		conn,
 		true,
 		false,
+		nil,
 	)
 	query := func() (int, uint32) {
 		q := new(dns.Msg)
@@ -544,5 +590,34 @@ func TestKernelModeDoesNotRetainUserspaceResponse(t *testing.T) {
 	}
 	if fc.localCapacity() != 0 || fc.lookupLocal(0, nil) != nil {
 		t.Fatal("kernel-only mode retained a userspace table")
+	}
+}
+
+func TestInactiveKernelLandingDoesNotWriteSharedMap(t *testing.T) {
+	now := time.Unix(1000, 0)
+	m := &fakeFastKernelMap{updates: make(chan fastKernelUpdate, 1)}
+	deps := testFastCacheDeps(now)
+	deps.loadKernelMap = func() (fastKernelMap, error) { return m, nil }
+	fc, err := newFastCacheWithDeps(resolvedFastCacheMode{kernel: true}, zap.NewNop(), deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fc.Close()
+
+	wire, _ := testFastCacheResponse(t, 8, "inactive-kernel.example.", 60)
+	fc.setKernelActive(false)
+	fc.Store(wire, false)
+	select {
+	case <-m.updates:
+		t.Fatal("inactive kernel landing wrote the shared map")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	fc.setKernelActive(true)
+	fc.Store(wire, false)
+	select {
+	case <-m.updates:
+	case <-time.After(time.Second):
+		t.Fatal("reactivated kernel landing did not write the shared map")
 	}
 }

@@ -144,6 +144,8 @@ type NftAdd struct {
 	ruleApplyGen atomic.Uint64
 	ebpfMu       sync.Mutex
 	ebpfRT       *nftEbpfRuntime
+	routingSetup atomic.Bool
+	runCmdFn     func(string)
 	closing      atomic.Bool
 	closeOnce    sync.Once
 }
@@ -459,6 +461,10 @@ func (p *NftAdd) flushAndFillSets(ipSet *netipx.IPSet) error {
 }
 
 func (p *NftAdd) runCmd(cmd string) {
+	if p.runCmdFn != nil {
+		p.runCmdFn(cmd)
+		return
+	}
 	_ = exec.Command("sh", "-c", cmd).Run()
 }
 
@@ -494,9 +500,21 @@ func (p *NftAdd) setupRouting() {
 	p.runCmd("sysctl -w net.ipv4.conf.all.accept_local=1")
 	p.runCmd("sysctl -w net.ipv4.conf.lo.accept_local=1")
 	p.runCmd("sysctl -w net.ipv4.conf.all.route_localnet=1")
+
+	// Mark that we own these ip rules, so Close() only removes rules this
+	// plugin created. Without this, cleanupRouting() ran unconditionally and
+	// wiped pref 1-5 even in nft_false/ebpf_false mode — deleting policy-
+	// routing rules that belong to other tools (e.g. tc-tool) on every restart.
+	p.routingSetup.Store(true)
 }
 
 func (p *NftAdd) cleanupRouting() {
+	// cleanupRouting is also used by transactional setup rollback. Centralizing
+	// the ownership check here prevents every shutdown and error path from
+	// deleting policy rules unless this instance actually ran setupRouting.
+	if !p.routingSetup.Swap(false) {
+		return
+	}
 	p.runCmd("ip rule del pref 1 2>/dev/null")
 	p.runCmd("ip rule del pref 2 2>/dev/null")
 	p.runCmd("ip rule del pref 3 2>/dev/null")

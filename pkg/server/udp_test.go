@@ -23,6 +23,10 @@ func (f udpTestHandler) Handle(
 }
 
 func runUDPMetadataTest(t *testing.T, opts UDPServerOpts) QueryMeta {
+	return runUDPMetadataTestWithQuery(t, opts, nil)
+}
+
+func runUDPMetadataTestWithQuery(t *testing.T, opts UDPServerOpts, configure func(*dns.Msg)) QueryMeta {
 	t.Helper()
 	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -51,6 +55,9 @@ func runUDPMetadataTest(t *testing.T, opts UDPServerOpts) QueryMeta {
 	}
 	q := new(dns.Msg)
 	q.SetQuestion("udp-telemetry.example.", dns.TypeA)
+	if configure != nil {
+		configure(q)
+	}
 	wire, err := q.Pack()
 	if err != nil {
 		client.Close()
@@ -74,6 +81,24 @@ func runUDPMetadataTest(t *testing.T, opts UDPServerOpts) QueryMeta {
 	case <-time.After(2 * time.Second):
 		t.Fatal("UDP handler did not receive query metadata")
 		return QueryMeta{}
+	}
+}
+
+func TestServeUDPCombinesFastCacheAndRealClientMetadata(t *testing.T) {
+	wantReal := netip.MustParseAddr("192.0.2.77")
+	meta := runUDPMetadataTestWithQuery(t, UDPServerOpts{
+		FastBypassWithTelemetry: func(int, []byte, netip.AddrPort) (int, int, uint64, string, uint32) {
+			return FastActionContinue, 0, 9, "telemetry", 37
+		},
+	}, func(q *dns.Msg) {
+		q.SetEdns0(1232, false)
+		q.IsEdns0().Option = append(q.IsEdns0().Option, &dns.EDNS0_LOCAL{
+			Code: EDNS0ClientIPCode,
+			Data: wantReal.AsSlice(),
+		})
+	})
+	if meta.RealClientAddr != wantReal || meta.FastCacheHits != 37 || meta.PreFastFlags != 9 {
+		t.Fatalf("combined UDP metadata = %#v", meta)
 	}
 }
 
