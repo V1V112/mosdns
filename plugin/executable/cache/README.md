@@ -54,10 +54,10 @@ goroutine、一个可复用 timer、按 `refreshAt` 排序的未来任务堆、�
       requery_timeout_ms: 1000
 
       workers: 16
-      max_refresh_qps: 30
-      # 以下两项省略时随 max_refresh_qps 线性调整；当前 QPS 下分别为 60、256。
+      max_refresh_qps: 32
+      # 以下两项省略时随 max_refresh_qps 线性调整；当前 QPS 下分别为 64、256。
       # 显式填写仍可覆盖自动值。
-      # refresh_burst: 60
+      # refresh_burst: 64
       # max_tasks_per_batch: 256
       max_pending_tasks: 2048
       max_retry_times: 2
@@ -132,13 +132,14 @@ actual_timeout = min(requery_timeout_ms, remaining / 2, 1000ms)
 
 - `workers` 是同时执行的 DNS 刷新上限，最大 256。
 - `max_refresh_qps` 是长期平均速率。省略 `refresh_burst` 时自动取
-  `ceil(max_refresh_qps × 60 / 30)`，最小为 1；它表示令牌桶最多积累的突发令牌数。
+  `ceil(max_refresh_qps × 64 / 32)`，最小为 1；它表示令牌桶最多积累的突发令牌数。
 - `max_pending_tasks` 限制已经到期、等待 worker/令牌的任务数。
 - pending 任务按 `expireAt` 排序；队列满时淘汰已失效任务以及过期最晚的低紧急任务。
 - 省略 `max_tasks_per_batch` 时自动取
   `min(max_pending_tasks, 2048, max(64, ceil(max_refresh_qps × 256 / 30)))`；它只限制调度器
-  一次转移的到期任务数，不绕过上述限制。两项自动值都以原默认 QPS 30 下的 60、256 为基准，
-  显式填写时仍以配置值为准。
+  一次转移的到期任务数，不绕过上述限制。省略 `max_refresh_qps` 时
+  `max_tasks_per_batch` 仍默认为 256；显式配置 QPS 时仍沿用 QPS 30 下的 256 作为缩放基准。
+  显式填写限制值时仍以配置值为准。
 - 每次写入都会产生新的 generation；旧 generation、已淘汰、过期、排除或不活跃任务在消耗
   QPS 和 worker 前丢弃。同一 key/generation 与 lazy 更新共用 inflight 去重。
 - 只有真实客户端访问该 key 才更新时间和重置 `max_refresh_times` 计数；主动刷新不会让无人使用的条目

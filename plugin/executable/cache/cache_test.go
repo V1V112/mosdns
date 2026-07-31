@@ -298,17 +298,19 @@ func TestActiveRefreshLimitsScaleWithMaxRefreshQPS(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		qps       float64
+		wantQPS   float64
 		pending   int
 		wantBurst int
 		wantBatch int
 	}{
-		{name: "default", qps: 0, wantBurst: 60, wantBatch: 256},
-		{name: "half", qps: 15, wantBurst: 30, wantBatch: 128},
-		{name: "double", qps: 60, wantBurst: 120, wantBatch: 512},
-		{name: "fractional_rounds_up", qps: 10, wantBurst: 20, wantBatch: 86},
-		{name: "bounded_minimum", qps: 0.1, wantBurst: 1, wantBatch: 64},
-		{name: "bounded_maximum", qps: 1000, wantBurst: 2000, wantBatch: 2048},
-		{name: "bounded_by_pending", qps: 1000, pending: 16, wantBurst: 2000, wantBatch: 16},
+		{name: "default", qps: 0, wantQPS: 32, wantBurst: 64, wantBatch: 256},
+		{name: "half", qps: 15, wantQPS: 15, wantBurst: 30, wantBatch: 128},
+		{name: "historical_default_explicit", qps: 30, wantQPS: 30, wantBurst: 60, wantBatch: 256},
+		{name: "double", qps: 60, wantQPS: 60, wantBurst: 120, wantBatch: 512},
+		{name: "fractional_rounds_up", qps: 10, wantQPS: 10, wantBurst: 20, wantBatch: 86},
+		{name: "bounded_minimum", qps: 0.1, wantQPS: 0.1, wantBurst: 1, wantBatch: 64},
+		{name: "bounded_maximum", qps: 1000, wantQPS: 1000, wantBurst: 2000, wantBatch: 2048},
+		{name: "bounded_by_pending", qps: 1000, wantQPS: 1000, pending: 16, wantBurst: 2000, wantBatch: 16},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			args := Args{ActiveRefresh: ActiveRefreshArgs{
@@ -316,6 +318,9 @@ func TestActiveRefreshLimitsScaleWithMaxRefreshQPS(t *testing.T) {
 				MaxPendingTasks: tc.pending,
 			}}
 			args.init()
+			if got := args.ActiveRefresh.MaxRefreshQPS; got != tc.wantQPS {
+				t.Fatalf("max refresh QPS = %v, want %v", got, tc.wantQPS)
+			}
 			if got := args.ActiveRefresh.RefreshBurst; got != tc.wantBurst {
 				t.Fatalf("refresh burst = %d, want %d for QPS %v", got, tc.wantBurst, args.ActiveRefresh.MaxRefreshQPS)
 			}
@@ -324,6 +329,40 @@ func TestActiveRefreshLimitsScaleWithMaxRefreshQPS(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestActiveRefreshDefaultsAcrossDecodePaths(t *testing.T) {
+	assertDefaults := func(t *testing.T, args *Args) {
+		t.Helper()
+		args.init()
+		a := args.ActiveRefresh
+		if a.MaxRefreshQPS != 32 || a.RefreshBurst != 64 {
+			t.Fatalf("active refresh QPS/burst defaults = %v/%d, want 32/64", a.MaxRefreshQPS, a.RefreshBurst)
+		}
+		if a.Threshold != 60 || a.RequeryTimeoutMS != 1000 || a.Workers != 16 ||
+			a.MaxTasksPerBatch != 256 || a.MaxPendingTasks != 2048 ||
+			a.MaxRetryTimes != 2 || a.MaxRefreshTimes != 0 || a.MaxIdleTime != 3600 {
+			t.Fatalf("unrelated active refresh defaults changed: %#v", a)
+		}
+	}
+
+	t.Run("weak_decode", func(t *testing.T) {
+		var args Args
+		if err := utils.WeakDecode(map[string]any{
+			"active_refresh": map[string]any{"enabled": true},
+		}, &args); err != nil {
+			t.Fatal(err)
+		}
+		assertDefaults(t, &args)
+	})
+
+	t.Run("direct_yaml", func(t *testing.T) {
+		var args Args
+		if err := yaml.Unmarshal([]byte("active_refresh:\n  enabled: true\n"), &args); err != nil {
+			t.Fatal(err)
+		}
+		assertDefaults(t, &args)
+	})
 }
 
 func TestActiveRefreshDynamicLimitsThroughWeakDecode(t *testing.T) {
@@ -341,11 +380,11 @@ func TestActiveRefreshDynamicLimitsThroughWeakDecode(t *testing.T) {
 
 func TestActiveRefreshExplicitLimitsOverrideQPSScaling(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		burst         int
-		batch         int
-		wantBurst     int
-		wantBatch     int
+		name      string
+		burst     int
+		batch     int
+		wantBurst int
+		wantBatch int
 	}{
 		{name: "both", burst: 7, batch: 9, wantBurst: 7, wantBatch: 9},
 		{name: "burst_only", burst: 7, wantBurst: 7, wantBatch: 128},

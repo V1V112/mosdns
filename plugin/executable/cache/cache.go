@@ -72,11 +72,12 @@ const (
 	defaultActiveRefreshRequeryTimeout = 1000
 	defaultActiveRefreshWorkers        = 16
 	defaultActiveRefreshMaxIdleTime    = 3600
-	defaultActiveRefreshMaxQPS         = 30
-	// RefreshBurst and MaxTasksPerBatch use these historical defaults as
-	// baselines and scale linearly when MaxRefreshQPS is changed.
-	defaultActiveRefreshBurst          = 60
+	defaultActiveRefreshMaxQPS         = 32
+	// Omitted limits scale linearly with MaxRefreshQPS. MaxTasksPerBatch keeps
+	// its historical QPS baseline so explicit QPS configurations are stable.
+	defaultActiveRefreshBurst          = 64
 	defaultActiveRefreshMaxBatch       = 256
+	activeRefreshMaxBatchBaselineQPS   = 30
 	defaultActiveRefreshMaxPending     = 2048
 	defaultActiveRefreshMaxRetry       = 2
 	defaultFallbackProbeTimeout        = 500
@@ -492,16 +493,16 @@ func (a *Args) init() {
 	a.ActiveRefresh.init(a.Size)
 }
 
-func activeRefreshLimitForQPS(qps float64, baseline int) int {
+func activeRefreshLimitForQPS(qps float64, baseline int, baselineQPS float64) int {
 	// The caller applies and validates MaxRefreshQPS before reaching here.
 	// Still saturate the conversion so an otherwise valid, very large QPS
 	// cannot overflow int while deriving an omitted limit.
 	maxInt := int(^uint(0) >> 1)
-	maxQPS := float64(maxInt) * defaultActiveRefreshMaxQPS / float64(baseline)
+	maxQPS := float64(maxInt) * baselineQPS / float64(baseline)
 	if math.IsInf(qps, 1) || qps >= maxQPS {
 		return maxInt
 	}
-	scaled := qps * float64(baseline) / defaultActiveRefreshMaxQPS
+	scaled := qps * float64(baseline) / baselineQPS
 	if math.IsInf(scaled, 1) || scaled >= float64(maxInt) {
 		return maxInt
 	}
@@ -509,7 +510,7 @@ func activeRefreshLimitForQPS(qps float64, baseline int) int {
 }
 
 func activeRefreshMaxBatchForQPS(qps float64, maxPending int) int {
-	scaled := activeRefreshLimitForQPS(qps, defaultActiveRefreshMaxBatch)
+	scaled := activeRefreshLimitForQPS(qps, defaultActiveRefreshMaxBatch, activeRefreshMaxBatchBaselineQPS)
 	// A tiny batch makes an already-due future heap wake the scheduler in a
 	// tight series of zero-delay loops. Keep automatic batches at least as
 	// large as the scheduler's normal cleanup pass, but never move more than
@@ -520,6 +521,7 @@ func activeRefreshMaxBatchForQPS(qps float64, maxPending int) int {
 }
 
 func (a *ActiveRefreshArgs) init(_ int) {
+	maxRefreshQPSOmitted := a.MaxRefreshQPS == 0
 	utils.SetDefaultUnsignNum(&a.Threshold, defaultActiveRefreshThreshold)
 	utils.SetDefaultUnsignNum(&a.RequeryTimeoutMS, defaultActiveRefreshRequeryTimeout)
 	utils.SetDefaultUnsignNum(&a.Workers, defaultActiveRefreshWorkers)
@@ -529,10 +531,14 @@ func (a *ActiveRefreshArgs) init(_ int) {
 	utils.SetDefaultUnsignNum(&a.MaxRefreshQPS, defaultActiveRefreshMaxQPS)
 	utils.SetDefaultUnsignNum(&a.MaxPendingTasks, defaultActiveRefreshMaxPending)
 	if a.RefreshBurst == 0 {
-		a.RefreshBurst = activeRefreshLimitForQPS(a.MaxRefreshQPS, defaultActiveRefreshBurst)
+		a.RefreshBurst = activeRefreshLimitForQPS(a.MaxRefreshQPS, defaultActiveRefreshBurst, defaultActiveRefreshMaxQPS)
 	}
 	if a.MaxTasksPerBatch == 0 {
-		a.MaxTasksPerBatch = activeRefreshMaxBatchForQPS(a.MaxRefreshQPS, a.MaxPendingTasks)
+		batchQPS := a.MaxRefreshQPS
+		if maxRefreshQPSOmitted {
+			batchQPS = activeRefreshMaxBatchBaselineQPS
+		}
+		a.MaxTasksPerBatch = activeRefreshMaxBatchForQPS(batchQPS, a.MaxPendingTasks)
 	}
 	if !a.maxRetryTimesConfigured && a.MaxRetryTimes == 0 {
 		a.MaxRetryTimes = defaultActiveRefreshMaxRetry
