@@ -32,6 +32,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/transport"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
@@ -331,7 +332,9 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 
 		go func(uqid uint32, question dns.Question) {
 			defer pool.ReleaseBuf(qc)
-			upstreamCtx, cancel := context.WithTimeout(context.Background(), upstreamTimeout)
+			// On timeout, drop the connection that carried the query (not the
+			// whole upstream), so a stale connection is re-dialed.
+			upstreamCtx, cancel := context.WithTimeout(transport.WithCloseConnOnTimeout(context.Background()), upstreamTimeout)
 			defer cancel()
 
 			var r *dns.Msg
