@@ -598,7 +598,9 @@ func TestActiveActivityRealHitWinsRefreshCompletion(t *testing.T) {
 func TestActiveRefreshIndependentCapEvictsColdEntry(t *testing.T) {
 	policy := activeRefreshTrackingPolicyForTest(2)
 	policy.EvictionScanLimit = 8
-	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	// Keep all three backend entries even if they hash to the same shard, so
+	// only the independent tracking limit selects the cold resident.
+	c := newDormantActiveCache(t, &Args{Size: 3 * shardCount, ActiveRefresh: policy}, Opts{})
 	defer c.Close()
 
 	seed := func(name string) (key, *query_context.Context, *preparedCacheEntry) {
@@ -639,7 +641,8 @@ func TestActiveRefreshIndependentCapEvictsColdEntry(t *testing.T) {
 func TestActiveRefreshIndependentCapRejectsColderIncomingEntry(t *testing.T) {
 	policy := activeRefreshTrackingPolicyForTest(1)
 	policy.EvictionScanLimit = 4
-	c := newDormantActiveCache(t, &Args{Size: 16, ActiveRefresh: policy}, Opts{})
+	// Backend shard capacity must not decide admission before the tracking cap.
+	c := newDormantActiveCache(t, &Args{Size: 2 * shardCount, ActiveRefresh: policy}, Opts{})
 	defer c.Close()
 	hotKey, _, hot := seedTrackedEntry(t, c, "resident-hot.example.", time.Minute, 0)
 	saturatingAddUint64(&hot.item.activityState().realAccessCount, 100)

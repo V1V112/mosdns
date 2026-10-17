@@ -170,8 +170,9 @@ func (uw *upstreamWrapper) ExchangeContext(ctx context.Context, m []byte) (*[]by
 
 func (uw *upstreamWrapper) Close() error {
 	err := uw.u.Close()
+	// Keep the key immutable: asynchronous connection events may still read it.
+	// Reports for an unregistered key are ignored by the runtime registry.
 	coremain.UnregisterUpstreamRuntime(uw.runtimeKey)
-	uw.runtimeKey = ""
 	return err
 }
 

@@ -979,8 +979,9 @@ func (w *upstreamWrapper) ExchangeContext(ctx context.Context, req []byte) (*[]b
 
 func (w *upstreamWrapper) Close() error {
 	err := w.u.Close()
+	// Connection and HTTP callbacks may still report after Close returns.
+	// Keep their key immutable; the registry ignores reports after unregistering.
 	coremain.UnregisterUpstreamRuntime(w.runtimeKey)
-	w.runtimeKey = ""
 	return err
 }
 
